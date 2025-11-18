@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 20  # Peticiones simultáneas
+MAX_WORKERS = 100  # Peticiones simultáneas
 
 
 # ==========================================
@@ -205,7 +205,7 @@ def calcular_horas(df):
 # ==========================================
 
 st.set_page_config(page_title="Fichajes CRECE", layout="wide")
-st.title("📊 Fichajes CRECE Personas – con Departamentos")
+st.title("📊 Fichajes CRECE Personas")
 
 col1, col2 = st.columns(2)
 with col1:
