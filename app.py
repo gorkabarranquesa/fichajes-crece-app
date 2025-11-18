@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 20  # Peticiones simultáneas
+MAX_WORKERS = 500  # Peticiones simultáneas
 
 
 # ==========================================
