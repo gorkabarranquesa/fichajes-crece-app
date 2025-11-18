@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 500  # Peticiones simultáneas
+MAX_WORKERS = 500  # Peticiones simultáneas (muy rápido)
 
 
 # ==========================================
@@ -272,42 +272,35 @@ if st.button("▶ Obtener resumen de fichajes"):
 
                 df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                resumen = df.groupby(
+                # Número de fichajes por día por empleado (100% fiable)
+                df["Numero_de_fichajes"] = df.groupby(
+                    ["nombre_completo", "fecha_dia"]
+                )["nif"].transform("count")
+
+                # Seleccionar última fila del día para el resumen
+                resumen = df.sort_values("fecha_dt").groupby(
                     ["nombre_completo", "departamento_nombre", "fecha_dia"],
-                    as_index=False,
-                    dropna=False
-                ).agg(
-                    Total_trabajado_horas=("horas_acumuladas", "max"),
-                    Numero_fichajes=("nif", "count")
-                )
+                    as_index=False
+                ).agg({
+                    "horas_acumuladas": "max",
+                    "Numero_de_fichajes": "max"
+                })
 
-                if resumen.empty:
-                    st.info("No hay datos que resumir para este rango de fechas.")
-                    st.stop()
-
-                resumen["Total trabajado"] = resumen["Total_trabajado_horas"].apply(
-                    lambda x: horas_a_hhmm(x)
-                )
+                resumen["Total trabajado"] = resumen["horas_acumuladas"].apply(horas_a_hhmm)
 
                 resumen = resumen.rename(columns={
                     "fecha_dia": "Fecha",
                     "nombre_completo": "Nombre Completo",
-                    "departamento_nombre": "Departamento"
+                    "departamento_nombre": "Departamento",
                 })
 
-                columnas_finales = [
+                resumen = resumen[[
                     "Fecha",
                     "Nombre Completo",
                     "Departamento",
                     "Total trabajado",
-                    "Numero de fichajes"
-                ]
-
-                for col in columnas_finales:
-                    if col not in resumen.columns:
-                        resumen[col] = ""
-
-                resumen = resumen[columnas_finales]
+                    "Numero_de_fichajes"
+                ]]
 
                 st.subheader("📄 Resumen Diario")
                 st.dataframe(resumen, use_container_width=True)
@@ -319,6 +312,5 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "fichajes_crece_resumen.csv",
                     "text/csv"
                 )
-
             else:
                 st.info("No se encontraron fichajes.")
