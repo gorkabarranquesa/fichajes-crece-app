@@ -292,6 +292,7 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "fecha_dia": "Fecha",
                     "nombre_completo": "Nombre Completo",
                     "departamento_nombre": "Departamento",
+                    "Numero_de_fichajes": "Numero de fichajes",
                 })
 
                 resumen = resumen[[
