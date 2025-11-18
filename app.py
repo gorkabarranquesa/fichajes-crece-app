@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 60  # número de peticiones simultáneas
+MAX_WORKERS = 20  # Peticiones simultáneas
 
 
 # ==========================================
@@ -38,10 +38,38 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
 
 # ==========================================
-# EMPLEADOS (NOMBRE + APELLIDOS)
+# EXPORTACIÓN DE DEPARTAMENTOS
+# ==========================================
+
+def api_exportar_departamentos():
+    """Obtiene listado de departamentos {id, nombre}."""
+    url = f"{API_URL_BASE}/exportacion/departamentos"
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {API_TOKEN}",
+    }
+
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+
+    payload_b64 = resp.text.strip().strip('"')
+    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+    departamentos = json.loads(decrypted)
+
+    lista = []
+    for d in departamentos:
+        lista.append({"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")})
+
+    return pd.DataFrame(lista)
+
+
+# ==========================================
+# EXPORTACIÓN DE EMPLEADOS
 # ==========================================
 
 def api_exportar_empleados_completos():
+    """Obtiene NIF, nombre, apellidos y departamento."""
     url = f"{API_URL_BASE}/exportacion/empleados"
 
     headers = {
@@ -61,17 +89,11 @@ def api_exportar_empleados_completos():
     lista = []
 
     for e in empleados:
-        # CRECE usa estos nombres
-        nombre = (
-            e.get("name")
-            or e.get("nombre")
-            or ""
-        )
 
+        nombre = e.get("name") or e.get("nombre") or ""
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
-        # fallback si devuelve un único campo "apellidos"
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -85,13 +107,14 @@ def api_exportar_empleados_completos():
             "primer_apellido": primer_apellido,
             "segundo_apellido": segundo_apellido,
             "nombre_completo": nombre_completo,
+            "departamento_id": e.get("departamento"),
         })
 
-    return lista
+    return pd.DataFrame(lista)
 
 
 # ==========================================
-# FICHAJES
+# EXPORTACIÓN DE FICHAJES
 # ==========================================
 
 def api_exportar_fichajes(nif, fi, ff):
@@ -121,7 +144,7 @@ def api_exportar_fichajes(nif, fi, ff):
         return json.loads(decrypted)
 
     except Exception:
-        return []  # IGNORAR LOS ERRORES
+        return []
 
 
 # ==========================================
@@ -129,8 +152,6 @@ def api_exportar_fichajes(nif, fi, ff):
 # ==========================================
 
 def calcular_horas(df):
-    """Devuelve el mismo DataFrame con columnas de horas trabajadas por fila."""
-
     df["horas_trabajadas"] = 0.0
     df["horas_acumuladas"] = 0.0
 
@@ -141,7 +162,7 @@ def calcular_horas(df):
 
     for nif in df["nif"].unique():
         sub = df[df["nif"] == nif].copy()
-        sub = sub.sort_values("fecha")
+        sub = sub.sort_values("fecha_dt")
 
         horas_acum = 0.0
         i = 0
@@ -151,44 +172,40 @@ def calcular_horas(df):
             salida = sub.iloc[i + 1]
 
             if entrada["direccion"] == "entrada" and salida["direccion"] == "salida":
-                t1 = datetime.strptime(entrada["fecha"], "%Y-%m-%d %H:%M:%S")
-                t2 = datetime.strptime(salida["fecha"], "%Y-%m-%d %H:%M:%S")
+                t1 = entrada["fecha_dt"]
+                t2 = salida["fecha_dt"]
                 horas = (t2 - t1).total_seconds() / 3600
 
-                # asignamos
                 entrada["horas_trabajadas"] = horas
                 horas_acum += horas
                 entrada["horas_acumuladas"] = horas_acum
 
                 result.append(entrada)
 
-                # añadimos salida también
                 salida["horas_trabajadas"] = 0
                 salida["horas_acumuladas"] = horas_acum
                 result.append(salida)
 
                 i += 2
             else:
-                # si no cuadra entrada/salida → solo añadir sin horas
                 sub.iloc[i]["horas_acumuladas"] = horas_acum
                 result.append(sub.iloc[i])
                 i += 1
 
-        # añadir último si quedó suelto
         if i == len(sub) - 1:
             sub.iloc[i]["horas_acumuladas"] = horas_acum
             result.append(sub.iloc[i])
 
     df_final = pd.DataFrame(result)
-    return df_final.sort_values("fecha", ascending=False)
+    return df_final.sort_values(["nombre_completo", "fecha_dt"])
 
 
 # ==========================================
-# INTERFAZ STREAMLIT
+# UI STREAMLIT
 # ==========================================
 
 st.set_page_config(page_title="Fichajes CRECE", layout="wide")
-st.title("📊 Fichajes CRECE Personas – Horas trabajadas")
+st.title("📊 Fichajes CRECE Personas – con Departamentos")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -201,21 +218,32 @@ st.write("---")
 if st.button("▶ Obtener fichajes de todos los empleados"):
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
+
     else:
-        with st.spinner("Cargando empleados y fichajes…"):
+        with st.spinner("Cargando empleados, departamentos y fichajes…"):
 
             fi = fecha_inicio.strftime("%Y-%m-%d")
             ff = fecha_fin.strftime("%Y-%m-%d")
 
-            empleados = api_exportar_empleados_completos()
+            # 1. Departamentos
+            departamentos_df = api_exportar_departamentos()
 
+            # 2. Empleados
+            empleados_df = api_exportar_empleados_completos()
+
+            # 3. Merge empleados + departamentos
+            empleados_df = empleados_df.merge(
+                departamentos_df,
+                on="departamento_id",
+                how="left"
+            )
+
+            # 4. Obtención de fichajes (paralelo)
             fichajes_totales = []
-            tareas = []
-
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {
                     executor.submit(api_exportar_fichajes, e["nif"], fi, ff): e
-                    for e in empleados
+                    for _, e in empleados_df.iterrows()
                 }
 
                 for future in as_completed(futures):
@@ -229,6 +257,8 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                             "primer_apellido": emp["primer_apellido"],
                             "segundo_apellido": emp["segundo_apellido"],
                             "nombre_completo": emp["nombre_completo"],
+                            "departamento_id": emp["departamento_id"],
+                            "departamento_nombre": emp["departamento_nombre"],
                             "id": f.get("id"),
                             "tipo": f.get("tipo"),
                             "fecha": f.get("fecha"),
@@ -240,29 +270,25 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                             "tipo_descripcion": f.get("tipo_obj", {}).get("descripcion") if f.get("tipo_obj") else None,
                         })
 
+            # 5. Construcción DataFrame final
             if fichajes_totales:
                 df = pd.DataFrame(fichajes_totales)
 
-                # 1) Convertir fecha a datetime para ordenar bien
+                # Convertir fecha a datetime
                 df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S")
 
-                # 2) Ordenar por nombre completo y fecha ascendente
-                df = df.sort_values(
-                    ["nombre_completo", "fecha_dt"],
-                    ascending=[True, True]
-                )
+                # Orden por nombre completo y fecha
+                df = df.sort_values(["nombre_completo", "fecha_dt"], ascending=[True, True])
 
-                # 3) Calcular horas (usa el orden correcto)
+                # Calcular horas con el orden correcto
                 df = calcular_horas(df)
 
-                # 4) Eliminar columna auxiliar
-                df = df.sort_values(
-                    ["nombre_completo", "fecha_dt"],
-                    ascending=[True, True]
-                )
+                # Orden final
+                df = df.sort_values(["nombre_completo", "fecha_dt"], ascending=[True, True])
+
+                # Eliminar auxiliar
                 df = df.drop(columns=["fecha_dt"])
 
-                # 5) Mostrar resultado final
                 st.subheader("Resultados")
                 st.dataframe(df, use_container_width=True)
 
@@ -275,5 +301,3 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                 )
             else:
                 st.info("No se encontraron fichajes.")
-
-
