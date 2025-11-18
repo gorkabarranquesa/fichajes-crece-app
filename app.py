@@ -220,7 +220,7 @@ def calcular_horas(df):
 # ==========================================
 
 st.set_page_config(page_title="Fichajes CRECE", layout="wide")
-st.title("📊 Fichajes CRECE Personas – Resumen Diario por Empleado")
+st.title("📊 Fichajes CRECE Personas")
 
 col1, col2 = st.columns(2)
 with col1:
