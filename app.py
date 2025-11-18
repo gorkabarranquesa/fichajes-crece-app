@@ -280,66 +280,88 @@ if st.button("▶ Obtener resumen de fichajes"):
                             "tipo_nombre": f.get("tipo_obj", {}).get("nombre") if f.get("tipo_obj") else None,
                         })
 
-            # ==========================================
-            # CONSTRUCCIÓN DEL RESUMEN FINAL
-            # ==========================================
+# ==========================================
+# CONSTRUCCIÓN DEL RESUMEN FINAL
+# ==========================================
 
-            if fichajes_totales:
-                df = pd.DataFrame(fichajes_totales)
+if fichajes_totales:
+    df = pd.DataFrame(fichajes_totales)
 
-                # Convertir fecha a datetime
-                df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S")
-                df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
+    # Convertir fecha a datetime
+    df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+    df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
-                # Orden inicial
-                df = df.sort_values(["nombre_completo", "fecha_dt"])
+    # Orden antes de cálculo de horas
+    df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Calcular horas reales
-                df = calcular_horas(df)
+    # Calcular horas
+    df = calcular_horas(df)
 
-                # Orden después del cálculo
-                df = df.sort_values(["nombre_completo", "fecha_dt"])
+    # Si df quedó vacío después del cálculo, mostramos mensaje limpio
+    if df.empty:
+        st.warning("No se encontraron fichajes válidos en el rango seleccionado.")
+        st.stop()
 
-                # RESUMEN FINAL
-                resumen = df.groupby(
-                    ["nombre_completo", "departamento_nombre", "fecha_dia"],
-                    as_index=False
-                ).agg(
-                    Total_trabajado_horas=("horas_acumuladas", "max"),
-                    Numero_fichajes=("id", "count")
-                )
+    # Orden final para resumen
+    df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Convertir horas a HH:MM
-                resumen["Total trabajado"] = resumen["Total_trabajado_horas"].apply(horas_a_hhmm)
+    # RESUMEN AGRUPADO
+    resumen = df.groupby(
+        ["nombre_completo", "departamento_nombre", "fecha_dia"],
+        as_index=False,
+        dropna=False
+    ).agg(
+        Total_trabajado_horas=("horas_acumuladas", "max"),
+        Numero_fichajes=("id", "count")
+    )
 
-                # Renombrar final
-                resumen = resumen.rename(columns={
-                    "fecha_dia": "Fecha",
-                    "nombre_completo": "Nombre Completo",
-                    "departamento_nombre": "Departamento"
-                })
+    # Si el resumen está vacío → mensaje amigable
+    if resumen.empty:
+        st.info("No hay datos que resumir para este rango de fechas.")
+        st.stop()
 
-                # Selección de columnas final
-                resumen = resumen[[
-                    "Fecha",
-                    "Nombre Completo",
-                    "Departamento",
-                    "Total trabajado",
-                    "Numero de fichajes"
-                ]]
+    # Convertir horas a formato HH:MM
+    resumen["Total trabajado"] = resumen["Total_trabajado_horas"].apply(
+        lambda x: horas_a_hhmm(x) if pd.notnull(x) else "00:00"
+    )
 
-                # Mostrar tabla
-                st.subheader("📄 Resumen Diario")
-                st.dataframe(resumen, use_container_width=True)
+    # Renombrar columnas
+    resumen = resumen.rename(columns={
+        "fecha_dia": "Fecha",
+        "nome_completo": "Nombre Completo",
+        "nombre_completo": "Nombre Completo",  # seguridad extra
+        "departamento_nombre": "Departamento"
+    })
 
-                # CSV
-                csv_bytes = resumen.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "⬇ Descargar CSV",
-                    csv_bytes,
-                    "fichajes_crece_resumen.csv",
-                    "text/csv"
-                )
+    # Asegurar que todas las columnas existen
+    columnas_finales = [
+        "Fecha",
+        "Nombre Completo",
+        "Departamento",
+        "Total trabajado",
+        "Numero de fichajes"
+    ]
 
-            else:
-                st.info("No se encontraron fichajes.")
+    for col in columnas_finales:
+        if col not in resumen.columns:
+            resumen[col] = ""
+
+    # Seleccionar columnas en el orden deseado
+    resumen = resumen[columnas_finales]
+
+    # Mostrar resultados
+    st.subheader("📄 Resumen Diario")
+    st.dataframe(resumen, use_container_width=True)
+
+    # CSV
+    csv_bytes = resumen.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Descargar CSV",
+        csv_bytes,
+        "fichajes_crece_resumen.csv",
+        "text/csv"
+    )
+
+else:
+    st.info("No se encontraron fichajes.")
+
