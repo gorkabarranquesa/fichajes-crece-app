@@ -299,7 +299,7 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "Nombre Completo",
                     "Departamento",
                     "Total trabajado",
-                    "Numero_de_fichajes"
+                    "Numero de fichajes"
                 ]]
 
                 st.subheader("📄 Resumen Diario")
