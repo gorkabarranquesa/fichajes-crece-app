@@ -278,7 +278,7 @@ if st.button("▶ Obtener resumen de fichajes"):
                     dropna=False
                 ).agg(
                     Total_trabajado_horas=("horas_acumuladas", "max"),
-                    Numero_fichajes=("id", "count")
+                    Numero_fichajes=("nif", "count")
                 )
 
                 if resumen.empty:
