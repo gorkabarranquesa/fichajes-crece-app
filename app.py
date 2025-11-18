@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 100  # Peticiones simultáneas
+MAX_WORKERS = 20  # Peticiones simultáneas
 
 
 # ==========================================
@@ -35,6 +35,17 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
     decrypted = unpad(cipher.decrypt(ct), AES.block_size)
 
     return decrypted.decode("utf-8")
+
+
+# ==========================================
+# HORAS → HH:MM
+# ==========================================
+
+def horas_a_hhmm(horas):
+    total_min = int(horas * 60)
+    h = total_min // 60
+    m = total_min % 60
+    return f"{h:02d}:{m:02d}"
 
 
 # ==========================================
@@ -59,7 +70,10 @@ def api_exportar_departamentos():
 
     lista = []
     for d in departamentos:
-        lista.append({"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")})
+        lista.append({
+            "departamento_id": d.get("id"),
+            "departamento_nombre": d.get("nombre")
+        })
 
     return pd.DataFrame(lista)
 
@@ -94,6 +108,7 @@ def api_exportar_empleados_completos():
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
+        # fallback si viene en un único campo
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -205,7 +220,7 @@ def calcular_horas(df):
 # ==========================================
 
 st.set_page_config(page_title="Fichajes CRECE", layout="wide")
-st.title("📊 Fichajes CRECE Personas")
+st.title("📊 Fichajes CRECE Personas – Resumen Diario por Empleado")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -215,10 +230,9 @@ with col2:
 
 st.write("---")
 
-if st.button("▶ Obtener fichajes de todos los empleados"):
+if st.button("▶ Obtener resumen de fichajes"):
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
-
     else:
         with st.spinner("Cargando empleados, departamentos y fichajes…"):
 
@@ -228,7 +242,7 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
             # 1. Departamentos
             departamentos_df = api_exportar_departamentos()
 
-            # 2. Empleados
+            # 2. Empleados completos
             empleados_df = api_exportar_empleados_completos()
 
             # 3. Merge empleados + departamentos
@@ -238,8 +252,9 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                 how="left"
             )
 
-            # 4. Obtención de fichajes (paralelo)
+            # 4. Obtención de fichajes (en paralelo)
             fichajes_totales = []
+
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {
                     executor.submit(api_exportar_fichajes, e["nif"], fi, ff): e
@@ -253,11 +268,7 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                     for f in fichajes:
                         fichajes_totales.append({
                             "nif": emp["nif"],
-                            "nombre": emp["nombre"],
-                            "primer_apellido": emp["primer_apellido"],
-                            "segundo_apellido": emp["segundo_apellido"],
                             "nombre_completo": emp["nombre_completo"],
-                            "departamento_id": emp["departamento_id"],
                             "departamento_nombre": emp["departamento_nombre"],
                             "id": f.get("id"),
                             "tipo": f.get("tipo"),
@@ -267,37 +278,68 @@ if st.button("▶ Obtener fichajes de todos los empleados"):
                             "latitud": f.get("latitud"),
                             "longitud": f.get("longitud"),
                             "tipo_nombre": f.get("tipo_obj", {}).get("nombre") if f.get("tipo_obj") else None,
-                            "tipo_descripcion": f.get("tipo_obj", {}).get("descripcion") if f.get("tipo_obj") else None,
                         })
 
-            # 5. Construcción DataFrame final
+            # ==========================================
+            # CONSTRUCCIÓN DEL RESUMEN FINAL
+            # ==========================================
+
             if fichajes_totales:
                 df = pd.DataFrame(fichajes_totales)
 
                 # Convertir fecha a datetime
                 df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S")
+                df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
-                # Orden por nombre completo y fecha
-                df = df.sort_values(["nombre_completo", "fecha_dt"], ascending=[True, True])
+                # Orden inicial
+                df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Calcular horas con el orden correcto
+                # Calcular horas reales
                 df = calcular_horas(df)
 
-                # Orden final
-                df = df.sort_values(["nombre_completo", "fecha_dt"], ascending=[True, True])
+                # Orden después del cálculo
+                df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Eliminar auxiliar
-                df = df.drop(columns=["fecha_dt"])
+                # RESUMEN FINAL
+                resumen = df.groupby(
+                    ["nombre_completo", "departamento_nombre", "fecha_dia"],
+                    as_index=False
+                ).agg(
+                    Total_trabajado_horas=("horas_acumuladas", "max"),
+                    Numero_fichajes=("id", "count")
+                )
 
-                st.subheader("Resultados")
-                st.dataframe(df, use_container_width=True)
+                # Convertir horas a HH:MM
+                resumen["Total trabajado"] = resumen["Total_trabajado_horas"].apply(horas_a_hhmm)
 
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                # Renombrar final
+                resumen = resumen.rename(columns={
+                    "fecha_dia": "Fecha",
+                    "nombre_completo": "Nombre Completo",
+                    "departamento_nombre": "Departamento"
+                })
+
+                # Selección de columnas final
+                resumen = resumen[[
+                    "Fecha",
+                    "Nombre Completo",
+                    "Departamento",
+                    "Total trabajado",
+                    "Numero de fichajes"
+                ]]
+
+                # Mostrar tabla
+                st.subheader("📄 Resumen Diario")
+                st.dataframe(resumen, use_container_width=True)
+
+                # CSV
+                csv_bytes = resumen.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "⬇ Descargar CSV",
                     csv_bytes,
-                    "fichajes_crece.csv",
+                    "fichajes_crece_resumen.csv",
                     "text/csv"
                 )
+
             else:
                 st.info("No se encontraron fichajes.")
