@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 500  # Peticiones simultáneas (muy rápido)
+MAX_WORKERS = 500  # Peticiones simultáneas
 
 
 # ==========================================
@@ -145,7 +145,7 @@ def api_exportar_fichajes(nif, fi, ff):
 
 
 # ==========================================
-# CÁLCULO DE HORAS TRABAJADAS
+# CÁLCULO DE HORAS TRABAJADAS (CORREGIDO POR DÍAS)
 # ==========================================
 
 def calcular_horas(df):
@@ -158,42 +158,46 @@ def calcular_horas(df):
     result = []
 
     for nif in df["nif"].unique():
-        sub = df[df["nif"] == nif].copy()
-        sub = sub.sort_values("fecha_dt")
+        sub_emp = df[df["nif"] == nif].copy()
 
-        horas_acum = 0.0
-        i = 0
+        # Procesar día por día
+        for fecha_dia in sub_emp["fecha_dia"].unique():
+            sub = sub_emp[sub_emp["fecha_dia"] == fecha_dia].copy()
+            sub = sub.sort_values("fecha_dt")
 
-        while i < len(sub) - 1:
-            entrada = sub.iloc[i]
-            salida = sub.iloc[i + 1]
+            horas_acum = 0.0
+            i = 0
 
-            if entrada["direccion"] == "entrada" and salida["direccion"] == "salida":
-                t1 = entrada["fecha_dt"]
-                t2 = salida["fecha_dt"]
-                horas = (t2 - t1).total_seconds() / 3600
+            while i < len(sub) - 1:
+                entrada = sub.iloc[i]
+                salida = sub.iloc[i + 1]
 
-                entrada["horas_trabajadas"] = horas
-                horas_acum += horas
-                entrada["horas_acumuladas"] = horas_acum
-                result.append(entrada)
+                if entrada["direccion"] == "entrada" and salida["direccion"] == "salida":
+                    t1 = entrada["fecha_dt"]
+                    t2 = salida["fecha_dt"]
+                    horas = (t2 - t1).total_seconds() / 3600
 
-                salida["horas_trabajadas"] = 0
-                salida["horas_acumuladas"] = horas_acum
-                result.append(salida)
+                    entrada["horas_trabajadas"] = horas
+                    horas_acum += horas
+                    entrada["horas_acumuladas"] = horas_acum
+                    result.append(entrada)
 
-                i += 2
-            else:
+                    salida["horas_trabajadas"] = 0
+                    salida["horas_acumuladas"] = horas_acum
+                    result.append(salida)
+
+                    i += 2
+                else:
+                    sub.iloc[i]["horas_acumuladas"] = horas_acum
+                    result.append(sub.iloc[i])
+                    i += 1
+
+            if i == len(sub) - 1:
                 sub.iloc[i]["horas_acumuladas"] = horas_acum
                 result.append(sub.iloc[i])
-                i += 1
-
-        if i == len(sub) - 1:
-            sub.iloc[i]["horas_acumuladas"] = horas_acum
-            result.append(sub.iloc[i])
 
     df_final = pd.DataFrame(result)
-    return df_final.sort_values(["nif", "fecha_dt"])
+    return df_final.sort_values(["fecha_dt", "nombre_completo"])
 
 
 # ==========================================
@@ -272,12 +276,12 @@ if st.button("▶ Obtener resumen de fichajes"):
 
                 df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Número de fichajes por día por empleado (100% fiable)
+                # Número de fichajes por día por empleado
                 df["Numero_de_fichajes"] = df.groupby(
                     ["nombre_completo", "fecha_dia"]
                 )["nif"].transform("count")
 
-                # Seleccionar última fila del día para el resumen
+                # Tomar la última fila del día (horas_acumuladas contiene el total del día)
                 resumen = df.sort_values("fecha_dt").groupby(
                     ["nombre_completo", "departamento_nombre", "fecha_dia"],
                     as_index=False
@@ -292,8 +296,11 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "fecha_dia": "Fecha",
                     "nombre_completo": "Nombre Completo",
                     "departamento_nombre": "Departamento",
-                    "Numero_de_fichajes": "Numero de fichajes",
+                    "Numero_de_fichajes": "Numero de fichajes"
                 })
+
+                # Orden final: Fecha → Nombre Completo
+                resumen = resumen.sort_values(["Fecha", "Nombre Completo"], ascending=[True, True])
 
                 resumen = resumen[[
                     "Fecha",
