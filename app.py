@@ -98,7 +98,6 @@ def api_exportar_empleados_completos():
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
-        # Fallback si viene en un único campo "apellidos"
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -142,12 +141,11 @@ def api_exportar_fichajes(nif, fi, ff):
         return json.loads(decrypted)
 
     except Exception:
-        # Ignoramos errores para que no pare el proceso
         return []
 
 
 # ==========================================
-# CÁLCULO DE HORAS TRABAJADAS (POR DÍA)
+# CÁLCULO DE HORAS POR DÍA
 # ==========================================
 
 def calcular_horas(df):
@@ -162,7 +160,6 @@ def calcular_horas(df):
     for nif in df["nif"].unique():
         sub_emp = df[df["nif"] == nif].copy()
 
-        # Procesar por día
         for fecha_dia in sub_emp["fecha_dia"].unique():
             sub = sub_emp[sub_emp["fecha_dia"] == fecha_dia].copy()
             sub = sub.sort_values("fecha_dt")
@@ -220,18 +217,16 @@ with col2:
 st.write("---")
 
 if st.button("▶ Obtener resumen de fichajes"):
-    # Validaciones de fechas
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
     elif fecha_fin > hoy:
-        st.error("❌ La fecha fin no puede ser mayor que la fecha de hoy.")
+        st.error("❌ La fecha fin no puede ser mayor que hoy.")
     else:
         with st.spinner("Cargando empleados, departamentos y fichajes…"):
 
             fi = fecha_inicio.strftime("%Y-%m-%d")
             ff = fecha_fin.strftime("%Y-%m-%d")
 
-            # 1) Departamentos y empleados
             departamentos_df = api_exportar_departamentos()
             empleados_df = api_exportar_empleados_completos()
 
@@ -241,7 +236,6 @@ if st.button("▶ Obtener resumen de fichajes"):
                 how="left"
             )
 
-            # 2) Fichajes en paralelo
             fichajes_totales = []
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -265,37 +259,22 @@ if st.button("▶ Obtener resumen de fichajes"):
                             "direccion": f.get("direccion"),
                         })
 
-            # ==========================================
-            # CONSTRUCCIÓN DEL RESUMEN FINAL
-            # ==========================================
-
             if fichajes_totales:
                 df = pd.DataFrame(fichajes_totales)
 
-                # Convertir fecha y extraer día
-                df["fecha_dt"] = pd.to_datetime(
-                    df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce"
-                )
+                df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
                 df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
-                # Orden previo
                 df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Calcular horas por día y empleado
                 df = calcular_horas(df)
 
-                if df.empty:
-                    st.warning("No se encontraron fichajes válidos en el rango seleccionado.")
-                    st.stop()
-
                 df = df.sort_values(["nombre_completo", "fecha_dt"])
 
-                # Número de fichajes por día y empleado
                 df["Numero_de_fichajes"] = df.groupby(
                     ["nombre_completo", "fecha_dia"]
                 )["nif"].transform("count")
 
-                # Resumen por día: coger última fila del día (horas_acumuladas = total día)
                 resumen = df.sort_values("fecha_dt").groupby(
                     ["nombre_completo", "departamento_nombre", "fecha_dia"],
                     as_index=False
@@ -304,10 +283,8 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "Numero_de_fichajes": "max"
                 })
 
-                # Formato horas
                 resumen["Total trabajado"] = resumen["horas_acumuladas"].apply(horas_a_hhmm)
 
-                # Renombrar columnas para salida
                 resumen = resumen.rename(columns={
                     "fecha_dia": "Fecha",
                     "nombre_completo": "Nombre Completo",
@@ -315,10 +292,8 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "Numero_de_fichajes": "Numero de fichajes"
                 })
 
-                # Orden global por Fecha y Nombre Completo
                 resumen = resumen.sort_values(["Fecha", "Nombre Completo"], ascending=[True, True])
 
-                # Solo columnas finales
                 resumen = resumen[[
                     "Fecha",
                     "Nombre Completo",
@@ -329,19 +304,21 @@ if st.button("▶ Obtener resumen de fichajes"):
 
                 st.subheader("📄 Resumen Diario")
 
-                # ==============================
-                # UNA TABLA POR CADA FECHA
-                # ==============================
                 fechas_unicas = resumen["Fecha"].unique()
 
                 for f_dia in fechas_unicas:
                     sub = resumen[resumen["Fecha"] == f_dia].copy()
 
                     st.markdown(f"### 📅 Fecha {f_dia}")
-                    # st.dataframe permite filtros en columnas (UI nativa de Streamlit)
-                    st.dataframe(sub, use_container_width=True)
 
-                # CSV global con todos los días
+                    # st.data_editor permite filtros y ordenación en columnas
+                    st.data_editor(
+                        sub,
+                        use_container_width=True,
+                        hide_index=True,
+                        num_rows="dynamic"
+                    )
+
                 csv_bytes = resumen.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "⬇ Descargar CSV (todos los días)",
