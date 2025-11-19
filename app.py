@@ -98,7 +98,6 @@ def api_exportar_empleados_completos():
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
-        # Fallback si viene en un único campo "apellidos"
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -142,7 +141,6 @@ def api_exportar_fichajes(nif, fi, ff):
         return json.loads(decrypted)
 
     except Exception:
-        # Ignoramos errores para que no pare el proceso
         return []
 
 
@@ -304,29 +302,93 @@ if st.button("▶ Obtener resumen de fichajes"):
                     "Numero de fichajes"
                 ]]
 
-                st.subheader("📄 Resumen Diario")
+                # ==========================================
+                # VALIDACIONES
+                # ==========================================
 
-                fechas_unicas = resumen["Fecha"].unique()
+                def hhmm_to_dec(hhmm):
+                    h, m = map(int, hhmm.split(":"))
+                    return h + m/60
 
-                for f_dia in fechas_unicas:
-                    sub = resumen[resumen["Fecha"] == f_dia].copy()
+                resumen["horas_dec"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+                resumen["dia_semana"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
+                def validar(row):
+                    depto = (row["Departamento"] or "").strip().upper()
+                    horas = row["horas_dec"]
+                    fich = row["Numero de fichajes"]
+                    dia = row["dia_semana"]
+
+                    motivo = []
+
+                    if depto in ["ESTRUCTURA", "MOI"]:
+                        if dia in [0,1,2,3]:
+                            min_h = 8.5; min_f = 4
+                        elif dia == 4:
+                            min_h = 6.5; min_f = 2
+                        else:
+                            return None
+
+                        if horas < min_h:
+                            motivo.append(f"Horas insuficientes (mín {min_h}h)")
+                        if fich < min_f:
+                            motivo.append(f"Fichajes insuficientes (mín {min_f})")
+                        if horas >= min_h and fich > min_f:
+                            motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {fich})")
+
+                    elif depto == "MOD":
+                        min_h = 8.0; min_f = 2
+
+                        if horas < min_h:
+                            motivo.append(f"Horas insuficientes (mín {min_h}h)")
+                        if fich < min_f:
+                            motivo.append(f"Fichajes insuficientes (mín {min_f})")
+                        if horas >= min_h and fich > min_f:
+                            motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {fich})")
+
+                    else:
+                        return None
+
+                    return "; ".join(motivo) if motivo else None
+
+                resumen["Motivo"] = resumen.apply(validar, axis=1)
+
+                resumen = resumen[resumen["Motivo"].notna()].copy()
+
+                resumen = resumen[[
+                    "Fecha",
+                    "Nombre Completo",
+                    "Departamento",
+                    "Total trabajado",
+                    "Numero de fichajes",
+                    "Motivo"
+                ]]
+
+                st.subheader("📄 Registros NO conformes")
+
+                if resumen.empty:
+                    st.success("🎉 Todos los empleados cumplen con las condiciones establecidas.")
+                    st.stop()
+
+                fechas = resumen["Fecha"].unique()
+
+                for f_dia in fechas:
                     st.markdown(f"### 📅 Fecha {f_dia}")
+                    sub = resumen[resumen["Fecha"] == f_dia]
 
-                    # Tabla solo lectura, pero con filtros y ordenación por columna
                     st.data_editor(
                         sub,
                         use_container_width=True,
                         hide_index=True,
-                        num_rows="fixed",   # no permite añadir/eliminar filas
-                        disabled=True       # no permite editar celdas
+                        disabled=True,
+                        num_rows="fixed"
                     )
 
                 csv_bytes = resumen.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "⬇ Descargar CSV (todos los días)",
+                    "⬇ Descargar CSV validaciones",
                     csv_bytes,
-                    "fichajes_crece_resumen.csv",
+                    "fichajes_validaciones.csv",
                     "text/csv"
                 )
 
