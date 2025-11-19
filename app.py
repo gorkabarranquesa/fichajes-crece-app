@@ -44,7 +44,7 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 def horas_a_hhmm(horas):
     if horas is None or pd.isna(horas):
         return "00:00"
-    total_min = int(horas * 60)
+    total_min = round(horas * 60)   # redondeo correcto
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
