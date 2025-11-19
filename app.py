@@ -98,6 +98,7 @@ def api_exportar_empleados_completos():
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
+        # Fallback si viene en un único campo "apellidos"
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -141,6 +142,7 @@ def api_exportar_fichajes(nif, fi, ff):
         return json.loads(decrypted)
 
     except Exception:
+        # Ignoramos errores para que no pare el proceso
         return []
 
 
@@ -311,12 +313,13 @@ if st.button("▶ Obtener resumen de fichajes"):
 
                     st.markdown(f"### 📅 Fecha {f_dia}")
 
-                    # st.data_editor permite filtros y ordenación en columnas
+                    # Tabla solo lectura, pero con filtros y ordenación por columna
                     st.data_editor(
                         sub,
                         use_container_width=True,
                         hide_index=True,
-                        num_rows="dynamic"
+                        num_rows="fixed",   # no permite añadir/eliminar filas
+                        disabled=True       # no permite editar celdas
                     )
 
                 csv_bytes = resumen.to_csv(index=False).encode("utf-8")
