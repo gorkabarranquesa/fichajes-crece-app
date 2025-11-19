@@ -16,7 +16,7 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-MAX_WORKERS = 1000  # Peticiones simultáneas (muy rápido, cuidado con límite de API)
+MAX_WORKERS = 1000  # Peticiones simultáneas
 
 
 # ==========================================
@@ -273,7 +273,9 @@ if st.button("▶ Obtener resumen de fichajes"):
                 df = pd.DataFrame(fichajes_totales)
 
                 # Convertir fecha y extraer día
-                df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+                df["fecha_dt"] = pd.to_datetime(
+                    df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce"
+                )
                 df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
                 # Orden previo
@@ -327,41 +329,17 @@ if st.button("▶ Obtener resumen de fichajes"):
 
                 st.subheader("📄 Resumen Diario")
 
-                # ------------------------------------------
-                # UNA TABLA POR CADA FECHA + FILTROS
-                # ------------------------------------------
+                # ==============================
+                # UNA TABLA POR CADA FECHA
+                # ==============================
                 fechas_unicas = resumen["Fecha"].unique()
 
                 for f_dia in fechas_unicas:
                     sub = resumen[resumen["Fecha"] == f_dia].copy()
 
                     st.markdown(f"### 📅 Fecha {f_dia}")
-
-                    # Filtros por Departamento y Nombre Completo
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        departamentos = sorted(sub["Departamento"].dropna().unique().tolist())
-                        depto_sel = st.multiselect(
-                            "Filtrar por departamento",
-                            departamentos,
-                            default=departamentos,
-                            key=f"depto_{f_dia}"
-                        )
-                    with c2:
-                        nombres = sorted(sub["Nombre Completo"].dropna().unique().tolist())
-                        nombres_sel = st.multiselect(
-                            "Filtrar por nombre",
-                            nombres,
-                            default=nombres,
-                            key=f"nombre_{f_dia}"
-                        )
-
-                    sub_filtrado = sub[
-                        sub["Departamento"].isin(depto_sel) &
-                        sub["Nombre Completo"].isin(nombres_sel)
-                    ]
-
-                    st.dataframe(sub_filtrado, use_container_width=True)
+                    # st.dataframe permite filtros en columnas (UI nativa de Streamlit)
+                    st.dataframe(sub, use_container_width=True)
 
                 # CSV global con todos los días
                 csv_bytes = resumen.to_csv(index=False).encode("utf-8")
