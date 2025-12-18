@@ -7,18 +7,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from datetime import datetime, date, timedelta
-import multiprocessing
 
 # ==========================================
-# CONFIG (Rápido y Seguro)
+# CONFIG
 # ==========================================
 
 API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-CPU = multiprocessing.cpu_count()
-MAX_WORKERS = min(32, CPU * 5)  # seguro y rápido
+MAX_WORKERS = 1000  # Peticiones simultáneas (ojo con saturar CRECE)
 
 
 # ==========================================
@@ -26,6 +24,7 @@ MAX_WORKERS = min(32, CPU * 5)  # seguro y rápido
 # ==========================================
 
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
+    """Descifra payload en base64 según Anexo 2 de CRECE."""
     json_raw = base64.b64decode(payload_b64).decode("utf-8")
     payload = json.loads(json_raw)
 
@@ -40,10 +39,11 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
 
 # ==========================================
-# HORAS → HH:MM
+# UTILIDADES HORAS
 # ==========================================
 
 def horas_a_hhmm(horas):
+    """Convierte horas decimales a 'HH:MM', redondeando minutos."""
     if horas is None or pd.isna(horas):
         return "00:00"
     total_min = round(float(horas) * 60)
@@ -53,14 +53,15 @@ def horas_a_hhmm(horas):
 
 
 def hhmm_to_dec(hhmm):
+    """Convierte 'HH:MM' a horas decimales."""
     if not isinstance(hhmm, str) or ":" not in hhmm:
         return 0.0
     h, m = map(int, hhmm.split(":"))
-    return h + m / 60
+    return h + m / 60.0
 
 
 # ==========================================
-# API EXPORTACIÓN DEPARTAMENTOS
+# EXPORTACIÓN DE DEPARTAMENTOS
 # ==========================================
 
 def api_exportar_departamentos():
@@ -85,10 +86,17 @@ def api_exportar_departamentos():
 
 
 # ==========================================
-# API EXPORTACIÓN EMPLEADOS
+# EXPORTACIÓN DE EMPLEADOS
 # ==========================================
 
 def api_exportar_empleados_completos():
+    """
+    Obtenemos empleados completos para:
+    - NIF
+    - Nombre completo
+    - Departamento
+    - num_empleado (para cruzar con /informes/empleados)
+    """
     url = f"{API_URL_BASE}/exportacion/empleados"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"}
     data = {"solo_nif": 0}
@@ -107,6 +115,7 @@ def api_exportar_empleados_completos():
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
 
+        # fallback si solo viene "apellidos"
         if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
             partes = e["apellidos"].split(" ")
             primer_apellido = partes[0] if len(partes) > 0 else ""
@@ -118,17 +127,15 @@ def api_exportar_empleados_completos():
             "nif": e.get("nif"),
             "nombre_completo": nombre_completo,
             "departamento_id": e.get("departamento"),
+            # num_empleado para cruzar con /informes/empleados
+            "num_empleado": e.get("num_empleado") or e.get("Num_empleado") or e.get("numero_empleado"),
         })
 
-    df_emp = pd.DataFrame(lista)
-    # Normalizar NIF
-    if not df_emp.empty:
-        df_emp["nif"] = df_emp["nif"].astype(str).str.upper().str.strip()
-    return df_emp
+    return pd.DataFrame(lista)
 
 
 # ==========================================
-# API EXPORTACIÓN DE FICHAJES
+# EXPORTACIÓN DE FICHAJES
 # ==========================================
 
 def api_exportar_fichajes(nif, fi, ff):
@@ -143,7 +150,7 @@ def api_exportar_fichajes(nif, fi, ff):
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=15)
+        resp = requests.post(url, headers=headers, data=data, timeout=20)
         resp.raise_for_status()
 
         payload_b64 = resp.text.strip().strip('"')
@@ -154,29 +161,27 @@ def api_exportar_fichajes(nif, fi, ff):
         return json.loads(decrypted)
 
     except Exception:
+        # Si falla, devolvemos lista vacía para no parar la app
         return []
 
 
 # ==========================================
-# API EXPORTACIÓN DE VACACIONES/PERMISOS
+# EXPORTACIÓN DE VACACIONES (VACACIONES / AP)
 # ==========================================
 
 def api_exportar_vacaciones(fi, ff):
     """
-    Ampliamos el rango de búsqueda para capturar permisos/vacaciones
-    que empiecen antes o terminen después del rango seleccionado,
-    pero luego recortaremos a fi–ff.
+    Exporta vacaciones / asuntos propios (tipos 1,2,8,9) para el rango.
     """
     url = f"{API_URL_BASE}/exportacion/vacaciones"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"}
-
-    fi_ext = (datetime.strptime(fi, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
-    ff_ext = (datetime.strptime(ff, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
-
-    data = {"fecha_inicio": fi_ext, "fecha_fin": ff_ext}
+    data = {
+        "fecha_inicio": fi,
+        "fecha_fin": ff
+    }
 
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=20)
+        resp = requests.post(url, headers=headers, data=data, timeout=30)
         resp.raise_for_status()
         payload_b64 = resp.text.strip().strip('"')
         if not payload_b64:
@@ -211,10 +216,18 @@ def map_estado_vacaciones(estado):
     return mapping.get(estado, f"Estado {estado}")
 
 
-def obtener_permisos_por_dia(fi, ff):
+def obtener_permisos_vacaciones_por_dia(fi, ff):
+    """
+    Devuelve DF con:
+      - Fecha (YYYY-MM-DD)
+      - nif
+      - Permiso (texto vacaciones/AP)
+      - estado (0..6)
+      - valido_permiso (bool) -> estados 0,1,5,6
+    """
     vacaciones = api_exportar_vacaciones(fi, ff)
     if not vacaciones:
-        return pd.DataFrame(columns=["Fecha", "nif", "Permiso", "valido_permiso"])
+        return pd.DataFrame(columns=["Fecha", "nif", "Permiso", "estado", "valido_permiso"])
 
     filas = []
 
@@ -223,53 +236,197 @@ def obtener_permisos_por_dia(fi, ff):
 
     for v in vacaciones:
         usuario = v.get("usuario", {}) or {}
-        nif = usuario.get("Nif") or usuario.get("nif") or v.get("nif")
+        nif = (
+            usuario.get("Nif")
+            or usuario.get("nif")
+            or v.get("nif")
+        )
+
         if not nif:
             continue
 
+        f_ini_str = v.get("fecha_inicio")
+        f_fin_str = v.get("fecha_fin")
+        tipo = v.get("tipo")
+        estado = v.get("estado")
+
         try:
-            f_ini = datetime.strptime(v["fecha_inicio"], "%Y-%m-%d").date()
-            f_fin = datetime.strptime(v["fecha_fin"], "%Y-%m-%d").date()
+            f_ini = datetime.strptime(f_ini_str, "%Y-%m-%d").date()
+            f_fin = datetime.strptime(f_fin_str, "%Y-%m-%d").date()
         except Exception:
             continue
 
-        # Recortamos al rango real fi–ff
         current = max(f_ini, rango_ini)
         last = min(f_fin, rango_fin)
-        if current > last:
-            continue
 
-        tipo = map_tipo_vacaciones(v.get("tipo"))
-        estado = map_estado_vacaciones(v.get("estado"))
-        valido = v.get("estado") in (0, 1, 5, 6)  # pendientes y aprobadas, etc.
+        tipo_txt = map_tipo_vacaciones(tipo)
+        estado_txt = map_estado_vacaciones(estado)
+        permiso_label = f"{tipo_txt} ({estado_txt})"
 
         while current <= last:
             filas.append({
                 "Fecha": current.strftime("%Y-%m-%d"),
                 "nif": nif,
-                "Permiso": f"{tipo} ({estado})",
-                "valido_permiso": valido
+                "Permiso": permiso_label,
+                "estado": estado
             })
             current += timedelta(days=1)
 
     if not filas:
-        return pd.DataFrame(columns=["Fecha", "nif", "Permiso", "valido_permiso"])
+        return pd.DataFrame(columns=["Fecha", "nif", "Permiso", "estado", "valido_permiso"])
 
     dfp = pd.DataFrame(filas)
 
-    # Normalizar NIF aquí también
-    dfp["nif"] = dfp["nif"].astype(str).str.upper().str.strip()
+    # válidos para horas: pendientes / aprobadas / pendientes admin / solicitada cancelación
+    dfp["valido_permiso"] = dfp["estado"].apply(lambda e: e in (0, 1, 5, 6))
 
-    dfp = dfp.groupby(["Fecha", "nif"], as_index=False).agg(
+    # Agrupamos por día y nif (puede haber varios registros)
+    dfp_grp = dfp.groupby(["Fecha", "nif"], as_index=False).agg(
         Permiso=("Permiso", lambda s: " + ".join(sorted(set(s)))),
+        estado=("estado", "max"),
         valido_permiso=("valido_permiso", "max")
     )
 
-    return dfp
+    return dfp_grp
 
 
 # ==========================================
-# CÁLCULO DE HORAS POR DÍA
+# INFORME DE EMPLEADOS (PERMISOS OTROS)
+# ==========================================
+
+def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
+    """
+    Llama a /api/informes/empleados para un rango.
+    El manual indica que devuelve, por empleado, un ARRAY con los campos
+    (Nº empleado, ..., Horas de permisos retribuidos, Horas de permisos NO retribuidos, ...).
+    """
+    url = f"{API_URL_BASE}/informes/empleados"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"}
+    data = {
+        "fecha_desde": fecha_desde,
+        "fecha_hasta": fecha_hasta,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=30)
+        resp.raise_for_status()
+        payload_b64 = resp.text.strip().strip('"')
+        if not payload_b64:
+            return []
+
+        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+        return json.loads(decrypted)
+    except Exception:
+        return []
+
+
+def obtener_permisos_otros_por_dia(fi: str, ff: str, empleados_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Usa /informes/empleados día a día para obtener:
+      - Horas de permisos retribuidos
+      - Horas de permisos NO retribuidos
+
+    Devuelve DF:
+      Fecha, nif, horas_perm_otros (decimal)
+    """
+    try:
+        fi_d = datetime.strptime(fi, "%Y-%m-%d").date()
+        ff_d = datetime.strptime(ff, "%Y-%m-%d").date()
+    except Exception:
+        return pd.DataFrame(columns=["Fecha", "nif", "horas_perm_otros"])
+
+    if fi_d > ff_d:
+        return pd.DataFrame(columns=["Fecha", "nif", "horas_perm_otros"])
+
+    filas = []
+
+    # Preparamos cruce num_empleado -> nif
+    emp_keys = empleados_df[["nif", "num_empleado"]].dropna().copy()
+    emp_keys["num_empleado"] = emp_keys["num_empleado"].astype(str)
+
+    current = fi_d
+    while current <= ff_d:
+        d_str = current.strftime("%Y-%m-%d")
+        registros = api_informe_empleados(d_str, d_str)
+
+        for reg in registros:
+            num_emp = None
+            horas_ret = 0.0
+            horas_noret = 0.0
+
+            # Caso más probable según manual: array posicional
+            if isinstance(reg, (list, tuple)):
+                # índice 0: Nº empleado
+                # índice 29: Horas de permisos retribuidos
+                # índice 30: Horas de permisos NO retribuidos
+                # (contando desde 0)
+                if len(reg) >= 31:
+                    num_emp = reg[0]
+                    try:
+                        horas_ret = float(reg[29] or 0)
+                    except Exception:
+                        horas_ret = 0.0
+                    try:
+                        horas_noret = float(reg[30] or 0)
+                    except Exception:
+                        horas_noret = 0.0
+
+            # fallback por si alguna versión devolviera diccionarios
+            elif isinstance(reg, dict):
+                num_emp = reg.get("num_empleado") or reg.get("Nº empleado") or reg.get("numero_empleado")
+                def _get_float(d, keys):
+                    for k in keys:
+                        if k in d and d[k] is not None:
+                            try:
+                                return float(d[k])
+                            except Exception:
+                                pass
+                    return 0.0
+
+                horas_ret = _get_float(reg, [
+                    "Horas de permisos retribuidos",
+                    "horas_permisos_retribuidos",
+                    "horas_perm_retribuidos"
+                ])
+                horas_noret = _get_float(reg, [
+                    "Horas de permisos NO retribuidos",
+                    "horas_permisos_no_retribuidos",
+                    "horas_perm_no_retribuidos"
+                ])
+
+            if not num_emp:
+                continue
+
+            total_perm = horas_ret + horas_noret
+            if total_perm <= 0:
+                continue
+
+            filas.append({
+                "Fecha": d_str,
+                "num_empleado": str(num_emp),
+                "horas_perm_otros": total_perm
+            })
+
+        current += timedelta(days=1)
+
+    if not filas:
+        return pd.DataFrame(columns=["Fecha", "nif", "horas_perm_otros"])
+
+    df_per = pd.DataFrame(filas)
+    df_per["num_empleado"] = df_per["num_empleado"].astype(str)
+
+    df_per = df_per.merge(emp_keys, on="num_empleado", how="left")
+    df_per = df_per[df_per["nif"].notna()]
+
+    if df_per.empty:
+        return pd.DataFrame(columns=["Fecha", "nif", "horas_perm_otros"])
+
+    df_per = df_per.groupby(["Fecha", "nif"], as_index=False)["horas_perm_otros"].sum()
+    return df_per
+
+
+# ==========================================
+# CÁLCULO DE HORAS A PARTIR DE FICHAJES
 # ==========================================
 
 def calcular_horas(df):
@@ -292,19 +449,23 @@ def calcular_horas(df):
             i = 0
 
             while i < len(sub) - 1:
-                e1, e2 = sub.iloc[i], sub.iloc[i + 1]
+                entrada = sub.iloc[i]
+                salida = sub.iloc[i + 1]
 
-                if e1["direccion"] == "entrada" and e2["direccion"] == "salida":
-                    total_seconds = (e2["fecha_dt"] - e1["fecha_dt"]).total_seconds()
-                    horas = total_seconds / 3600
+                if entrada["direccion"] == "entrada" and salida["direccion"] == "salida":
+                    t1 = entrada["fecha_dt"]
+                    t2 = salida["fecha_dt"]
+                    total_seconds = (t2 - t1).total_seconds()
+                    horas = total_seconds / 3600.0
 
-                    e1["horas_trabajadas"] = horas
+                    entrada["horas_trabajadas"] = horas
                     horas_acum += horas
-                    e1["horas_acumuladas"] = horas_acum
-                    result.append(e1)
+                    entrada["horas_acumuladas"] = horas_acum
+                    result.append(entrada)
 
-                    e2["horas_acumuladas"] = horas_acum
-                    result.append(e2)
+                    salida["horas_trabajadas"] = 0.0
+                    salida["horas_acumuladas"] = horas_acum
+                    result.append(salida)
 
                     i += 2
                 else:
@@ -316,35 +477,40 @@ def calcular_horas(df):
                 sub.iloc[i]["horas_acumuladas"] = horas_acum
                 result.append(sub.iloc[i])
 
-    return pd.DataFrame(result).sort_values(["fecha_dt", "nif"])
+    df_final = pd.DataFrame(result)
+    return df_final.sort_values(["fecha_dt", "nombre_completo"])
 
 
 # ==========================================
-# REGLAS DE JORNADA
+# REGLAS DE JORNADA POR DEPARTAMENTO/DÍA
 # ==========================================
 
-def calcular_minimos(depto: str, dia: int):
-    depto = (depto or "").upper().strip()
+def calcular_minimos(depto: str, dia_semana: int):
+    """
+    Devuelve (min_horas, min_fichajes) o (None, None) si no aplica.
+    depto en mayúsculas, dia_semana: 0=Lunes ... 6=Domingo
+    """
     if depto in ["ESTRUCTURA", "MOI"]:
-        if dia in [0, 1, 2, 3]:
+        if dia_semana in [0, 1, 2, 3]:   # L-J
             return 8.5, 4
-        if dia == 4:
+        elif dia_semana == 4:            # V
             return 6.5, 2
-        return None, None
-
-    if depto == "MOD":
-        if dia in [0, 1, 2, 3, 4]:
+        else:
+            return None, None
+    elif depto == "MOD":
+        if dia_semana in [0, 1, 2, 3, 4]:  # L-V
             return 8.0, 2
+        else:
+            return None, None
+    else:
         return None, None
-
-    return None, None
 
 
 # ==========================================
 # UI STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
+st.set_page_config(page_title="Fichajes CRECE", layout="wide")
 st.title("📊 Fichajes CRECE Personas")
 
 hoy = date.today()
@@ -360,236 +526,367 @@ st.write("---")
 if st.button("▶ Obtener resumen de fichajes y permisos"):
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
-        st.stop()
-
-    if fecha_fin > hoy:
+    elif fecha_fin > hoy:
         st.error("❌ La fecha fin no puede ser mayor que hoy.")
-        st.stop()
+    else:
+        with st.spinner("Cargando empleados, departamentos, fichajes y permisos…"):
 
-    with st.spinner("Cargando información…"):
+            fi = fecha_inicio.strftime("%Y-%m-%d")
+            ff = fecha_fin.strftime("%Y-%m-%d")
 
-        fi = fecha_inicio.strftime("%Y-%m-%d")
-        ff = fecha_fin.strftime("%Y-%m-%d")
+            # 1) Departamentos y empleados
+            departamentos_df = api_exportar_departamentos()
+            empleados_df = api_exportar_empleados_completos()
 
-        # 1) Empleados y departamentos
-        departamentos_df = api_exportar_departamentos()
-        empleados_df = api_exportar_empleados_completos()
-        empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
-
-        # Aseguramos NIF normalizado
-        if not empleados_df.empty:
-            empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
-
-        # 2) Fichajes paralelos
-        fichajes = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-            futures = {
-                exe.submit(api_exportar_fichajes, e["nif"], fi, ff): e
-                for _, e in empleados_df.iterrows()
-            }
-            for f in as_completed(futures):
-                emp = futures[f]
-                resp = f.result()
-                for x in resp:
-                    fichajes.append({
-                        "nif": emp["nif"],
-                        "nombre_completo": emp["nombre_completo"],
-                        "departamento_nombre": emp["departamento_nombre"],
-                        "id": x["id"],
-                        "direccion": x["direccion"],
-                        "fecha": x["fecha"],
-                    })
-
-        # 3) Construcción de resumen base
-        if fichajes:
-            df = pd.DataFrame(fichajes)
-            df["nif"] = df["nif"].astype(str).str.upper().str.strip()
-            df["fecha_dt"] = pd.to_datetime(df["fecha"])
-            df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
-
-            df = calcular_horas(df)
-            df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
-
-            resumen = df.groupby(
-                ["nif", "nombre_completo", "departamento_nombre", "fecha_dia"],
-                as_index=False
-            ).agg(
-                horas=("horas_acumuladas", "max"),
-                fichajes=("Numero", "max")
+            empleados_df = empleados_df.merge(
+                departamentos_df,
+                on="departamento_id",
+                how="left"
             )
 
-            resumen["Total trabajado"] = resumen["horas"].apply(horas_a_hhmm)
+            # 2) Fichajes en paralelo
+            fichajes_totales = []
 
-        else:
-            resumen = pd.DataFrame(columns=[
-                "nif", "nombre_completo", "departamento_nombre",
-                "fecha_dia", "horas", "fichajes", "Total trabajado"
-            ])
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(api_exportar_fichajes, e["nif"], fi, ff): e
+                    for _, e in empleados_df.iterrows()
+                    if pd.notna(e.get("nif"))
+                }
 
-        resumen = resumen.rename(columns={
-            "nombre_completo": "Nombre",
-            "departamento_nombre": "Departamento",
-            "fecha_dia": "Fecha",
-            "fichajes": "Numero de fichajes",
-        })
+                for future in as_completed(futures):
+                    emp = futures[future]
+                    fichajes = future.result()
 
-        if not resumen.empty:
-            resumen["nif"] = resumen["nif"].astype(str).str.upper().str.strip()
+                    for f in fichajes:
+                        fichajes_totales.append({
+                            "nif": emp["nif"],
+                            "nombre_completo": emp["nombre_completo"],
+                            "departamento_nombre": emp["departamento_nombre"],
+                            "id": f.get("id"),
+                            "tipo": f.get("tipo"),
+                            "fecha": f.get("fecha"),
+                            "direccion": f.get("direccion"),
+                        })
 
-        # 4) Permisos
-        permisos = obtener_permisos_por_dia(fi, ff)
+            # 3) Construcción de resumen base (fichajes)
+            if fichajes_totales:
+                df = pd.DataFrame(fichajes_totales)
 
-        # Añadir días con permisos sin fichajes
-        if not permisos.empty:
-            # Normalizar NIF en permisos (por si acaso)
-            permisos["nif"] = permisos["nif"].astype(str).str.upper().str.strip()
+                df["fecha_dt"] = pd.to_datetime(df["fecha"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+                df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
-            faltantes = permisos.merge(
-                resumen[["nif", "Fecha"]],
-                on=["nif", "Fecha"],
-                how="left",
-                indicator=True
-            )
-            faltantes = faltantes[faltantes["_merge"] == "left_only"][["nif", "Fecha"]]
+                df = df.sort_values(["nif", "fecha_dt", "nombre_completo"])
+                df = calcular_horas(df)
+                df = df.sort_values(["nif", "fecha_dt", "nombre_completo"])
 
-            if not faltantes.empty:
-                faltantes = faltantes.merge(
+                df["Numero_de_fichajes"] = df.groupby(
+                    ["nif", "fecha_dia"]
+                )["id"].transform("count")
+
+                resumen = df.sort_values("fecha_dt").groupby(
+                    ["nif", "nombre_completo", "departamento_nombre", "fecha_dia"],
+                    as_index=False
+                ).agg({
+                    "horas_acumuladas": "max",
+                    "Numero_de_fichajes": "max"
+                })
+
+                resumen["Total trabajado"] = resumen["horas_acumuladas"].apply(horas_a_hhmm)
+
+                resumen = resumen.rename(columns={
+                    "fecha_dia": "Fecha",
+                    "nombre_completo": "Nombre Completo",
+                    "departamento_nombre": "Departamento",
+                    "Numero_de_fichajes": "Numero de fichajes"
+                })
+
+            else:
+                resumen = pd.DataFrame(columns=[
+                    "nif", "Nombre Completo", "Departamento",
+                    "Fecha", "horas_acumuladas", "Numero de fichajes", "Total trabajado"
+                ])
+
+            # 4) Permisos/vacaciones por día (Vacaciones/AP)
+            permisos_vac_df = obtener_permisos_vacaciones_por_dia(fi, ff)
+
+            # 5) Añadir días con vacaciones pero sin fichajes
+            if not permisos_vac_df.empty:
+                perms_ext = permisos_vac_df.merge(
                     empleados_df[["nif", "nombre_completo", "departamento_nombre"]],
                     on="nif",
                     how="left"
                 )
-                faltantes["horas"] = 0
-                faltantes["Numero de fichajes"] = 0
-                faltantes["Total trabajado"] = "00:00"
-                faltantes = faltantes.rename(columns={
-                    "nombre_completo": "Nombre",
-                    "departamento_nombre": "Departamento"
-                })
-                resumen = pd.concat([resumen, faltantes], ignore_index=True)
 
-        # Merge permisos al resumen
-        resumen = resumen.merge(permisos, on=["nif", "Fecha"], how="left")
+                if resumen.empty:
+                    resumen = perms_ext.copy()
+                    resumen = resumen.rename(columns={
+                        "nombre_completo": "Nombre Completo",
+                        "departamento_nombre": "Departamento"
+                    })
+                    resumen["horas_acumuladas"] = 0.0
+                    resumen["Numero de fichajes"] = 0
+                    resumen["Total trabajado"] = "00:00"
+                else:
+                    claves_res = resumen[["nif", "Fecha"]].drop_duplicates()
+                    claves_perm = perms_ext[["nif", "Fecha"]].drop_duplicates()
 
-        if resumen.empty:
-            st.info("No se encontraron fichajes ni permisos en el rango seleccionado.")
-            st.stop()
+                    faltan = claves_perm.merge(
+                        claves_res,
+                        on=["nif", "Fecha"],
+                        how="left",
+                        indicator=True
+                    )
+                    faltan = faltan[faltan["_merge"] == "left_only"][["nif", "Fecha"]]
 
-        # ==========================================
-        # CÁLCULO DE HORAS TOTALES Y VALIDACIONES
-        # ==========================================
+                    if not faltan.empty:
+                        faltan = faltan.merge(
+                            empleados_df[["nif", "nombre_completo", "departamento_nombre"]],
+                            on="nif",
+                            how="left"
+                        )
+                        faltan["horas_acumuladas"] = 0.0
+                        faltan["Numero de fichajes"] = 0
+                        faltan["Total trabajado"] = "00:00"
+                        faltan = faltan.rename(columns={
+                            "nombre_completo": "Nombre Completo",
+                            "departamento_nombre": "Departamento"
+                        })
+                        resumen = pd.concat([resumen, faltan], ignore_index=True)
 
-        resumen["horas_dec"] = resumen["Total trabajado"].apply(hhmm_to_dec)
-        resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
-
-        # Minimos
-        resumen[["min_horas", "min_fichajes"]] = resumen.apply(
-            lambda r: pd.Series(calcular_minimos(r.get("Departamento"), r["dia"])),
-            axis=1
-        )
-
-        # Horas permiso CORREGIDAS
-        def calc_horas_permiso(r):
-            p = r.get("Permiso")
-            # Sin permiso
-            if p is None or pd.isna(p) or str(p).strip() == "":
-                return 0.0
-            # Permiso no válido
-            if not bool(r.get("valido_permiso")):
-                return 0.0
-            # Departamento sin mínimos (ej. fin de semana)
-            if pd.isna(r.get("min_horas")):
-                return 0.0
-            return float(r["min_horas"])
-
-        resumen["horas_permiso"] = resumen.apply(calc_horas_permiso, axis=1)
-        resumen["horas_totales"] = resumen["horas_dec"] + resumen["horas_permiso"]
-
-        # Validaciones
-        def validar(r):
-            min_h, min_f = r["min_horas"], r["min_fichajes"]
-            if pd.isna(min_h) or pd.isna(min_f):
-                # No validamos dept. sin reglas
-                return None
-
-            motivo = []
-
-            if r["horas_totales"] < min_h:
-                motivo.append(
-                    f"Horas totales insuficientes (mín {min_h}h, tiene {r['horas_totales']:.2f}h)"
+            # 6) Merge permisos vacaciones al resumen
+            if not permisos_vac_df.empty and not resumen.empty:
+                resumen = resumen.merge(
+                    permisos_vac_df,
+                    on=["nif", "Fecha"],
+                    how="left"
                 )
+            else:
+                if "Permiso" not in resumen.columns:
+                    resumen["Permiso"] = None
+                if "valido_permiso" not in resumen.columns:
+                    resumen["valido_permiso"] = False
 
-            if r["Numero de fichajes"] < min_f:
-                motivo.append(
-                    f"Fichajes insuficientes (mín {min_f}, tiene {r['Numero de fichajes']})"
+            # 7) Permisos OTROS (hospitalización, médico, etc.) vía /informes/empleados
+            permisos_otros_df = obtener_permisos_otros_por_dia(fi, ff, empleados_df)
+
+            if not permisos_otros_df.empty:
+                if resumen.empty:
+                    base = permisos_otros_df.merge(
+                        empleados_df[["nif", "nombre_completo", "departamento_nombre"]],
+                        on="nif",
+                        how="left"
+                    )
+                    base = base.rename(columns={
+                        "nombre_completo": "Nombre Completo",
+                        "departamento_nombre": "Departamento"
+                    })
+                    base["horas_acumuladas"] = 0.0
+                    base["Numero de fichajes"] = 0
+                    base["Total trabajado"] = "00:00"
+                    base["Permiso"] = None
+                    base["valido_permiso"] = False
+                    resumen = base
+                else:
+                    # Días con permisos otros pero sin filas en resumen
+                    claves_res2 = resumen[["nif", "Fecha"]].drop_duplicates()
+                    claves_perm2 = permisos_otros_df[["nif", "Fecha"]].drop_duplicates()
+
+                    faltan2 = claves_perm2.merge(
+                        claves_res2,
+                        on=["nif", "Fecha"],
+                        how="left",
+                        indicator=True
+                    )
+                    faltan2 = faltan2[faltan2["_merge"] == "left_only"][["nif", "Fecha"]]
+
+                    if not faltan2.empty:
+                        faltan2 = faltan2.merge(
+                            empleados_df[["nif", "nombre_completo", "departamento_nombre"]],
+                            on="nif",
+                            how="left"
+                        )
+                        faltan2["horas_acumuladas"] = 0.0
+                        faltan2["Numero de fichajes"] = 0
+                        faltan2["Total trabajado"] = "00:00"
+                        faltan2 = faltan2.rename(columns={
+                            "nombre_completo": "Nombre Completo",
+                            "departamento_nombre": "Departamento"
+                        })
+                        faltan2["Permiso"] = None
+                        faltan2["valido_permiso"] = False
+                        resumen = pd.concat([resumen, faltan2], ignore_index=True)
+
+                resumen = resumen.merge(
+                    permisos_otros_df,
+                    on=["nif", "Fecha"],
+                    how="left"
                 )
+            else:
+                if "horas_perm_otros" not in resumen.columns:
+                    resumen["horas_perm_otros"] = 0.0
 
-            if r["horas_totales"] >= min_h and r["Numero de fichajes"] > min_f:
-                motivo.append(
-                    f"Fichajes excesivos (mín {min_f}, tiene {r['Numero de fichajes']})"
-                )
+            # Si sigue vacío, no hay fichajes ni permisos de ningún tipo
+            if resumen.empty:
+                st.info("No se encontraron fichajes ni permisos en el rango seleccionado.")
+                st.stop()
 
-            return "; ".join(motivo) if motivo else None
+            # ==========================================
+            # CÁLCULO DE HORAS TOTALES Y VALIDACIONES
+            # ==========================================
 
-        resumen["Incidencia"] = resumen.apply(validar, axis=1)
+            resumen["horas_dec"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+            resumen["dia_semana"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
-        # Motivo final (Opción O: siempre mostrar permisos)
-        def motivo_final(r):
-            per = r.get("Permiso")
-            inc = r.get("Incidencia")
+            # Mínimos por depto/día
+            def aplicar_minimos(row):
+                depto = (row["Departamento"] or "").strip().upper()
+                dia = int(row["dia_semana"])
+                min_h, min_f = calcular_minimos(depto, dia)
+                return pd.Series({"min_horas": min_h, "min_fichajes": min_f})
 
-            if per and not pd.isna(per) and str(per).strip():
-                texto = f"Permiso: {per}"
-                if "Pendiente" in per:
-                    texto += " (pendiente, contado como horas para el cuadre)"
-                return texto if not inc else f"{texto} | {inc}"
+            mins = resumen.apply(aplicar_minimos, axis=1)
+            resumen["min_horas"] = mins["min_horas"]
+            resumen["min_fichajes"] = mins["min_fichajes"]
 
-            return inc
+            # Horas de permiso por vacaciones/AP (cuando hay Permiso válido)
+            def calc_horas_perm_vac(row):
+                if not row.get("Permiso") or not row.get("valido_permiso"):
+                    return 0.0
+                if pd.isna(row["min_horas"]):
+                    return 0.0
+                # usamos min_horas como "jornada" cubierta por vacaciones/AP
+                return float(row["min_horas"])
 
-        resumen["Motivo"] = resumen.apply(motivo_final, axis=1)
+            resumen["horas_perm_vac"] = resumen.apply(calc_horas_perm_vac, axis=1)
 
-        resumen_final = resumen[resumen["Motivo"].notna()].copy()
+            # Aseguramos columna permisos_otros
+            if "horas_perm_otros" not in resumen.columns:
+                resumen["horas_perm_otros"] = 0.0
+            resumen["horas_perm_otros"] = resumen["horas_perm_otros"].fillna(0.0)
 
-        if resumen_final.empty:
-            st.success("🎉 No hay incidencias ni permisos que mostrar.")
-            st.stop()
-
-        resumen_final["Horas permiso"] = resumen_final["horas_permiso"].apply(horas_a_hhmm)
-        resumen_final["Horas totales"] = resumen_final["horas_totales"].apply(horas_a_hhmm)
-
-        resumen_final = resumen_final[[
-            "Fecha",
-            "Nombre",
-            "Departamento",
-            "Total trabajado",
-            "Horas permiso",
-            "Horas totales",
-            "Numero de fichajes",
-            "Permiso",
-            "Motivo"
-        ]]
-
-        resumen_final = resumen_final.sort_values(["Fecha", "Nombre"])
-
-        # Mostrar tablas por fecha
-        st.subheader("📄 Incidencias y permisos")
-
-        fechas = resumen_final["Fecha"].unique()
-        for f_dia in fechas:
-            st.markdown(f"### 📅 {f_dia}")
-            sub = resumen_final[resumen_final["Fecha"] == f_dia]
-
-            st.data_editor(
-                sub,
-                use_container_width=True,
-                hide_index=True,
-                disabled=True,
-                num_rows="fixed"
+            # Horas totales = trabajadas + permiso vacaciones/AP + permisos otros (hospitalización, médico, etc.)
+            resumen["horas_totales"] = (
+                resumen["horas_dec"]
+                + resumen["horas_perm_vac"]
+                + resumen["horas_perm_otros"]
             )
 
-        csv = resumen_final.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇ Descargar CSV",
-            csv,
-            "fichajes_validaciones_permisos.csv",
-            "text/csv"
-        )
+            # Validación por reglas
+            def validar(row):
+                depto = (row["Departamento"] or "").strip().upper()
+                horas_tot = float(row["horas_totales"])
+                fich = int(row["Numero de fichajes"])
+                min_h = row["min_horas"]
+                min_f = row["min_fichajes"]
+
+                motivo = []
+
+                if pd.isna(min_h) or pd.isna(min_f):
+                    # Departamento sin reglas → no validamos horas/fichajes
+                    return None
+
+                # Horas
+                if horas_tot < min_h:
+                    motivo.append(f"Horas totales insuficientes (mín {min_h}h, tiene {horas_tot:.2f}h)")
+
+                # Fichajes
+                if fich < min_f:
+                    motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {fich})")
+
+                # Fichajes excesivos (cumple horas mínimas)
+                if horas_tot >= min_h and fich > min_f:
+                    motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {fich})")
+
+                return "; ".join(motivo) if motivo else None
+
+            resumen["Motivo_incidencia"] = resumen.apply(validar, axis=1)
+
+            # Combinar incidencia + info de permisos (vacaciones/AP + otros permisos)
+            def combinar_motivo(row):
+                per = row.get("Permiso")
+                inc = row.get("Motivo_incidencia")
+                per_otros = float(row.get("horas_perm_otros", 0.0))
+
+                texto_perm = None
+
+                # Vacaciones / AP
+                if per and isinstance(per, str) and per.strip():
+                    texto_perm = f"Vacaciones/Asuntos propios: {per}"
+                    if "Pendiente" in per or "Pendientes" in per:
+                        texto_perm += " (pendiente, contado como horas para el cuadre)"
+
+                # Otros permisos retribuidos / no retribuidos (ej. Hospitalización familiar)
+                if per_otros > 0:
+                    hhmm_otros = horas_a_hhmm(per_otros)
+                    texto_otros = f"Permisos retribuidos/NO retribuidos: {hhmm_otros} (según informe de empleados)"
+                    if texto_perm:
+                        texto_perm = texto_perm + " | " + texto_otros
+                    else:
+                        texto_perm = texto_otros
+
+                if texto_perm:
+                    if inc and isinstance(inc, str) and inc.strip():
+                        return f"{texto_perm} | {inc}"
+                    else:
+                        return texto_perm
+                else:
+                    return inc
+
+            resumen["Motivo"] = resumen.apply(combinar_motivo, axis=1)
+
+            # Mostrar:
+            # - filas con incidencias
+            # - filas con permisos (aunque no haya incidencia)
+            resumen_filtrado = resumen[resumen["Motivo"].notna()].copy()
+
+            if resumen_filtrado.empty:
+                st.success("🎉 No hay incidencias ni permisos relevantes en el rango seleccionado.")
+                st.stop()
+
+            # Orden final: por Fecha y Nombre Completo
+            resumen_filtrado = resumen_filtrado.sort_values(
+                ["Fecha", "Nombre Completo"], ascending=[True, True]
+            )
+
+            # Columnas visibles
+            resumen_filtrado["Horas permiso"] = (
+                resumen_filtrado["horas_perm_vac"] + resumen_filtrado["horas_perm_otros"]
+            ).apply(horas_a_hhmm)
+            resumen_filtrado["Horas totales"] = resumen_filtrado["horas_totales"].apply(horas_a_hhmm)
+
+            resumen_filtrado = resumen_filtrado[[
+                "Fecha",
+                "Nombre Completo",
+                "Departamento",
+                "Total trabajado",
+                "Horas permiso",
+                "Horas totales",
+                "Numero de fichajes",
+                "Permiso",
+                "Motivo"
+            ]]
+
+            st.subheader("📄 Registros: incidencias y/o permisos")
+
+            fechas = resumen_filtrado["Fecha"].unique()
+
+            for f_dia in fechas:
+                st.markdown(f"### 📅 Fecha {f_dia}")
+                sub = resumen_filtrado[resumen_filtrado["Fecha"] == f_dia]
+
+                st.data_editor(
+                    sub,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=True,
+                    num_rows="fixed"
+                )
+
+            csv_bytes = resumen_filtrado.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇ Descargar CSV (incidencias + permisos + cuadre)",
+                csv_bytes,
+                "fichajes_validaciones_permisos_cuadre.csv",
+                "text/csv"
+            )
