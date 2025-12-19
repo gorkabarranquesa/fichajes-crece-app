@@ -396,10 +396,13 @@ def validar_incidencia(r):
         horas_val = 0.0
 
     motivo = []
+
     if horas_val < float(min_h):
         motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {horas_val:.2f}h)")
+
     if num_fich < int(min_f):
-        motivo.append(fFichajes insuficientes (mín {min_f}, tiene {num_fich})")
+        motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {num_fich})")
+
     if horas_val >= float(min_h) and num_fich > int(min_f):
         motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {num_fich})")
 
