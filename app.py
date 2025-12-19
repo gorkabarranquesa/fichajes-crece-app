@@ -57,33 +57,48 @@ def _extract_payload_b64(resp: requests.Response) -> str:
 
 
 # ============================================================
-# FORMATEOS TIEMPO
+# FORMATEOS TIEMPO (TRUNCADO A MINUTO: estilo CRECE)
 # ============================================================
 
 def segundos_a_hhmm(seg: float) -> str:
+    """
+    TRUNCADO a minuto (floor), NO round.
+    Evita el +1 minuto por segundos residuales.
+    """
     if seg is None or pd.isna(seg):
         return ""
-    seg = max(0, int(round(float(seg))))
-    total_min = seg // 60
+    try:
+        seg_i = int(float(seg))
+    except Exception:
+        return ""
+    if seg_i < 0:
+        seg_i = 0
+
+    total_min = seg_i // 60  # <-- truncado
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
 
 
-def hhmm_to_dec(hhmm: str) -> float:
+def hhmm_to_min(hhmm: str) -> int:
     if not isinstance(hhmm, str) or ":" not in hhmm:
-        return 0.0
+        return 0
     try:
         h, m = map(int, hhmm.split(":"))
-        return float(h) + float(m) / 60.0
+        return max(0, h * 60 + m)
     except Exception:
-        return 0.0
+        return 0
+
+
+def hhmm_to_dec(hhmm: str) -> float:
+    mins = hhmm_to_min(hhmm)
+    return mins / 60.0
 
 
 def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     """
     Diferencia = Tiempo Contabilizado - Total trabajado
-    - Devuelve "" si son iguales (al minuto) o falta alguno
+    - Devuelve "" si son iguales o falta alguno
     - Devuelve +HH:MM o -HH:MM
     """
     tc_hhmm = (tc_hhmm or "").strip()
@@ -91,8 +106,8 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     if not tc_hhmm or not tt_hhmm:
         return ""
 
-    tc_min = int(round(hhmm_to_dec(tc_hhmm) * 60))
-    tt_min = int(round(hhmm_to_dec(tt_hhmm) * 60))
+    tc_min = hhmm_to_min(tc_hhmm)
+    tt_min = hhmm_to_min(tt_hhmm)
 
     if tc_min == tt_min:
         return ""
@@ -213,10 +228,6 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
 
 
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
-    """
-    Manual: clave = parámetro encontrado (nif/email/...), valor = array con:
-    ID, nif/email/..., tiempoEfectivo (seg), tiempoContabilizado (seg). :contentReference[oaicite:1]{index=1}
-    """
     filas = []
 
     def add_row(key: str, val):
@@ -224,7 +235,6 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
         if not k:
             return
 
-        # Caso dict (ideal)
         if isinstance(val, dict):
             filas.append(
                 {
@@ -235,20 +245,16 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
             )
             return
 
-        # Caso lista posicional: [ID, nif/email/..., tiempoEfectivo, tiempoContabilizado]
         if isinstance(val, list) and len(val) >= 4:
-            tef = val[-2]
-            tco = val[-1]
             filas.append(
                 {
                     "nif": k,
-                    "tiempoEfectivo_seg": tef,
-                    "tiempoContabilizado_seg": tco,
+                    "tiempoEfectivo_seg": val[-2],
+                    "tiempoContabilizado_seg": val[-1],
                 }
             )
             return
 
-        # Fallback
         filas.append({"nif": k, "tiempoEfectivo_seg": None, "tiempoContabilizado_seg": None})
 
     if isinstance(parsed, dict):
@@ -264,16 +270,16 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
 
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
     """
-    IMPORTANTE: NO CAMBIAMOS LA FORMA (seguimos usando nif[] repetido) porque así ya te funciona.
+    MISMA FORMA que te funciona:
+    - POST con nif[] repetido.
+    - desde/hasta según llamamos por día.
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
 
     if nifs:
         for v in nifs:
-            if v is None:
-                continue
-            s = str(v).strip()
+            s = str(v).strip() if v is not None else ""
             if s:
                 payload.append(("nif[]", s))
 
@@ -305,7 +311,7 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
 
 
 # ============================================================
-# TIEMPO POR FICHAJES (neto)
+# TIEMPO POR FICHAJES (neto) - TRABAJAMOS EN SEGUNDOS ENTEROS
 # ============================================================
 
 def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
@@ -330,11 +336,12 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
+                        delta_i = int(delta)  # <-- NO round, truncamos segundos
                         props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
-                            descontados += int(round(delta))
+                            descontados += delta_i
                         else:
-                            sumados += int(round(delta))
+                            sumados += delta_i
                     i += 2
                 else:
                     i += 1
@@ -365,21 +372,19 @@ def calcular_minimos(depto: str, dia: int):
     return None, None
 
 
-def validar_incidencia(r):
+def validar_incidencia(r) -> str:
     min_h = r.get("min_horas")
     min_f = r.get("min_fichajes")
     if pd.isna(min_h) or pd.isna(min_f):
         return ""
 
-    num_fich = r.get("Numero de fichajes", 0)
     try:
-        num_fich = int(num_fich) if not pd.isna(num_fich) else 0
+        num_fich = int(r.get("Numero de fichajes", 0) or 0)
     except Exception:
         num_fich = 0
 
-    horas_val = r.get("horas_dec_validacion", 0.0)
     try:
-        horas_val = float(horas_val) if not pd.isna(horas_val) else 0.0
+        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
     except Exception:
         horas_val = 0.0
 
@@ -476,7 +481,7 @@ if st.button("Consultar"):
 
         df["fecha_dia"] = df.apply(_dia_row, axis=1)
 
-        # Número de fichajes por día
+        # Nº fichajes por día
         df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
         conteo = (
             df.groupby(["nif", "Nombre", "Departamento", "fecha_dia"], as_index=False)
@@ -484,17 +489,18 @@ if st.button("Consultar"):
             .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
         )
 
-        # Tiempo neto por marcajes
+        # Tiempo neto por marcajes (segundos)
         neto = calcular_tiempos_neto(df, tipos_map)
         resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
         resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
+
+        # Total trabajado (truncado minuto)
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
         # ============================================================
         # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA QUE TE FUNCIONA
-        # Con mejora para evitar "de más":
-        #   1) intentar (desde=dia, hasta=dia)
-        #   2) si viene vacío, fallback (hasta=dia+1)
+        # Intento 1: (desde=dia, hasta=dia)  -> evita sumar "de más"
+        # Fallback:  (hasta=dia+1)
         # ============================================================
 
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -507,10 +513,7 @@ if st.button("Consultar"):
         while cur <= d1:
             desde = cur.strftime("%Y-%m-%d")
 
-            # Intento 1: mismo día (evita incluir el día siguiente si 'hasta' fuera inclusivo)
             df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
-
-            # Fallback: día siguiente
             if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
                 hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
                 df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
@@ -523,7 +526,7 @@ if st.button("Consultar"):
 
         if tc_rows:
             tc = pd.concat(tc_rows, ignore_index=True)
-            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)  # truncado minuto
             tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
         else:
             tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
@@ -551,10 +554,15 @@ if st.button("Consultar"):
             axis=1,
         )
 
-        # Incidencia: ahora NO filtramos; dejamos vacío si no hay
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
-        salida = resumen.copy()
+        # ✅ SOLO QUIEN NO CUMPLE REQUISITOS
+        salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
+
+        if salida.empty:
+            st.success("🎉 No hay incidencias en el rango seleccionado.")
+            st.stop()
+
         salida = salida[
             [
                 "Fecha",
@@ -568,11 +576,11 @@ if st.button("Consultar"):
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    st.subheader("📄 Resultado")
+    # Sin "📄 Resultado" ni subheader
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
         sub = salida[salida["Fecha"] == f_dia]
         st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
     csv = salida.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Descargar CSV", csv, "fichajes_resultado.csv", "text/csv")
+    st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
