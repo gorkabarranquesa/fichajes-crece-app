@@ -3,13 +3,13 @@ import json
 import requests
 import pandas as pd
 import streamlit as st
+import hmac
+import hashlib
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-import hmac
-import hashlib
 
 
 # ==========================================
@@ -24,50 +24,48 @@ REQ_TIMEOUT = 30
 
 
 # ==========================================
-# DESCIFRADO CRECE (según Anexo 2 del manual)
+# DESCIFRADO CRECE (Laravel) + MAC CORRECTO
 # ==========================================
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
     """
-    payload_b64: base64 de un JSON {"iv","value","mac","tag"}
-    app_key_b64: APP_KEY en base64
+    payload_b64: base64 que contiene JSON {"iv","value","mac","tag"}
+    app_key_b64: APP_KEY en base64 (bytes reales de clave)
     """
     if not payload_b64:
         return ""
 
-    payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
-    key = base64.b64decode(app_key_b64)
+    payload_json = base64.b64decode(payload_b64).decode("utf-8")
+    payload = json.loads(payload_json)
 
-    # Valid payload
     if not (isinstance(payload, dict) and "iv" in payload and "value" in payload and "mac" in payload):
         raise ValueError("Payload inválido: faltan iv/value/mac")
 
-    # IV length check (AES-256-CBC => 16 bytes)
-    iv_raw = base64.b64decode(payload["iv"])
-    if len(iv_raw) != 16:
-        raise ValueError("IV inválido (longitud incorrecta)")
+    key = base64.b64decode(app_key_b64)
 
-    # MAC check (tal como describe el ejemplo PHP del Anexo 2)
-    # calculatedMAC = HMAC(bytes, HMAC(key, iv+value))
-    # compare HMAC(bytes, mac) == calculatedMAC
-    rnd = hashlib.sha256(os_urandom_16()).digest()[:16]  # 16 bytes
-    inner = hmac.new(key, (payload["iv"] + payload["value"]).encode("utf-8"), hashlib.sha256).digest()
-    calculated = hmac.new(rnd, inner, hashlib.sha256).digest()
-    received = hmac.new(rnd, payload["mac"].encode("utf-8"), hashlib.sha256).digest()
+    # En este formato, payload["iv"] y payload["value"] son strings base64.
+    # MAC esperado (hex) = HMAC_SHA256( iv_base64 + value_base64, key_bytes )
+    msg = (payload["iv"] + payload["value"]).encode("utf-8")
+    expected_mac = hmac.new(key, msg, hashlib.sha256).hexdigest()
 
-    if not hmac.compare_digest(received, calculated):
+    # compare seguro
+    if not hmac.compare_digest(expected_mac.lower(), str(payload["mac"]).lower()):
         raise ValueError("MAC inválido (clave incorrecta o payload manipulado)")
 
-    # Decrypt (payload["value"] está en base64, como openssl_decrypt con option 0)
+    iv = base64.b64decode(payload["iv"])
     ct = base64.b64decode(payload["value"])
-    cipher = AES.new(key, AES.MODE_CBC, iv_raw)
+
+    cipher = AES.new(key, AES.MODE_CBC, iv)
     decrypted = unpad(cipher.decrypt(ct), AES.block_size)
     return decrypted.decode("utf-8")
 
 
-def os_urandom_16():
-    # wrapper para evitar importar os arriba y mantener el archivo limpio
-    import os
-    return os.urandom(16)
+def safe_strip_quotes(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1]
+    return s.strip()
 
 
 # ==========================================
@@ -90,7 +88,7 @@ def daterange(d1: date, d2: date):
 
 
 # ==========================================
-# HTTP (session + pool)
+# HTTP (session pool)
 # ==========================================
 def make_session():
     s = requests.Session()
@@ -114,7 +112,7 @@ def api_exportar_departamentos() -> pd.DataFrame:
     resp = s.get(url, headers=headers(), timeout=REQ_TIMEOUT)
     resp.raise_for_status()
 
-    payload_b64 = resp.text.strip().strip('"')
+    payload_b64 = safe_strip_quotes(resp.text)
     decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
     departamentos = json.loads(decrypted)
 
@@ -129,7 +127,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     resp = s.post(url, headers=headers(), data={"solo_nif": 0}, timeout=REQ_TIMEOUT)
     resp.raise_for_status()
 
-    payload_b64 = resp.text.strip().strip('"')
+    payload_b64 = safe_strip_quotes(resp.text)
     decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
     empleados = json.loads(decrypted)
 
@@ -153,21 +151,21 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows).dropna(subset=["nif"])
+    df["nif"] = df["nif"].astype(str)
     return df
 
 
 # ==========================================
-# EXPORTACIÓN: FICHAJES (solo para contar fichajes)
+# EXPORTACIÓN: FICHAJES (solo para contar)
 # ==========================================
 def api_exportar_fichajes(s: requests.Session, nif: str, fi: str, ff: str):
     url = f"{API_URL_BASE}/exportacion/fichajes"
     data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "desc"}
-
     try:
         resp = s.post(url, headers=headers(), data=data, timeout=REQ_TIMEOUT)
         if resp.status_code >= 400:
             return []
-        payload_b64 = resp.text.strip().strip('"')
+        payload_b64 = safe_strip_quotes(resp.text)
         if not payload_b64:
             return []
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
@@ -177,9 +175,6 @@ def api_exportar_fichajes(s: requests.Session, nif: str, fi: str, ff: str):
 
 
 def contar_fichajes_por_dia(fichajes: list) -> dict:
-    """
-    Devuelve {YYYY-MM-DD: count}
-    """
     out = {}
     for f in fichajes:
         fecha = f.get("fecha")
@@ -194,10 +189,7 @@ def contar_fichajes_por_dia(fichajes: list) -> dict:
 
 
 # ==========================================
-# EXPORTACIÓN: TIEMPO TRABAJADO (por día) ✅
-# POST /api/exportacion/tiempo-trabajado
-# desde/hasta + nif[] array
-# Devuelve (por empleado): tiempoEfectivo y tiempoContabilizado (segundos)
+# EXPORTACIÓN: TIEMPO TRABAJADO (por día)
 # ==========================================
 def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[str]) -> dict:
     """
@@ -205,8 +197,6 @@ def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
 
-    # El manual define el campo como "nif: Array" y fechas "desde/hasta"
-    # Requests con listas: repetimos nif[] para formar un array compatible.
     data = [("desde", fecha_str), ("hasta", fecha_str)]
     for n in nifs:
         data.append(("nif[]", n))
@@ -216,27 +206,22 @@ def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[
         if resp.status_code >= 400:
             return {}
 
-        payload_b64 = resp.text.strip().strip('"')
+        payload_b64 = safe_strip_quotes(resp.text)
         if not payload_b64:
             return {}
 
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
         decoded = json.loads(decrypted)
 
-        # Estructura: array que contiene como clave el parámetro con el que se encontró al empleado y valor un array con datos
-        # En la práctica suele ser un dict: { "NIF": { ...tiempos... } } o { "NIF": [ ... ] }
         out = {}
-
         if isinstance(decoded, dict):
             for k, v in decoded.items():
-                # k suele ser el nif
                 if isinstance(v, dict):
-                    te = v.get("tiempoEfectivo")
-                    tc = v.get("tiempoContabilizado")
+                    te = v.get("tiempoEfectivo", 0)
+                    tc = v.get("tiempoContabilizado", 0)
                 elif isinstance(v, list):
-                    # Por manual: [ID, nif/email/..., tiempoEfectivo, tiempoContabilizado]
-                    te = v[-2] if len(v) >= 2 else None
-                    tc = v[-1] if len(v) >= 1 else None
+                    te = v[-2] if len(v) >= 2 else 0
+                    tc = v[-1] if len(v) >= 1 else 0
                 else:
                     continue
 
@@ -244,7 +229,6 @@ def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[
                     "tiempoEfectivo": float(te) if te is not None else 0.0,
                     "tiempoContabilizado": float(tc) if tc is not None else 0.0,
                 }
-
         return out
 
     except Exception:
@@ -252,8 +236,7 @@ def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[
 
 
 # ==========================================
-# PERMISOS (por ahora, mantenemos 0.00)
-# Próximo paso: ajustarlo bien con otra fuente real si existe.
+# PERMISOS (temporalmente 0)
 # ==========================================
 def permisos_horas_por_dia(fi: date, ff: date, empleados_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(columns=["Fecha", "nif", "horas_permiso"])
@@ -317,21 +300,20 @@ if st.button("▶ Obtener resumen (incidencias)"):
             data_day = api_tiempo_trabajado_un_dia(s, ds, nifs)
             for nif, vv in data_day.items():
                 tc = float(vv.get("tiempoContabilizado", 0.0))
-                horas = tc / 3600.0
-                tiempo_por_dia[(ds, nif)] = horas
+                tiempo_por_dia[(ds, str(nif))] = tc / 3600.0
 
     # 2) Fichajes en paralelo SOLO para contar registros
     with st.spinner("Contando fichajes por día…"):
         fi_str = fecha_inicio.strftime("%Y-%m-%d")
         ff_str = fecha_fin.strftime("%Y-%m-%d")
 
-        resumen_rows = []
         s2 = make_session()
 
         def worker(emp_row):
             nif = str(emp_row["nif"])
             fichajes = api_exportar_fichajes(s2, nif, fi_str, ff_str)
             counts = contar_fichajes_por_dia(fichajes)
+
             rows = []
             for d in daterange(fecha_inicio, fecha_fin):
                 ds = d.strftime("%Y-%m-%d")
@@ -341,18 +323,18 @@ if st.button("▶ Obtener resumen (incidencias)"):
                     "nif": nif,
                     "Nombre Completo": emp_row["nombre_completo"],
                     "Departamento": emp_row["departamento_nombre"],
-                    "horas_trabajadas": total_trab,  # ahora viene de tiempo-trabajado
+                    "horas_trabajadas": total_trab,
                     "Numero de fichajes": int(counts.get(ds, 0)),
                 })
             return rows
 
+        resumen_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futs = [ex.submit(worker, r) for _, r in empleados_df.iterrows()]
             for fut in as_completed(futs):
                 try:
                     resumen_rows.extend(fut.result())
                 except Exception:
-                    # no paramos nunca
                     pass
 
     base = pd.DataFrame(resumen_rows)
@@ -360,10 +342,11 @@ if st.button("▶ Obtener resumen (incidencias)"):
         st.info("No hay datos en el rango.")
         st.stop()
 
-    # 3) Permisos (por ahora 0, lo afinamos después)
+    # 3) Permisos (por ahora 0)
     perm_df = permisos_horas_por_dia(fecha_inicio, fecha_fin, empleados_df)
     base = base.merge(perm_df, on=["Fecha", "nif"], how="left")
-    base["horas_permiso"] = base.get("horas_permiso", 0.0)
+    if "horas_permiso" not in base.columns:
+        base["horas_permiso"] = 0.0
     base["horas_permiso"] = base["horas_permiso"].fillna(0.0)
 
     base["horas_totales"] = base["horas_trabajadas"] + base["horas_permiso"]
@@ -372,7 +355,6 @@ if st.button("▶ Obtener resumen (incidencias)"):
     base["Horas totales"] = base["horas_totales"].apply(horas_a_hhmm)
     base["dia_semana"] = pd.to_datetime(base["Fecha"]).dt.weekday
 
-    # mínimos
     def _mins(row):
         min_h, min_f = calcular_minimos(row["Departamento"], int(row["dia_semana"]))
         return pd.Series({"min_horas": min_h, "min_fichajes": min_f})
@@ -381,7 +363,6 @@ if st.button("▶ Obtener resumen (incidencias)"):
     base["min_horas"] = mins["min_horas"]
     base["min_fichajes"] = mins["min_fichajes"]
 
-    # validar
     def validar(row):
         min_h = row["min_horas"]
         min_f = row["min_fichajes"]
