@@ -241,12 +241,35 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     return df
 
 
-def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd.DataFrame:
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, *, nifs=None, emails=None, nums_empleado=None, nums_ss=None) -> pd.DataFrame:
+    """
+    /exportacion/tiempo trabajado (según manual)
+    Enviamos arrays como nif[]/email[]/num_empleado[]/num_seg_social[] repetidos.
+    :contentReference[oaicite:3]{index=3}
+    """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
-    data = {"desde": desde, "hasta": hasta, "nif": nifs}
+
+    # Construcción POST tipo "form" con claves repetidas
+    payload = [("desde", desde), ("hasta", hasta)]
+
+    def add_array(key: str, values):
+        if not values:
+            return
+        for v in values:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                payload.append((key, s))
+
+    # OJO: usar nif[] / email[] / num_empleado[] / num_seg_social[]
+    add_array("nif[]", nifs)
+    add_array("email[]", emails)
+    add_array("num_empleado[]", nums_empleado)
+    add_array("num_seg_social[]", nums_ss)
 
     try:
-        resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
+        resp = _SESSION.post(url, data=payload, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
 
         payload_b64 = _extract_payload_b64(resp)
@@ -255,7 +278,9 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd
 
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
         parsed = json.loads(decrypted)
-        return _parse_tiempo_trabajado_payload(parsed)
+
+        df = _parse_tiempo_trabajado_payload(parsed)
+        return df
 
     except Exception as e:
         _safe_fail(e)
