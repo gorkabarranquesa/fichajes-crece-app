@@ -20,7 +20,6 @@ APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))  # rápido sin saturar API
-
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 _SESSION = requests.Session()
@@ -65,23 +64,14 @@ def _extract_payload_b64(resp: requests.Response) -> str:
 # FORMATEOS TIEMPO
 # ============================================================
 
-def horas_a_hhmm(horas: float) -> str:
-    if horas is None or pd.isna(horas):
-        return "00:00"
-    total_min = int(round(float(horas) * 60))
-    h = total_min // 60
-    m = total_min % 60
-    return f"{h:02d}:{m:02d}"
-
-
 def segundos_a_hhmm(seg: float) -> str:
     if seg is None or pd.isna(seg):
         return "00:00"
     seg = max(0, int(round(float(seg))))
-    m = seg // 60
-    h = m // 60
-    mm = m % 60
-    return f"{h:02d}:{mm:02d}"
+    total_min = seg // 60
+    h = total_min // 60
+    m = total_min % 60
+    return f"{h:02d}:{m:02d}"
 
 
 def hhmm_to_dec(hhmm: str) -> float:
@@ -197,7 +187,7 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
         "fecha_inicio": fi,
         "fecha_fin": ff,
         "nif": nif,
-        "order": "asc",  # mejor para calcular tramos
+        "order": "asc",
     }
 
     try:
@@ -216,16 +206,18 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
         return []
 
 
-def api_exportar_vacaciones(fi: str, ff: str, nifs: list[str]) -> list:
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd.DataFrame:
     """
-    Vacaciones/Asuntos propios por días (NO horas).
-    Permite filtrar por nifs (opcional según manual).
+    /exportacion/tiempo-trabajado
+    - desde/hasta formato Y-m-d
+    - nif es Array
+    Devuelve DF: nif, tiempoEfectivo_seg, tiempoContabilizado_seg
     """
-    url = f"{API_URL_BASE}/exportacion/vacaciones"
+    url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     data = {
-        "fecha_inicio": fi,
-        "fecha_fin": ff,
-        "nifs": nifs,  # según manual es opcional; si falla lo gestionamos
+        "desde": desde,
+        "hasta": hasta,
+        "nif": nifs,
     }
 
     try:
@@ -234,27 +226,60 @@ def api_exportar_vacaciones(fi: str, ff: str, nifs: list[str]) -> list:
 
         payload_b64 = _extract_payload_b64(resp)
         if not payload_b64:
-            return []
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        out = json.loads(decrypted)
-        return out if isinstance(out, list) else []
+        parsed = json.loads(decrypted)
+
+        filas = []
+
+        # El manual dice: array/dict donde clave es el parámetro (nif) y el valor un array con datos
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                nif = str(k).upper().strip()
+                if isinstance(v, dict):
+                    filas.append(
+                        {
+                            "nif": nif,
+                            "tiempoEfectivo_seg": v.get("tiempoEfectivo"),
+                            "tiempoContabilizado_seg": v.get("tiempoContabilizado"),
+                        }
+                    )
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                    # por si viene como lista de resultados
+                    for it in v:
+                        filas.append(
+                            {
+                                "nif": str(it.get("nif") or nif).upper().strip(),
+                                "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
+                                "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
+                            }
+                        )
+        elif isinstance(parsed, list):
+            # fallback: lista de dicts
+            for it in parsed:
+                if isinstance(it, dict):
+                    nif = it.get("nif") or it.get("email") or it.get("num_empleado")
+                    if not nif:
+                        continue
+                    filas.append(
+                        {
+                            "nif": str(nif).upper().strip(),
+                            "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
+                            "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
+                        }
+                    )
+
+        df = pd.DataFrame(filas)
+        if df.empty:
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
+        df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+        return df
+
     except Exception as e:
         _safe_fail(e)
-        # Intento sin nifs por si ese parámetro no está habilitado en vuestra instancia
-        try:
-            data2 = {"fecha_inicio": fi, "fecha_fin": ff}
-            resp2 = _SESSION.post(url, data=data2, timeout=HTTP_TIMEOUT)
-            resp2.raise_for_status()
-            payload_b64 = _extract_payload_b64(resp2)
-            if not payload_b64:
-                return []
-            decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-            out = json.loads(decrypted)
-            return out if isinstance(out, list) else []
-        except Exception as e2:
-            _safe_fail(e2)
-            return []
+        return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 
 # ============================================================
@@ -262,11 +287,7 @@ def api_exportar_vacaciones(fi: str, ff: str, nifs: list[str]) -> list:
 # ============================================================
 
 def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
-    """
-    Heurística conservadora:
-    - Si turno_nocturno=1 y el fichaje es de madrugada, lo asociamos al día anterior.
-    Esto suele acercar el resultado a “cambio de día” que aplica CRECE.
-    """
+    # Heurística conservadora: madrugada -> día anterior si turno nocturno
     if turno_nocturno == 1 and fecha_dt.hour < 6:
         return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
     return fecha_dt.date().strftime("%Y-%m-%d")
@@ -277,14 +298,6 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
 # ============================================================
 
 def calcular_tiempos(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
-    """
-    Devuelve df con:
-    - segundos_sumados: suma de tramos "entrada->salida" normales
-    - segundos_descontados: suma de tramos cuya entrada tiene descuenta_tiempo=1
-    - segundos_neto: sumados - descontados
-
-    Nota: usamos la propiedad del TIPO del fichaje de entrada del tramo.
-    """
     if df.empty:
         return df
 
@@ -354,71 +367,6 @@ def calcular_tiempos(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
 
 # ============================================================
-# VACACIONES -> bandera por día (sin horas)
-# ============================================================
-
-def map_tipo_vacaciones(tipo: int) -> str:
-    mapping = {
-        1: "Vacaciones",
-        2: "Asuntos propios",
-        8: "Asuntos propios año anterior",
-        9: "Vacaciones año anterior",
-        10: "Vacaciones año siguiente",
-    }
-    return mapping.get(int(tipo) if tipo is not None else -1, f"Tipo {tipo}")
-
-
-def expandir_vacaciones_a_dias(vacs: list, fi: str, ff: str) -> pd.DataFrame:
-    if not vacs:
-        return pd.DataFrame(columns=["nif", "Fecha", "Vacaciones_detalle", "Tiene vacaciones"])
-
-    rango_ini = datetime.strptime(fi, "%Y-%m-%d").date()
-    rango_fin = datetime.strptime(ff, "%Y-%m-%d").date()
-
-    filas = []
-    for v in vacs:
-        usuario = v.get("usuario", {}) or {}
-        nif = usuario.get("Nif") or usuario.get("nif")
-        if not nif:
-            continue
-        nif = str(nif).upper().strip()
-
-        try:
-            f_ini = datetime.strptime(v["fecha_inicio"], "%Y-%m-%d").date()
-            f_fin = datetime.strptime(v["fecha_fin"], "%Y-%m-%d").date()
-        except Exception:
-            continue
-
-        current = max(f_ini, rango_ini)
-        last = min(f_fin, rango_fin)
-        if current > last:
-            continue
-
-        texto = map_tipo_vacaciones(v.get("tipo")) + f" (estado {v.get('estado')})"
-        while current <= last:
-            filas.append(
-                {
-                    "nif": nif,
-                    "Fecha": current.strftime("%Y-%m-%d"),
-                    "Vacaciones_detalle": texto,
-                    "Tiene vacaciones": True,
-                }
-            )
-            current += timedelta(days=1)
-
-    if not filas:
-        return pd.DataFrame(columns=["nif", "Fecha", "Vacaciones_detalle", "Tiene vacaciones"])
-
-    dfv = pd.DataFrame(filas)
-    dfv = dfv.groupby(["nif", "Fecha"], as_index=False).agg(
-        Vacaciones_detalle=("Vacaciones_detalle", lambda s: " + ".join(sorted(set(s)))),
-        Tiene_vacaciones=("Tiene vacaciones", "max"),
-    )
-    dfv = dfv.rename(columns={"Tiene_vacaciones": "Tiene vacaciones"})
-    return dfv
-
-
-# ============================================================
 # REGLAS DE JORNADA (validación base)
 # ============================================================
 
@@ -426,14 +374,14 @@ def calcular_minimos(depto: str, dia: int):
     depto = (depto or "").upper().strip()
 
     if depto in ["ESTRUCTURA", "MOI"]:
-        if dia in [0, 1, 2, 3]:  # L-J
+        if dia in [0, 1, 2, 3]:
             return 8.5, 4
-        if dia == 4:  # V
+        if dia == 4:
             return 6.5, 2
         return None, None
 
     if depto == "MOD":
-        if dia in [0, 1, 2, 3, 4]:  # L-V
+        if dia in [0, 1, 2, 3, 4]:
             return 8.0, 2
         return None, None
 
@@ -446,13 +394,13 @@ def validar_incidencia(r):
         return None
 
     motivo = []
-    if r["horas_dec"] < float(min_h):
-        motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {r['horas_dec']:.2f}h)")
+    if r["horas_dec_validacion"] < float(min_h):
+        motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {r['horas_dec_validacion']:.2f}h)")
 
     if int(r["Numero de fichajes"]) < int(min_f):
         motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {int(r['Numero de fichajes'])})")
 
-    if r["horas_dec"] >= float(min_h) and int(r["Numero de fichajes"]) > int(min_f):
+    if r["horas_dec_validacion"] >= float(min_h) and int(r["Numero de fichajes"]) > int(min_f):
         motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {int(r['Numero de fichajes'])})")
 
     return "; ".join(motivo) if motivo else None
@@ -547,13 +495,13 @@ if st.button("Consultar"):
 
         df["fecha_dia"] = df.apply(_dia_row, axis=1)
 
-        # cálculo tiempos netos
+        # cálculo tiempos netos por fichajes
         df = calcular_tiempos(df, tipos_map)
 
         # nº fichajes por día
         df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
 
-        # resumen diario (neto)
+        # resumen diario por fichajes (neto)
         resumen = (
             df.groupby(["nif", "Nombre", "Departamento", "fecha_dia"], as_index=False)
             .agg(
@@ -569,9 +517,46 @@ if st.button("Consultar"):
         )
 
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
-        resumen["horas_dec"] = resumen["Total trabajado"].apply(hhmm_to_dec)
-        resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
+        # ============================================================
+        # TIEMPO CONTABILIZADO (API) -> por día
+        # 1 llamada/día para todos los NIFs (eficiente)
+        # ============================================================
+
+        nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+
+        tc_rows = []
+        d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+        d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+
+        cur = d0
+        while cur <= d1:
+            desde = cur.strftime("%Y-%m-%d")
+            hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")  # hasta debe ser posterior
+            df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs)
+            if not df_tc.empty:
+                df_tc["Fecha"] = desde
+                tc_rows.append(df_tc)
+            cur += timedelta(days=1)
+
+        if tc_rows:
+            tc = pd.concat(tc_rows, ignore_index=True)
+            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+            tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
+        else:
+            tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
+
+        resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
+
+        # Validación: si existe Tiempo Contabilizado, validamos con ese valor; si no, con Total trabajado
+        resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+        resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
+
+        resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
+        mask_tc = resumen["Tiempo Contabilizado"].notna() & (resumen["Tiempo Contabilizado"].astype(str).str.strip() != "")
+        resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
+
+        resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
             lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]))),
             axis=1,
@@ -579,22 +564,13 @@ if st.button("Consultar"):
 
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
-        # Vacaciones (bandera por día, sin horas)
-        nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-        vacs = api_exportar_vacaciones(fi, ff, nifs)
-        df_vac = expandir_vacaciones_a_dias(vacs, fi, ff)
-
-        resumen = resumen.merge(df_vac, on=["nif", "Fecha"], how="left")
-        resumen["Tiene vacaciones"] = resumen["Tiene vacaciones"].fillna(False)
-
-        # Mostrar solo lo necesario: incidencias o vacaciones
-        salida = resumen[(resumen["Incidencia"].notna()) | (resumen["Tiene vacaciones"] == True)].copy()
+        salida = resumen[resumen["Incidencia"].notna()].copy()
 
         if salida.empty:
-            st.success("🎉 No hay incidencias ni vacaciones en el rango seleccionado.")
+            st.success("🎉 No hay incidencias en el rango seleccionado.")
             st.stop()
 
-        salida["Vacaciones_detalle"] = salida["Vacaciones_detalle"].fillna("")
+        salida["Tiempo Contabilizado"] = salida["Tiempo Contabilizado"].fillna("")
 
         salida = salida[
             [
@@ -602,14 +578,13 @@ if st.button("Consultar"):
                 "Nombre",
                 "Departamento",
                 "Total trabajado",
+                "Tiempo Contabilizado",
                 "Numero de fichajes",
-                "Tiene vacaciones",
-                "Vacaciones_detalle",
                 "Incidencia",
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    st.subheader("📄 Resultado")
+    st.subheader("📄 Incidencias")
 
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
@@ -626,6 +601,6 @@ if st.button("Consultar"):
     st.download_button(
         "⬇ Descargar CSV",
         csv,
-        "fichajes_resultado.csv",
+        "fichajes_incidencias.csv",
         "text/csv",
     )
