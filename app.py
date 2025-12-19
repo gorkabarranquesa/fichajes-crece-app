@@ -19,7 +19,7 @@ API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 CPU = multiprocessing.cpu_count()
-MAX_WORKERS = max(8, min(24, CPU * 3))  # rápido sin saturar API
+MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 _SESSION = requests.Session()
@@ -31,11 +31,10 @@ _SESSION.headers.update(
 )
 
 # ============================================================
-# SEGURIDAD: utilidades internas (NO mostrar PII/secretos)
+# SEGURIDAD: no loguear detalles (PII, tokens, payloads)
 # ============================================================
 
 def _safe_fail(_exc: Exception) -> None:
-    # Deliberadamente no logueamos detalles (evita filtraciones)
     return None
 
 
@@ -66,7 +65,7 @@ def _extract_payload_b64(resp: requests.Response) -> str:
 
 def segundos_a_hhmm(seg: float) -> str:
     if seg is None or pd.isna(seg):
-        return "00:00"
+        return ""
     seg = max(0, int(round(float(seg))))
     total_min = seg // 60
     h = total_min // 60
@@ -98,15 +97,12 @@ def api_exportar_departamentos() -> pd.DataFrame:
     decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
     departamentos = json.loads(decrypted)
 
-    lista = []
-    for d in departamentos:
-        lista.append(
-            {
-                "departamento_id": d.get("id"),
-                "departamento_nombre": d.get("nombre"),
-            }
-        )
-    return pd.DataFrame(lista)
+    return pd.DataFrame(
+        [
+            {"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")}
+            for d in (departamentos or [])
+        ]
+    )
 
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
@@ -122,7 +118,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     empleados = json.loads(decrypted)
 
     lista = []
-    for e in empleados:
+    for e in (empleados or []):
         nombre = e.get("name") or e.get("nombre") or ""
         primer_apellido = e.get("primer_apellido") or ""
         segundo_apellido = e.get("segundo_apellido") or ""
@@ -142,18 +138,14 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             }
         )
 
-    df_emp = pd.DataFrame(lista)
-    if not df_emp.empty:
-        df_emp["nif"] = df_emp["nif"].astype(str).str.upper().str.strip()
-    return df_emp
+    df = pd.DataFrame(lista)
+    if not df.empty:
+        df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+    return df
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_tipos_fichaje() -> dict:
-    """
-    Devuelve dict: {tipo_id: {descuenta_tiempo, entrada, turno_nocturno}}
-    Cache 1h (no PII).
-    """
     url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
     try:
         resp = _SESSION.post(url, timeout=HTTP_TIMEOUT)
@@ -183,12 +175,7 @@ def api_exportar_tipos_fichaje() -> dict:
 
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
     url = f"{API_URL_BASE}/exportacion/fichajes"
-    data = {
-        "fecha_inicio": fi,
-        "fecha_fin": ff,
-        "nif": nif,
-        "order": "asc",
-    }
+    data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "asc"}
 
     try:
         resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
@@ -206,19 +193,91 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
         return []
 
 
+def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
+    """
+    El manual indica: array con clave = parámetro (nif/email/...), valor = array con datos.
+    No asegura si esos 'arrays' vienen como dict (claves) o lista (posicional).
+    :contentReference[oaicite:1]{index=1}
+    """
+    filas = []
+
+    def add_row(nif_key: str, obj):
+        nif_key = (str(nif_key) or "").upper().strip()
+        if not nif_key:
+            return
+
+        # Caso 1: dict con claves
+        if isinstance(obj, dict):
+            filas.append(
+                {
+                    "nif": str(obj.get("nif") or nif_key).upper().strip(),
+                    "tiempoEfectivo_seg": obj.get("tiempoEfectivo"),
+                    "tiempoContabilizado_seg": obj.get("tiempoContabilizado"),
+                }
+            )
+            return
+
+        # Caso 2: lista posicional (heurística)
+        if isinstance(obj, list):
+            # buscamos valores numéricos que parezcan segundos y/o dicts internos
+            # A) lista de dicts
+            if len(obj) > 0 and isinstance(obj[0], dict):
+                for it in obj:
+                    filas.append(
+                        {
+                            "nif": str(it.get("nif") or nif_key).upper().strip(),
+                            "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
+                            "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
+                        }
+                    )
+                return
+
+            # B) lista plana: [ID, nif/email/..., tiempoEfectivo, tiempoContabilizado] (típico)
+            # Intentamos tomar los 2 últimos numéricos como tiempos.
+            nums = [x for x in obj if isinstance(x, (int, float)) or (isinstance(x, str) and str(x).isdigit())]
+            # Preferimos últimos 2 (si existen)
+            tef = None
+            tco = None
+            if len(nums) >= 2:
+                tef = nums[-2]
+                tco = nums[-1]
+            filas.append(
+                {
+                    "nif": nif_key,
+                    "tiempoEfectivo_seg": tef,
+                    "tiempoContabilizado_seg": tco,
+                }
+            )
+            return
+
+        # Caso 3: desconocido
+        filas.append({"nif": nif_key, "tiempoEfectivo_seg": None, "tiempoContabilizado_seg": None})
+
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            add_row(k, v)
+    elif isinstance(parsed, list):
+        # si es lista de dicts con nif dentro
+        for it in parsed:
+            if isinstance(it, dict):
+                nk = it.get("nif") or it.get("email") or it.get("num_empleado") or ""
+                add_row(nk, it)
+
+    df = pd.DataFrame(filas)
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
+    df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+    return df
+
+
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd.DataFrame:
     """
     /exportacion/tiempo-trabajado
-    - desde/hasta formato Y-m-d
-    - nif es Array
-    Devuelve DF: nif, tiempoEfectivo_seg, tiempoContabilizado_seg
+    Parámetros: desde, hasta, nif[] (según manual). :contentReference[oaicite:2]{index=2}
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
-    data = {
-        "desde": desde,
-        "hasta": hasta,
-        "nif": nifs,
-    }
+    data = {"desde": desde, "hasta": hasta, "nif": nifs}
 
     try:
         resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
@@ -230,52 +289,7 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd
 
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
         parsed = json.loads(decrypted)
-
-        filas = []
-
-        # El manual dice: array/dict donde clave es el parámetro (nif) y el valor un array con datos
-        if isinstance(parsed, dict):
-            for k, v in parsed.items():
-                nif = str(k).upper().strip()
-                if isinstance(v, dict):
-                    filas.append(
-                        {
-                            "nif": nif,
-                            "tiempoEfectivo_seg": v.get("tiempoEfectivo"),
-                            "tiempoContabilizado_seg": v.get("tiempoContabilizado"),
-                        }
-                    )
-                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                    # por si viene como lista de resultados
-                    for it in v:
-                        filas.append(
-                            {
-                                "nif": str(it.get("nif") or nif).upper().strip(),
-                                "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
-                                "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
-                            }
-                        )
-        elif isinstance(parsed, list):
-            # fallback: lista de dicts
-            for it in parsed:
-                if isinstance(it, dict):
-                    nif = it.get("nif") or it.get("email") or it.get("num_empleado")
-                    if not nif:
-                        continue
-                    filas.append(
-                        {
-                            "nif": str(nif).upper().strip(),
-                            "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
-                            "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
-                        }
-                    )
-
-        df = pd.DataFrame(filas)
-        if df.empty:
-            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
-
-        df["nif"] = df["nif"].astype(str).str.upper().str.strip()
-        return df
+        return _parse_tiempo_trabajado_payload(parsed)
 
     except Exception as e:
         _safe_fail(e)
@@ -283,34 +297,27 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs: list[str]) -> pd
 
 
 # ============================================================
-# LÓGICA: asignar "día" (manejo básico turno nocturno)
+# DÍA (turno nocturno)
 # ============================================================
 
 def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
-    # Heurística conservadora: madrugada -> día anterior si turno nocturno
     if turno_nocturno == 1 and fecha_dt.hour < 6:
         return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
     return fecha_dt.date().strftime("%Y-%m-%d")
 
 
 # ============================================================
-# CÁLCULO TIEMPO TRABAJADO (con descuento_tiempo y nocturno)
+# TIEMPO POR FICHAJES (neto: sumados - descontados)
 # ============================================================
 
 def calcular_tiempos(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.copy()
-    df["segundos_sumados"] = 0
-    df["segundos_descontados"] = 0
-    df["segundos_neto"] = 0
-
     rows_out = []
 
     for nif in df["nif"].unique():
         sub_emp = df[df["nif"] == nif].copy()
-
         for fecha_dia in sub_emp["fecha_dia"].unique():
             sub = sub_emp[sub_emp["fecha_dia"] == fecha_dia].copy()
             sub = sub.sort_values("fecha_dt")
@@ -320,59 +327,43 @@ def calcular_tiempos(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
             i = 0
             n = len(sub)
-
             while i < n:
                 row_i = sub.iloc[i].copy()
-                row_i["segundos_sumados"] = sumados
-                row_i["segundos_descontados"] = descontados
-                row_i["segundos_neto"] = sumados - descontados
-
                 if i < n - 1:
                     row_j = sub.iloc[i + 1].copy()
-
                     if row_i.get("direccion") == "entrada" and row_j.get("direccion") == "salida":
                         delta = (row_j["fecha_dt"] - row_i["fecha_dt"]).total_seconds()
-                        if delta < 0:
-                            rows_out.append(row_i)
-                            i += 1
-                            continue
-
-                        tipo_id = row_i.get("tipo")
-                        props = tipos_map.get(int(tipo_id), {}) if tipo_id is not None else {}
-
-                        if int(props.get("descuenta_tiempo", 0)) == 1:
-                            descontados += int(round(delta))
-                        else:
-                            sumados += int(round(delta))
-
-                        row_i["segundos_sumados"] = sumados
-                        row_i["segundos_descontados"] = descontados
-                        row_i["segundos_neto"] = sumados - descontados
-                        rows_out.append(row_i)
-
-                        row_j = row_j.copy()
-                        row_j["segundos_sumados"] = sumados
-                        row_j["segundos_descontados"] = descontados
-                        row_j["segundos_neto"] = sumados - descontados
-                        rows_out.append(row_j)
-
+                        if delta >= 0:
+                            tipo_id = row_i.get("tipo")
+                            props = tipos_map.get(int(tipo_id), {}) if tipo_id is not None else {}
+                            if int(props.get("descuenta_tiempo", 0)) == 1:
+                                descontados += int(round(delta))
+                            else:
+                                sumados += int(round(delta))
                         i += 2
                         continue
-
-                rows_out.append(row_i)
                 i += 1
 
-    out = pd.DataFrame(rows_out).sort_values(["fecha_dt", "nif"], kind="mergesort")
+            rows_out.append(
+                {
+                    "nif": nif,
+                    "fecha_dia": fecha_dia,
+                    "segundos_neto": max(0, sumados - descontados),
+                }
+            )
+
+    out = pd.DataFrame(rows_out)
+    if out.empty:
+        return out
     return out
 
 
 # ============================================================
-# REGLAS DE JORNADA (validación base)
+# REGLAS DE JORNADA
 # ============================================================
 
 def calcular_minimos(depto: str, dia: int):
     depto = (depto or "").upper().strip()
-
     if depto in ["ESTRUCTURA", "MOI"]:
         if dia in [0, 1, 2, 3]:
             return 8.5, 4
@@ -407,7 +398,7 @@ def validar_incidencia(r):
 
 
 # ============================================================
-# UI STREAMLIT (mínima)
+# UI
 # ============================================================
 
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
@@ -439,7 +430,6 @@ if st.button("Consultar"):
             tipos_map = api_exportar_tipos_fichaje()
             departamentos_df = api_exportar_departamentos()
             empleados_df = api_exportar_empleados_completos()
-
             if empleados_df.empty:
                 st.warning("No hay empleados disponibles.")
                 st.stop()
@@ -452,7 +442,7 @@ if st.button("Consultar"):
             st.error("❌ No se pudo cargar la información base.")
             st.stop()
 
-        # Fichajes en paralelo (si un empleado falla, se continúa)
+        # ============ FICHAJES EN PARALELO ============
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
             futures = {
@@ -488,43 +478,44 @@ if st.button("Consultar"):
         df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
         df = df.dropna(subset=["fecha_dt"])
 
-        # día ajustado (turno nocturno si aplica)
+        # día ajustado por nocturno
         def _dia_row(r):
             props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
             return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
 
         df["fecha_dia"] = df.apply(_dia_row, axis=1)
 
-        # cálculo tiempos netos por fichajes
-        df = calcular_tiempos(df, tipos_map)
+        # resumen neto por fichajes
+        neto = calcular_tiempos(df, tipos_map)
+        neto = neto.rename(columns={"fecha_dia": "Fecha"})
 
         # nº fichajes por día
         df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
-
-        # resumen diario por fichajes (neto)
-        resumen = (
+        conteo = (
             df.groupby(["nif", "Nombre", "Departamento", "fecha_dia"], as_index=False)
-            .agg(
-                segundos_neto=("segundos_neto", "max"),
-                fichajes=("Numero", "max"),
-            )
-        )
-        resumen = resumen.rename(
-            columns={
-                "fecha_dia": "Fecha",
-                "fichajes": "Numero de fichajes",
-            }
+            .agg(Numero=("Numero", "max"))
+            .rename(columns={"fecha_dia": "Fecha"})
         )
 
+        resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
+        resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
-        # ============================================================
-        # TIEMPO CONTABILIZADO (API) -> por día
-        # 1 llamada/día para todos los NIFs (eficiente)
-        # ============================================================
-
+        # ============ TIEMPO TRABAJADO (API) ============
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
+        # 1) RANGO COMPLETO (para comprobar que devuelve algo)
+        # Nota: el manual indica que devuelve total del rango. :contentReference[oaicite:3]{index=3}
+        df_tc_rango = api_exportar_tiempo_trabajado(fi, ff, nifs)
+        if not df_tc_rango.empty:
+            df_tc_rango["Tiempo Contabilizado (rango)"] = df_tc_rango["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+            df_tc_rango = df_tc_rango[["nif", "Tiempo Contabilizado (rango)"]]
+        else:
+            df_tc_rango = pd.DataFrame(columns=["nif", "Tiempo Contabilizado (rango)"])
+
+        resumen = resumen.merge(df_tc_rango, on="nif", how="left")
+
+        # 2) POR DÍA (doble intento: hasta=igual y hasta=+1)
         tc_rows = []
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
@@ -532,11 +523,19 @@ if st.button("Consultar"):
         cur = d0
         while cur <= d1:
             desde = cur.strftime("%Y-%m-%d")
-            hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")  # hasta debe ser posterior
-            df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs)
+
+            # Intento A: mismo día (aunque el manual diga "posterior", algunas instancias aceptan)
+            df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs)
+
+            # Intento B: hasta día siguiente
+            if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+                hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+                df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs)
+
             if not df_tc.empty:
                 df_tc["Fecha"] = desde
                 tc_rows.append(df_tc)
+
             cur += timedelta(days=1)
 
         if tc_rows:
@@ -547,20 +546,22 @@ if st.button("Consultar"):
             tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
 
         resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
+        resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
 
-        # Validación: si existe Tiempo Contabilizado, validamos con ese valor; si no, con Total trabajado
-        resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
-        resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
-
-        resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
-        mask_tc = resumen["Tiempo Contabilizado"].notna() & (resumen["Tiempo Contabilizado"].astype(str).str.strip() != "")
-        resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
-
+        # ============ VALIDACIÓN ============
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
             lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]))),
             axis=1,
         )
+
+        resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+        resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
+
+        # Si hay contabilizado, valida con contabilizado; si no, con marcajes
+        resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
+        mask_tc = resumen["Tiempo Contabilizado"].astype(str).str.strip().ne("")
+        resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
 
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
@@ -571,6 +572,7 @@ if st.button("Consultar"):
             st.stop()
 
         salida["Tiempo Contabilizado"] = salida["Tiempo Contabilizado"].fillna("")
+        salida["Tiempo Contabilizado (rango)"] = salida["Tiempo Contabilizado (rango)"].fillna("")
 
         salida = salida[
             [
@@ -579,10 +581,11 @@ if st.button("Consultar"):
                 "Departamento",
                 "Total trabajado",
                 "Tiempo Contabilizado",
-                "Numero de fichajes",
+                "Tiempo Contabilizado (rango)",
+                "Numero",
                 "Incidencia",
             ]
-        ].sort_values(["Fecha", "Nombre"], kind="mergesort")
+        ].rename(columns={"Numero": "Numero de fichajes"}).sort_values(["Fecha", "Nombre"], kind="mergesort")
 
     st.subheader("📄 Incidencias")
 
