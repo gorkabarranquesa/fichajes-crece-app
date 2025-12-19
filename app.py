@@ -22,10 +22,13 @@ CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)
 
+# Tolerancia RRHH (±5 min). Aplicamos para "mínimo de horas"
+TOLERANCIA_MINUTOS = 5
+TOLERANCIA_HORAS = TOLERANCIA_MINUTOS / 60.0
+
 _SESSION = requests.Session()
-_SESSION.headers.update(
-    {"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"}
-)
+_SESSION.headers.update({"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"})
+
 
 # ============================================================
 # SEGURIDAD: no loguear detalles (PII, tokens, payloads)
@@ -33,6 +36,17 @@ _SESSION.headers.update(
 
 def _safe_fail(_exc: Exception) -> None:
     return None
+
+
+# ============================================================
+# NORMALIZACIÓN NOMBRES (para reglas especiales)
+# ============================================================
+
+def norm_name(s: str) -> str:
+    if s is None:
+        return ""
+    # uppercase + colapsar espacios
+    return " ".join(str(s).upper().strip().split())
 
 
 # ============================================================
@@ -74,7 +88,7 @@ def segundos_a_hhmm(seg: float) -> str:
     if seg_i < 0:
         seg_i = 0
 
-    total_min = seg_i // 60  # <-- truncado
+    total_min = seg_i // 60  # truncado
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
@@ -91,8 +105,7 @@ def hhmm_to_min(hhmm: str) -> int:
 
 
 def hhmm_to_dec(hhmm: str) -> float:
-    mins = hhmm_to_min(hhmm)
-    return mins / 60.0
+    return hhmm_to_min(hhmm) / 60.0
 
 
 def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
@@ -119,6 +132,79 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     h = diff // 60
     m = diff % 60
     return f"{sign}{h:02d}:{m:02d}"
+
+
+# ============================================================
+# REGLAS ESPECIALES RRHH (NOMBRE + DEPTO)
+# ============================================================
+# Nota: usa el nombre completo tal cual lo muestra la app (normalizado a MAYÚSCULAS y espacios).
+# Si en CRECE el nombre viene diferente, ajustamos aquí sin tocar el resto del código.
+
+SPECIAL_RULES = {
+    # 2) MOD David Rodriguez: 09:30-14:00 => 4.5h, 2 fichajes
+    ("MOD", norm_name("DAVID RODRIGUEZ")): {"min_horas": 4.5, "min_fichajes": 2},
+
+    # 3) MOI Debora, Etor y Miriam: mínimo 2 fichajes
+    ("MOI", norm_name("DEBORA")): {"min_fichajes": 2},
+    ("MOI", norm_name("ETOR")): {"min_fichajes": 2},
+
+    # 4) MOI Miriam: 09:00-14:30 => 5.5h y 2 fichajes
+    ("MOI", norm_name("MIRIAM")): {"min_horas": 5.5, "min_fichajes": 2},
+}
+
+
+def _lookup_special(depto_norm: str, nombre_norm: str):
+    """
+    Intenta casar primero por (depto, nombre completo) y luego por (depto, primer nombre)
+    """
+    # 1) por nombre completo
+    key_full = (depto_norm, nombre_norm)
+    if key_full in SPECIAL_RULES:
+        return SPECIAL_RULES[key_full]
+
+    # 2) por primer token (p.ej. "MIRIAM", "ETOR")
+    first = (nombre_norm.split(" ")[0] if nombre_norm else "")
+    key_first = (depto_norm, first)
+    return SPECIAL_RULES.get(key_first)
+
+
+# ============================================================
+# REGLAS BASE DE JORNADA
+# ============================================================
+
+def calcular_minimos(depto: str, dia: int, nombre: str):
+    """
+    Devuelve (min_horas, min_fichajes) con overrides por reglas especiales.
+    """
+    depto_norm = (depto or "").upper().strip()
+    nombre_norm = norm_name(nombre)
+
+    min_h, min_f = None, None
+
+    # BASE
+    if depto_norm in ["ESTRUCTURA", "MOI"]:
+        if dia in [0, 1, 2, 3]:       # L-J
+            min_h, min_f = 8.5, 4
+        elif dia == 4:                # V
+            min_h, min_f = 6.5, 2
+        else:
+            min_h, min_f = None, None
+
+    elif depto_norm == "MOD":
+        if dia in [0, 1, 2, 3, 4]:    # L-V
+            min_h, min_f = 8.0, 2
+        else:
+            min_h, min_f = None, None
+
+    # OVERRIDES ESPECIALES (si aplica)
+    special = _lookup_special(depto_norm, nombre_norm)
+    if special:
+        if "min_horas" in special and min_h is not None:
+            min_h = float(special["min_horas"])
+        if "min_fichajes" in special and min_f is not None:
+            min_f = int(special["min_fichajes"])
+
+    return min_h, min_f
 
 
 # ============================================================
@@ -272,7 +358,7 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
     """
     MISMA FORMA que te funciona:
     - POST con nif[] repetido.
-    - desde/hasta según llamamos por día.
+    - desde/hasta por día (intento mismo día; fallback día+1).
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
@@ -311,7 +397,7 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
 
 
 # ============================================================
-# TIEMPO POR FICHAJES (neto) - TRABAJAMOS EN SEGUNDOS ENTEROS
+# TIEMPO POR FICHAJES (neto) - segundos enteros
 # ============================================================
 
 def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
@@ -336,7 +422,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
-                        delta_i = int(delta)  # <-- NO round, truncamos segundos
+                        delta_i = int(delta)  # truncado
                         props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
                             descontados += delta_i
@@ -352,25 +438,8 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
 
 # ============================================================
-# REGLAS DE JORNADA
+# VALIDACIÓN (con tolerancia ±5 minutos en horas)
 # ============================================================
-
-def calcular_minimos(depto: str, dia: int):
-    depto = (depto or "").upper().strip()
-    if depto in ["ESTRUCTURA", "MOI"]:
-        if dia in [0, 1, 2, 3]:
-            return 8.5, 4
-        if dia == 4:
-            return 6.5, 2
-        return None, None
-
-    if depto == "MOD":
-        if dia in [0, 1, 2, 3, 4]:
-            return 8.0, 2
-        return None, None
-
-    return None, None
-
 
 def validar_incidencia(r) -> str:
     min_h = r.get("min_horas")
@@ -389,11 +458,20 @@ def validar_incidencia(r) -> str:
         horas_val = 0.0
 
     motivo = []
-    if horas_val < float(min_h):
-        motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {horas_val:.2f}h)")
+
+    # 1) Tolerancia ±5 min -> para "insuficientes" permitimos min_h - 5 min
+    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
+    if horas_val < umbral_inferior:
+        motivo.append(
+            f"Horas insuficientes (mín {min_h}h, tolerancia {TOLERANCIA_MINUTOS}m, tiene {horas_val:.2f}h)"
+        )
+
+    # 2) Fichajes (sin tolerancia)
     if num_fich < int(min_f):
         motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {num_fich})")
-    if horas_val >= float(min_h) and num_fich > int(min_f):
+
+    # 3) Fichajes excesivos (misma regla que ya teníais)
+    if horas_val >= umbral_inferior and num_fich > int(min_f):
         motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {num_fich})")
 
     return "; ".join(motivo)
@@ -494,13 +572,11 @@ if st.button("Consultar"):
         resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
         resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
 
-        # Total trabajado (truncado minuto)
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
         # ============================================================
-        # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA QUE TE FUNCIONA
-        # Intento 1: (desde=dia, hasta=dia)  -> evita sumar "de más"
-        # Fallback:  (hasta=dia+1)
+        # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA
+        # Intento 1: (desde=dia, hasta=dia) / Fallback: (hasta=dia+1)
         # ============================================================
 
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -526,7 +602,7 @@ if st.button("Consultar"):
 
         if tc_rows:
             tc = pd.concat(tc_rows, ignore_index=True)
-            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)  # truncado minuto
+            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
             tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
         else:
             tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
@@ -549,14 +625,16 @@ if st.button("Consultar"):
         resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
 
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
+
+        # Minimos por depto+día + especiales por persona
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
-            lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]))),
+            lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
             axis=1,
         )
 
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
-        # ✅ SOLO QUIEN NO CUMPLE REQUISITOS
+        # ✅ SOLO QUIEN NO CUMPLE
         salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
 
         if salida.empty:
@@ -576,7 +654,7 @@ if st.button("Consultar"):
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    # Sin "📄 Resultado" ni subheader
+    # Vista mínima (sin subheader)
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
         sub = salida[salida["Fecha"] == f_dia]
