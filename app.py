@@ -20,17 +20,13 @@ API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 MAX_WORKERS = 1000
-REQ_TIMEOUT = 30
+REQ_TIMEOUT = 45
 
 
 # ==========================================
-# DESCIFRADO CRECE (Laravel) + MAC CORRECTO
+# DESCIFRADO CRECE (Laravel) + MAC correcto
 # ==========================================
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
-    """
-    payload_b64: base64 que contiene JSON {"iv","value","mac","tag"}
-    app_key_b64: APP_KEY en base64 (bytes reales de clave)
-    """
     if not payload_b64:
         return ""
 
@@ -42,12 +38,8 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
     key = base64.b64decode(app_key_b64)
 
-    # En este formato, payload["iv"] y payload["value"] son strings base64.
-    # MAC esperado (hex) = HMAC_SHA256( iv_base64 + value_base64, key_bytes )
     msg = (payload["iv"] + payload["value"]).encode("utf-8")
     expected_mac = hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-    # compare seguro
     if not hmac.compare_digest(expected_mac.lower(), str(payload["mac"]).lower()):
         raise ValueError("MAC inválido (clave incorrecta o payload manipulado)")
 
@@ -69,7 +61,7 @@ def safe_strip_quotes(s: str) -> str:
 
 
 # ==========================================
-# HELPERS TIEMPO
+# TIEMPO HELPERS
 # ==========================================
 def horas_a_hhmm(horas: float) -> str:
     if horas is None or pd.isna(horas):
@@ -88,7 +80,7 @@ def daterange(d1: date, d2: date):
 
 
 # ==========================================
-# HTTP (session pool)
+# HTTP session pool
 # ==========================================
 def make_session():
     s = requests.Session()
@@ -103,7 +95,7 @@ def headers():
 
 
 # ==========================================
-# EXPORTACIÓN: DEPARTAMENTOS / EMPLEADOS
+# EXPORT: DEPARTAMENTOS / EMPLEADOS
 # ==========================================
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def api_exportar_departamentos() -> pd.DataFrame:
@@ -156,7 +148,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
 
 # ==========================================
-# EXPORTACIÓN: FICHAJES (solo para contar)
+# EXPORT: FICHAJES (solo para contar)
 # ==========================================
 def api_exportar_fichajes(s: requests.Session, nif: str, fi: str, ff: str):
     url = f"{API_URL_BASE}/exportacion/fichajes"
@@ -189,61 +181,101 @@ def contar_fichajes_por_dia(fichajes: list) -> dict:
 
 
 # ==========================================
-# EXPORTACIÓN: TIEMPO TRABAJADO (por día)
+# EXPORT: TIEMPO TRABAJADO (tiempoContabilizado)
 # ==========================================
+def _parse_tiempo_trabajado(decoded) -> dict:
+    """
+    Devuelve dict nif -> {"tiempoContabilizado": seconds, "tiempoEfectivo": seconds}
+    Soporta múltiples formatos de respuesta (dict/list).
+    """
+    out = {}
+
+    # Caso 1: dict (p.ej. {"44649081D": {...}})
+    if isinstance(decoded, dict):
+        for key, val in decoded.items():
+            nif_key = str(key)
+
+            if isinstance(val, dict):
+                tc = val.get("tiempoContabilizado", 0) or 0
+                te = val.get("tiempoEfectivo", 0) or 0
+            elif isinstance(val, (list, tuple)):
+                # si viene como lista, intentamos localizar los dos últimos numéricos
+                nums = [x for x in val if isinstance(x, (int, float))]
+                tc = nums[-1] if len(nums) >= 1 else 0
+                te = nums[-2] if len(nums) >= 2 else 0
+            else:
+                tc, te = 0, 0
+
+            out[nif_key] = {"tiempoContabilizado": float(tc), "tiempoEfectivo": float(te)}
+
+        return out
+
+    # Caso 2: lista de dicts
+    if isinstance(decoded, list):
+        for item in decoded:
+            if not isinstance(item, dict):
+                continue
+
+            nif = item.get("nif") or item.get("Nif") or item.get("nif_empleado")
+            if not nif:
+                # a veces el “parámetro” puede venir en otra clave
+                for k in ("email", "num_empleado", "num_seg_social"):
+                    if item.get(k):
+                        nif = item.get(k)
+                        break
+            if not nif:
+                continue
+
+            tc = item.get("tiempoContabilizado", 0) or 0
+            te = item.get("tiempoEfectivo", 0) or 0
+            out[str(nif)] = {"tiempoContabilizado": float(tc), "tiempoEfectivo": float(te)}
+
+        return out
+
+    return out
+
+
 def api_tiempo_trabajado_un_dia(s: requests.Session, fecha_str: str, nifs: list[str]) -> dict:
     """
-    Devuelve dict nif -> {"tiempoEfectivo": secs, "tiempoContabilizado": secs}
+    Llama a /exportacion/tiempo-trabajado con desde=hasta=fecha_str.
+    Probamos dos codificaciones del array (nif[] y nif) para compatibilidad.
+    Devuelve dict nif -> seconds
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
 
-    data = [("desde", fecha_str), ("hasta", fecha_str)]
-    for n in nifs:
-        data.append(("nif[]", n))
-
+    # Intento 1: nif[]
+    data1 = [("desde", fecha_str), ("hasta", fecha_str)] + [("nif[]", n) for n in nifs]
     try:
-        resp = s.post(url, headers=headers(), data=data, timeout=REQ_TIMEOUT)
-        if resp.status_code >= 400:
-            return {}
-
-        payload_b64 = safe_strip_quotes(resp.text)
-        if not payload_b64:
-            return {}
-
-        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        decoded = json.loads(decrypted)
-
-        out = {}
-        if isinstance(decoded, dict):
-            for k, v in decoded.items():
-                if isinstance(v, dict):
-                    te = v.get("tiempoEfectivo", 0)
-                    tc = v.get("tiempoContabilizado", 0)
-                elif isinstance(v, list):
-                    te = v[-2] if len(v) >= 2 else 0
-                    tc = v[-1] if len(v) >= 1 else 0
-                else:
-                    continue
-
-                out[str(k)] = {
-                    "tiempoEfectivo": float(te) if te is not None else 0.0,
-                    "tiempoContabilizado": float(tc) if tc is not None else 0.0,
-                }
-        return out
-
+        resp = s.post(url, headers=headers(), data=data1, timeout=REQ_TIMEOUT)
+        if resp.status_code < 400:
+            payload_b64 = safe_strip_quotes(resp.text)
+            if payload_b64:
+                decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                decoded = json.loads(decrypted)
+                parsed = _parse_tiempo_trabajado(decoded)
+                if parsed:
+                    return parsed
     except Exception:
-        return {}
+        pass
+
+    # Intento 2: nif (repetido)
+    data2 = [("desde", fecha_str), ("hasta", fecha_str)] + [("nif", n) for n in nifs]
+    try:
+        resp = s.post(url, headers=headers(), data=data2, timeout=REQ_TIMEOUT)
+        if resp.status_code < 400:
+            payload_b64 = safe_strip_quotes(resp.text)
+            if payload_b64:
+                decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                decoded = json.loads(decrypted)
+                return _parse_tiempo_trabajado(decoded)
+    except Exception:
+        pass
+
+    return {}
 
 
 # ==========================================
-# PERMISOS (temporalmente 0)
-# ==========================================
-def permisos_horas_por_dia(fi: date, ff: date, empleados_df: pd.DataFrame) -> pd.DataFrame:
-    return pd.DataFrame(columns=["Fecha", "nif", "horas_permiso"])
-
-
-# ==========================================
-# REGLAS DE VALIDACIÓN
+# VALIDACIÓN (la que ya tenías)
 # ==========================================
 def calcular_minimos(depto: str, dia_semana: int):
     depto = (depto or "").strip().upper()
@@ -261,21 +293,21 @@ def calcular_minimos(depto: str, dia_semana: int):
 
 
 # ==========================================
-# UI
+# UI STREAMLIT
 # ==========================================
 st.set_page_config(page_title="Fichajes CRECE", layout="wide")
 st.title("📊 Fichajes CRECE Personas")
 
 hoy = date.today()
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     fecha_inicio = st.date_input("Fecha inicio", value=hoy, max_value=hoy)
-with col2:
+with c2:
     fecha_fin = st.date_input("Fecha fin", value=hoy, max_value=hoy)
 
 st.write("---")
 
-if st.button("▶ Obtener resumen (incidencias)"):
+if st.button("▶ Obtener incidencias (Total trabajado = tiempoContabilizado)"):
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
@@ -291,22 +323,23 @@ if st.button("▶ Obtener resumen (incidencias)"):
 
     nifs = empleados_df["nif"].dropna().astype(str).unique().tolist()
 
-    # 1) Tiempo trabajado por día (1 llamada por día para todos los NIFs)
+    # 1) Tiempo trabajado por día (tiempoContabilizado)
     with st.spinner("Obteniendo tiempo trabajado (tiempoContabilizado) por día…"):
         s = make_session()
-        tiempo_por_dia = {}  # (Fecha, nif) -> horas
+        tiempo_por_dia = {}  # (Fecha, nif) -> horas_contabilizadas
         for d in daterange(fecha_inicio, fecha_fin):
             ds = d.strftime("%Y-%m-%d")
             data_day = api_tiempo_trabajado_un_dia(s, ds, nifs)
+
+            # guardamos siempre, aunque venga parcial
             for nif, vv in data_day.items():
                 tc = float(vv.get("tiempoContabilizado", 0.0))
                 tiempo_por_dia[(ds, str(nif))] = tc / 3600.0
 
-    # 2) Fichajes en paralelo SOLO para contar registros
+    # 2) Fichajes en paralelo SOLO para contar
     with st.spinner("Contando fichajes por día…"):
         fi_str = fecha_inicio.strftime("%Y-%m-%d")
         ff_str = fecha_fin.strftime("%Y-%m-%d")
-
         s2 = make_session()
 
         def worker(emp_row):
@@ -317,74 +350,56 @@ if st.button("▶ Obtener resumen (incidencias)"):
             rows = []
             for d in daterange(fecha_inicio, fecha_fin):
                 ds = d.strftime("%Y-%m-%d")
-                total_trab = float(tiempo_por_dia.get((ds, nif), 0.0))
+                horas_cont = float(tiempo_por_dia.get((ds, nif), 0.0))
                 rows.append({
                     "Fecha": ds,
                     "nif": nif,
                     "Nombre Completo": emp_row["nombre_completo"],
                     "Departamento": emp_row["departamento_nombre"],
-                    "horas_trabajadas": total_trab,
+                    "horas_trabajadas": horas_cont,            # <- EXACTAMENTE tiempoContabilizado (horas)
                     "Numero de fichajes": int(counts.get(ds, 0)),
                 })
             return rows
 
-        resumen_rows = []
+        rows_all = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futs = [ex.submit(worker, r) for _, r in empleados_df.iterrows()]
             for fut in as_completed(futs):
                 try:
-                    resumen_rows.extend(fut.result())
+                    rows_all.extend(fut.result())
                 except Exception:
                     pass
 
-    base = pd.DataFrame(resumen_rows)
+    base = pd.DataFrame(rows_all)
     if base.empty:
         st.info("No hay datos en el rango.")
         st.stop()
 
-    # 3) Permisos (por ahora 0)
-    perm_df = permisos_horas_por_dia(fecha_inicio, fecha_fin, empleados_df)
-    base = base.merge(perm_df, on=["Fecha", "nif"], how="left")
-    if "horas_permiso" not in base.columns:
-        base["horas_permiso"] = 0.0
-    base["horas_permiso"] = base["horas_permiso"].fillna(0.0)
-
-    base["horas_totales"] = base["horas_trabajadas"] + base["horas_permiso"]
+    # Total trabajado = horas_trabajadas (tiempoContabilizado)
     base["Total trabajado"] = base["horas_trabajadas"].apply(horas_a_hhmm)
-    base["Horas permiso"] = base["horas_permiso"].apply(horas_a_hhmm)
-    base["Horas totales"] = base["horas_totales"].apply(horas_a_hhmm)
     base["dia_semana"] = pd.to_datetime(base["Fecha"]).dt.weekday
 
-    def _mins(row):
-        min_h, min_f = calcular_minimos(row["Departamento"], int(row["dia_semana"]))
-        return pd.Series({"min_horas": min_h, "min_fichajes": min_f})
-
-    mins = base.apply(_mins, axis=1)
-    base["min_horas"] = mins["min_horas"]
-    base["min_fichajes"] = mins["min_fichajes"]
-
     def validar(row):
-        min_h = row["min_horas"]
-        min_f = row["min_fichajes"]
-        if pd.isna(min_h) or pd.isna(min_f):
+        min_h, min_f = calcular_minimos(row["Departamento"], int(row["dia_semana"]))
+        if min_h is None or min_f is None:
             return None
 
-        horas_tot = float(row["horas_totales"])
+        horas = float(row["horas_trabajadas"])
         fich = int(row["Numero de fichajes"])
         motivos = []
 
-        if horas_tot < float(min_h):
-            motivos.append(f"Horas insuficientes (mín {min_h}h, tiene {horas_tot:.2f}h)")
+        if horas < float(min_h):
+            motivos.append(f"Horas insuficientes (mín {min_h}h, tiene {horas:.2f}h)")
         if fich < int(min_f):
             motivos.append(f"Fichajes insuficientes (mín {min_f}, tiene {fich})")
-        if horas_tot >= float(min_h) and fich > int(min_f):
+        if horas >= float(min_h) and fich > int(min_f):
             motivos.append(f"Fichajes excesivos (mín {min_f}, tiene {fich})")
 
         return "; ".join(motivos) if motivos else None
 
     base["Motivo"] = base.apply(validar, axis=1)
-
     out = base[base["Motivo"].notna()].copy()
+
     if out.empty:
         st.success("🎉 No hay incidencias en el rango seleccionado.")
         st.stop()
@@ -396,13 +411,11 @@ if st.button("▶ Obtener resumen (incidencias)"):
         "Nombre Completo",
         "Departamento",
         "Total trabajado",
-        "Horas permiso",
-        "Horas totales",
         "Numero de fichajes",
         "Motivo"
     ]].copy()
 
-    st.subheader("📄 Incidencias (por día)")
+    st.subheader("📄 Incidencias (Total trabajado = tiempoContabilizado)")
     for ds in out_final["Fecha"].unique():
         st.markdown(f"### 📅 Fecha {ds}")
         st.dataframe(out_final[out_final["Fecha"] == ds], use_container_width=True, hide_index=True)
@@ -411,6 +424,6 @@ if st.button("▶ Obtener resumen (incidencias)"):
     st.download_button(
         "⬇ Descargar CSV (incidencias)",
         csv_bytes,
-        "fichajes_incidencias.csv",
+        "fichajes_incidencias_tiempocontabilizado.csv",
         "text/csv"
     )
