@@ -142,14 +142,14 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
 
 SPECIAL_RULES = {
     # 2) MOD David Rodriguez: 09:30-14:00 => 4.5h, 2 fichajes
-    ("MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ")): {"min_horas": 4.5, "min_fichajes": 2},
+    ("MOD", norm_name("David Rodriguez Vazquez")): {"min_horas": 4.5, "min_fichajes": 2},
 
     # 3) MOI Debora, Etor y Miriam: mínimo 2 fichajes
-    ("MOI", norm_name("DEBORA")): {"min_fichajes": 2},
-    ("MOI", norm_name("ETOR")): {"min_fichajes": 2},
+    ("MOI", norm_name("Debora Luis Soto")): {"min_fichajes": 2},
+    ("MOI", norm_name("Etor Alegria Reparaz")): {"min_fichajes": 2},
 
     # 4) MOI Miriam: 09:00-14:30 => 5.5h y 2 fichajes
-    ("MOI", norm_name("MIRIAM")): {"min_horas": 5.5, "min_fichajes": 2},
+    ("MOI", norm_name("Miriam Martín Muñoz")): {"min_horas": 5.5, "min_fichajes": 2},
 }
 
 
