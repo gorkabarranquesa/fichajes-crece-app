@@ -91,19 +91,18 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     if not tc_hhmm or not tt_hhmm:
         return ""
 
-    tc = hhmm_to_dec(tc_hhmm)
-    tt = hhmm_to_dec(tt_hhmm)
+    tc_min = int(round(hhmm_to_dec(tc_hhmm) * 60))
+    tt_min = int(round(hhmm_to_dec(tt_hhmm) * 60))
 
-    # Igual al minuto -> vacío
-    if round(tc * 60) == round(tt * 60):
+    if tc_min == tt_min:
         return ""
 
-    diff_min = int(round((tc - tt) * 60))
-    sign = "+" if diff_min > 0 else "-"
-    diff_min = abs(diff_min)
+    diff = tc_min - tt_min
+    sign = "+" if diff > 0 else "-"
+    diff = abs(diff)
 
-    h = diff_min // 60
-    m = diff_min % 60
+    h = diff // 60
+    m = diff % 60
     return f"{sign}{h:02d}:{m:02d}"
 
 
@@ -214,51 +213,47 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
 
 
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
+    """
+    Manual: clave = parámetro encontrado (nif/email/...), valor = array con:
+    ID, nif/email/..., tiempoEfectivo (seg), tiempoContabilizado (seg). :contentReference[oaicite:1]{index=1}
+    """
     filas = []
 
-    def add_row(nif_key: str, obj):
-        nif_key = (str(nif_key) or "").upper().strip()
-        if not nif_key:
+    def add_row(key: str, val):
+        k = (str(key) or "").upper().strip()
+        if not k:
             return
 
-        if isinstance(obj, dict):
+        # Caso dict (ideal)
+        if isinstance(val, dict):
             filas.append(
                 {
-                    "nif": str(obj.get("nif") or nif_key).upper().strip(),
-                    "tiempoEfectivo_seg": obj.get("tiempoEfectivo"),
-                    "tiempoContabilizado_seg": obj.get("tiempoContabilizado"),
+                    "nif": str(val.get("nif") or k).upper().strip(),
+                    "tiempoEfectivo_seg": val.get("tiempoEfectivo"),
+                    "tiempoContabilizado_seg": val.get("tiempoContabilizado"),
                 }
             )
             return
 
-        if isinstance(obj, list):
-            if len(obj) > 0 and isinstance(obj[0], dict):
-                for it in obj:
-                    filas.append(
-                        {
-                            "nif": str(it.get("nif") or nif_key).upper().strip(),
-                            "tiempoEfectivo_seg": it.get("tiempoEfectivo"),
-                            "tiempoContabilizado_seg": it.get("tiempoContabilizado"),
-                        }
-                    )
-                return
-
-            nums = [x for x in obj if isinstance(x, (int, float)) or (isinstance(x, str) and str(x).isdigit())]
-            tef = nums[-2] if len(nums) >= 2 else None
-            tco = nums[-1] if len(nums) >= 2 else None
-            filas.append({"nif": nif_key, "tiempoEfectivo_seg": tef, "tiempoContabilizado_seg": tco})
+        # Caso lista posicional: [ID, nif/email/..., tiempoEfectivo, tiempoContabilizado]
+        if isinstance(val, list) and len(val) >= 4:
+            tef = val[-2]
+            tco = val[-1]
+            filas.append(
+                {
+                    "nif": k,
+                    "tiempoEfectivo_seg": tef,
+                    "tiempoContabilizado_seg": tco,
+                }
+            )
             return
 
-        filas.append({"nif": nif_key, "tiempoEfectivo_seg": None, "tiempoContabilizado_seg": None})
+        # Fallback
+        filas.append({"nif": k, "tiempoEfectivo_seg": None, "tiempoContabilizado_seg": None})
 
     if isinstance(parsed, dict):
         for k, v in parsed.items():
             add_row(k, v)
-    elif isinstance(parsed, list):
-        for it in parsed:
-            if isinstance(it, dict):
-                nk = it.get("nif") or it.get("email") or it.get("num_empleado") or ""
-                add_row(nk, it)
 
     df = pd.DataFrame(filas)
     if df.empty:
@@ -267,27 +262,20 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     return df
 
 
-def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None, emails=None, nums_empleado=None, nums_ss=None) -> pd.DataFrame:
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
     """
-    Enviamos arrays como nif[] repetido (sin cambiar la forma actual que te funciona).
+    IMPORTANTE: NO CAMBIAMOS LA FORMA (seguimos usando nif[] repetido) porque así ya te funciona.
     """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
 
-    def add_array(key: str, values):
-        if not values:
-            return
-        for v in values:
+    if nifs:
+        for v in nifs:
             if v is None:
                 continue
             s = str(v).strip()
             if s:
-                payload.append((key, s))
-
-    add_array("nif[]", nifs)
-    add_array("email[]", emails)
-    add_array("num_empleado[]", nums_empleado)
-    add_array("num_seg_social[]", nums_ss)
+                payload.append(("nif[]", s))
 
     try:
         resp = _SESSION.post(url, data=payload, timeout=HTTP_TIMEOUT)
@@ -381,7 +369,7 @@ def validar_incidencia(r):
     min_h = r.get("min_horas")
     min_f = r.get("min_fichajes")
     if pd.isna(min_h) or pd.isna(min_f):
-        return None
+        return ""
 
     num_fich = r.get("Numero de fichajes", 0)
     try:
@@ -396,17 +384,14 @@ def validar_incidencia(r):
         horas_val = 0.0
 
     motivo = []
-
     if horas_val < float(min_h):
         motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {horas_val:.2f}h)")
-
     if num_fich < int(min_f):
         motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {num_fich})")
-
     if horas_val >= float(min_h) and num_fich > int(min_f):
         motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {num_fich})")
 
-    return "; ".join(motivo) if motivo else None
+    return "; ".join(motivo)
 
 
 # ============================================================
@@ -506,7 +491,10 @@ if st.button("Consultar"):
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
         # ============================================================
-        # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA QUE AHORA
+        # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA QUE TE FUNCIONA
+        # Con mejora para evitar "de más":
+        #   1) intentar (desde=dia, hasta=dia)
+        #   2) si viene vacío, fallback (hasta=dia+1)
         # ============================================================
 
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -518,9 +506,15 @@ if st.button("Consultar"):
         cur = d0
         while cur <= d1:
             desde = cur.strftime("%Y-%m-%d")
-            hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
 
-            df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
+            # Intento 1: mismo día (evita incluir el día siguiente si 'hasta' fuera inclusivo)
+            df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
+
+            # Fallback: día siguiente
+            if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+                hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+                df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
+
             if not df_tc.empty:
                 df_tc["Fecha"] = desde
                 tc_rows.append(df_tc)
@@ -557,13 +551,10 @@ if st.button("Consultar"):
             axis=1,
         )
 
+        # Incidencia: ahora NO filtramos; dejamos vacío si no hay
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
-        salida = resumen[resumen["Incidencia"].notna()].copy()
-        if salida.empty:
-            st.success("🎉 No hay incidencias en el rango seleccionado.")
-            st.stop()
-
+        salida = resumen.copy()
         salida = salida[
             [
                 "Fecha",
@@ -577,11 +568,11 @@ if st.button("Consultar"):
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    st.subheader("📄 Incidencias")
+    st.subheader("📄 Resultado")
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
         sub = salida[salida["Fecha"] == f_dia]
         st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
     csv = salida.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
+    st.download_button("⬇ Descargar CSV", csv, "fichajes_resultado.csv", "text/csv")
