@@ -241,15 +241,9 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     return df
 
 
-def api_exportar_tiempo_trabajado(desde: str, hasta: str, *, nifs=None, emails=None, nums_empleado=None, nums_ss=None) -> pd.DataFrame:
-    """
-    /exportacion/tiempo trabajado (según manual)
-    Enviamos arrays como nif[]/email[]/num_empleado[]/num_seg_social[] repetidos.
-    :contentReference[oaicite:3]{index=3}
-    """
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None, emails=None, nums_empleado=None, nums_ss=None) -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
 
-    # Construcción POST tipo "form" con claves repetidas
     payload = [("desde", desde), ("hasta", hasta)]
 
     def add_array(key: str, values):
@@ -262,7 +256,6 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, *, nifs=None, emails=N
             if s:
                 payload.append((key, s))
 
-    # OJO: usar nif[] / email[] / num_empleado[] / num_seg_social[]
     add_array("nif[]", nifs)
     add_array("email[]", emails)
     add_array("num_empleado[]", nums_empleado)
@@ -278,13 +271,12 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, *, nifs=None, emails=N
 
         decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
         parsed = json.loads(decrypted)
-
-        df = _parse_tiempo_trabajado_payload(parsed)
-        return df
+        return _parse_tiempo_trabajado_payload(parsed)
 
     except Exception as e:
         _safe_fail(e)
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
 
 
 # ============================================================
