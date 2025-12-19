@@ -20,7 +20,7 @@ APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
-HTTP_TIMEOUT = (5, 25)
+HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 _SESSION = requests.Session()
 _SESSION.headers.update(
@@ -80,6 +80,32 @@ def hhmm_to_dec(hhmm: str) -> float:
         return 0.0
 
 
+def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
+    """
+    Diferencia = Tiempo Contabilizado - Total trabajado
+    Devuelve "" si son iguales (al minuto) o falta algún valor.
+    """
+    tc_hhmm = (tc_hhmm or "").strip()
+    tt_hhmm = (tt_hhmm or "").strip()
+    if not tc_hhmm or not tt_hhmm:
+        return ""
+
+    tc = hhmm_to_dec(tc_hhmm)
+    tt = hhmm_to_dec(tt_hhmm)
+
+    # Igualdad al minuto para evitar ruido por segundos/redondeos
+    if round(tc * 60) == round(tt * 60):
+        return ""
+
+    diff_min = int(round((tc - tt) * 60))
+    sign = "+" if diff_min > 0 else "-"
+    diff_min = abs(diff_min)
+
+    h = diff_min // 60
+    m = diff_min % 60
+    return f"{sign}{h:02d}:{m:02d}"
+
+
 # ============================================================
 # API EXPORTACIÓN
 # ============================================================
@@ -101,6 +127,7 @@ def api_exportar_departamentos() -> pd.DataFrame:
 
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
+    # PII -> NO cache
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
@@ -140,6 +167,9 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_tipos_fichaje() -> dict:
+    """
+    Cache 1h (no PII). Se usa para descuenta_tiempo y turno_nocturno.
+    """
     url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
     try:
         resp = _SESSION.post(url, timeout=HTTP_TIMEOUT)
@@ -186,6 +216,10 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
 
 
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
+    """
+    Soporta dict y list. Si viene posicional, toma los 2 últimos numéricos
+    como (tiempoEfectivo, tiempoContabilizado).
+    """
     filas = []
 
     def add_row(nif_key: str, obj):
@@ -215,7 +249,11 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
                     )
                 return
 
-            nums = [x for x in obj if isinstance(x, (int, float)) or (isinstance(x, str) and str(x).isdigit())]
+            nums = [
+                x
+                for x in obj
+                if isinstance(x, (int, float)) or (isinstance(x, str) and str(x).isdigit())
+            ]
             tef = nums[-2] if len(nums) >= 2 else None
             tco = nums[-1] if len(nums) >= 2 else None
             filas.append(
@@ -242,8 +280,10 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
 
 
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None, emails=None, nums_empleado=None, nums_ss=None) -> pd.DataFrame:
+    """
+    Envía arrays como nif[] repetido (forma compatible con backend).
+    """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
-
     payload = [("desde", desde), ("hasta", hasta)]
 
     def add_array(key: str, values):
@@ -278,7 +318,6 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None, emails=None
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 
-
 # ============================================================
 # DÍA (turno nocturno)
 # ============================================================
@@ -294,10 +333,10 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
 # ============================================================
 
 def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
-    rows_out = []
     if df.empty:
         return pd.DataFrame(columns=["nif", "Fecha", "segundos_neto"])
 
+    rows_out = []
     for nif in df["nif"].unique():
         sub_emp = df[df["nif"] == nif].copy()
         for fecha_dia in sub_emp["fecha_dia"].unique():
@@ -312,6 +351,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
             while i < n - 1:
                 a = sub.iloc[i]
                 b = sub.iloc[i + 1]
+
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
@@ -324,9 +364,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 else:
                     i += 1
 
-            rows_out.append(
-                {"nif": nif, "Fecha": fecha_dia, "segundos_neto": max(0, sumados - descontados)}
-            )
+            rows_out.append({"nif": nif, "Fecha": fecha_dia, "segundos_neto": max(0, sumados - descontados)})
 
     return pd.DataFrame(rows_out)
 
@@ -358,7 +396,6 @@ def validar_incidencia(r):
     if pd.isna(min_h) or pd.isna(min_f):
         return None
 
-    # DEFENSIVO: nunca KeyError
     num_fich = r.get("Numero de fichajes", 0)
     try:
         num_fich = int(num_fich) if not pd.isna(num_fich) else 0
@@ -414,6 +451,7 @@ if st.button("Consultar"):
             tipos_map = api_exportar_tipos_fichaje()
             departamentos_df = api_exportar_departamentos()
             empleados_df = api_exportar_empleados_completos()
+
             if empleados_df.empty:
                 st.warning("No hay empleados disponibles.")
                 st.stop()
@@ -426,7 +464,9 @@ if st.button("Consultar"):
             st.error("❌ No se pudo cargar la información base.")
             st.stop()
 
-        # Fichajes en paralelo
+        # =======================
+        # FICHAJES EN PARALELO
+        # =======================
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
             futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_df.iterrows()}
@@ -464,9 +504,8 @@ if st.button("Consultar"):
 
         df["fecha_dia"] = df.apply(_dia_row, axis=1)
 
-        # Número de fichajes por día
+        # Nº fichajes por día
         df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
-
         conteo = (
             df.groupby(["nif", "Nombre", "Departamento", "fecha_dia"], as_index=False)
             .agg(Numero=("Numero", "max"))
@@ -479,17 +518,10 @@ if st.button("Consultar"):
         resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
-        # Tiempo contabilizado: rango completo y por día (doble intento)
+        # =======================
+        # TIEMPO CONTABILIZADO (API) POR DÍA
+        # =======================
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-
-        df_tc_rango = api_exportar_tiempo_trabajado(fi, ff, nifs)
-        if not df_tc_rango.empty:
-            df_tc_rango["Tiempo Contabilizado (rango)"] = df_tc_rango["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
-            df_tc_rango = df_tc_rango[["nif", "Tiempo Contabilizado (rango)"]]
-        else:
-            df_tc_rango = pd.DataFrame(columns=["nif", "Tiempo Contabilizado (rango)"])
-
-        resumen = resumen.merge(df_tc_rango, on="nif", how="left")
 
         tc_rows = []
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
@@ -498,12 +530,8 @@ if st.button("Consultar"):
         cur = d0
         while cur <= d1:
             desde = cur.strftime("%Y-%m-%d")
-
-            df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs)
-            if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
-                hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
-                df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs)
-
+            hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")  # hasta > desde
+            df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
             if not df_tc.empty:
                 df_tc["Fecha"] = desde
                 tc_rows.append(df_tc)
@@ -518,9 +546,18 @@ if st.button("Consultar"):
 
         resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
         resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
-        resumen["Tiempo Contabilizado (rango)"] = resumen["Tiempo Contabilizado (rango)"].fillna("")
 
-        # Validación
+        # =======================
+        # DIFERENCIA (TC - TT)
+        # =======================
+        resumen["Diferencia"] = resumen.apply(
+            lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
+            axis=1
+        )
+
+        # =======================
+        # VALIDACIÓN
+        # =======================
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
             lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]))),
@@ -548,17 +585,29 @@ if st.button("Consultar"):
                 "Departamento",
                 "Total trabajado",
                 "Tiempo Contabilizado",
-                "Tiempo Contabilizado (rango)",
+                "Diferencia",
                 "Numero de fichajes",
                 "Incidencia",
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
     st.subheader("📄 Incidencias")
+
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
         sub = salida[salida["Fecha"] == f_dia]
-        st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        st.data_editor(
+            sub,
+            use_container_width=True,
+            hide_index=True,
+            disabled=True,
+            num_rows="fixed",
+        )
 
     csv = salida.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
+    st.download_button(
+        "⬇ Descargar CSV",
+        csv,
+        "fichajes_incidencias.csv",
+        "text/csv",
+    )
