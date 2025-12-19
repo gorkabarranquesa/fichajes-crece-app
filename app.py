@@ -1,7 +1,7 @@
 import base64
 import json
 import multiprocessing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -18,14 +18,11 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-# Concurrencia segura (evita saturar API/Cloud)
 CPU = multiprocessing.cpu_count()
-MAX_WORKERS = max(8, min(24, CPU * 3))  # equilibrado: rápido sin “apisonadora”
+MAX_WORKERS = max(8, min(24, CPU * 3))  # rápido sin saturar API
 
-# Timeouts robustos (conexión, lectura)
-HTTP_TIMEOUT = (5, 25)
+HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
-# Session global (reutiliza conexiones, más rápido)
 _SESSION = requests.Session()
 _SESSION.headers.update(
     {
@@ -39,10 +36,7 @@ _SESSION.headers.update(
 # ============================================================
 
 def _safe_fail(_exc: Exception) -> None:
-    """
-    No mostrar detalles (evita filtrar respuestas, tokens, payloads).
-    Aquí deliberadamente no se hace nada.
-    """
+    # Deliberadamente no logueamos detalles (evita filtraciones)
     return None
 
 
@@ -51,13 +45,6 @@ def _safe_fail(_exc: Exception) -> None:
 # ============================================================
 
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
-    """
-    Descifra payloads cifrados por CRECE.
-
-    Seguridad:
-    - No loguea nada.
-    - Lanza excepción si el formato es inválido para que el caller gestione silenciosamente.
-    """
     json_raw = base64.b64decode(payload_b64).decode("utf-8")
     payload = json.loads(json_raw)
 
@@ -71,14 +58,11 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
 
 def _extract_payload_b64(resp: requests.Response) -> str:
-    """
-    Algunas APIs devuelven el string base64 entrecomillado.
-    """
     return (resp.text or "").strip().strip('"').strip()
 
 
 # ============================================================
-# FORMATEOS HORAS
+# FORMATEOS TIEMPO
 # ============================================================
 
 def horas_a_hhmm(horas: float) -> str:
@@ -88,6 +72,16 @@ def horas_a_hhmm(horas: float) -> str:
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
+
+
+def segundos_a_hhmm(seg: float) -> str:
+    if seg is None or pd.isna(seg):
+        return "00:00"
+    seg = max(0, int(round(float(seg))))
+    m = seg // 60
+    h = m // 60
+    mm = m % 60
+    return f"{h:02d}:{mm:02d}"
 
 
 def hhmm_to_dec(hhmm: str) -> float:
@@ -106,11 +100,7 @@ def hhmm_to_dec(hhmm: str) -> float:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_departamentos() -> pd.DataFrame:
-    """
-    Departamentos (normalmente no PII) -> cache seguro con TTL.
-    """
     url = f"{API_URL_BASE}/exportacion/departamentos"
-
     resp = _SESSION.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
 
@@ -130,9 +120,7 @@ def api_exportar_departamentos() -> pd.DataFrame:
 
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
-    """
-    Empleados: contiene PII -> NO cache por defecto.
-    """
+    # PII -> NO cache
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
@@ -165,25 +153,51 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         )
 
     df_emp = pd.DataFrame(lista)
-
     if not df_emp.empty:
         df_emp["nif"] = df_emp["nif"].astype(str).str.upper().str.strip()
-
     return df_emp
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_tipos_fichaje() -> dict:
+    """
+    Devuelve dict: {tipo_id: {descuenta_tiempo, entrada, turno_nocturno}}
+    Cache 1h (no PII).
+    """
+    url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
+    try:
+        resp = _SESSION.post(url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+
+        payload_b64 = _extract_payload_b64(resp)
+        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+        tipos = json.loads(decrypted)
+
+        out = {}
+        if isinstance(tipos, list):
+            for t in tipos:
+                tid = t.get("id")
+                if tid is None:
+                    continue
+                out[int(tid)] = {
+                    "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
+                    "entrada": int(t.get("entrada") or 0),
+                    "turno_nocturno": int(t.get("turno_nocturno") or 0),
+                    "nombre": t.get("nombre") or "",
+                }
+        return out
+    except Exception as e:
+        _safe_fail(e)
+        return {}
+
+
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
-    """
-    Fichajes por empleado y rango.
-    Seguridad:
-    - Ante error, devuelve [] sin exponer detalles.
-    """
     url = f"{API_URL_BASE}/exportacion/fichajes"
     data = {
         "fecha_inicio": fi,
         "fecha_fin": ff,
         "nif": nif,
-        "order": "desc",
+        "order": "asc",  # mejor para calcular tramos
     }
 
     try:
@@ -202,26 +216,85 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
         return []
 
 
+def api_exportar_vacaciones(fi: str, ff: str, nifs: list[str]) -> list:
+    """
+    Vacaciones/Asuntos propios por días (NO horas).
+    Permite filtrar por nifs (opcional según manual).
+    """
+    url = f"{API_URL_BASE}/exportacion/vacaciones"
+    data = {
+        "fecha_inicio": fi,
+        "fecha_fin": ff,
+        "nifs": nifs,  # según manual es opcional; si falla lo gestionamos
+    }
+
+    try:
+        resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+
+        payload_b64 = _extract_payload_b64(resp)
+        if not payload_b64:
+            return []
+
+        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+        out = json.loads(decrypted)
+        return out if isinstance(out, list) else []
+    except Exception as e:
+        _safe_fail(e)
+        # Intento sin nifs por si ese parámetro no está habilitado en vuestra instancia
+        try:
+            data2 = {"fecha_inicio": fi, "fecha_fin": ff}
+            resp2 = _SESSION.post(url, data=data2, timeout=HTTP_TIMEOUT)
+            resp2.raise_for_status()
+            payload_b64 = _extract_payload_b64(resp2)
+            if not payload_b64:
+                return []
+            decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+            out = json.loads(decrypted)
+            return out if isinstance(out, list) else []
+        except Exception as e2:
+            _safe_fail(e2)
+            return []
+
+
 # ============================================================
-# CÁLCULO DE HORAS (sin SettingWithCopy)
+# LÓGICA: asignar "día" (manejo básico turno nocturno)
 # ============================================================
 
-def calcular_horas(df: pd.DataFrame) -> pd.DataFrame:
+def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
     """
-    Calcula horas trabajadas por pares entrada->salida y acumulado diario.
-    - Robusto: no usa asignaciones ambiguas en sub.iloc[i]["..."].
-    - No inventa pares si el orden es raro: deja horas_trabajadas=0 y solo acumula cuando hay par válido.
+    Heurística conservadora:
+    - Si turno_nocturno=1 y el fichaje es de madrugada, lo asociamos al día anterior.
+    Esto suele acercar el resultado a “cambio de día” que aplica CRECE.
+    """
+    if turno_nocturno == 1 and fecha_dt.hour < 6:
+        return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return fecha_dt.date().strftime("%Y-%m-%d")
+
+
+# ============================================================
+# CÁLCULO TIEMPO TRABAJADO (con descuento_tiempo y nocturno)
+# ============================================================
+
+def calcular_tiempos(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
+    """
+    Devuelve df con:
+    - segundos_sumados: suma de tramos "entrada->salida" normales
+    - segundos_descontados: suma de tramos cuya entrada tiene descuenta_tiempo=1
+    - segundos_neto: sumados - descontados
+
+    Nota: usamos la propiedad del TIPO del fichaje de entrada del tramo.
     """
     if df.empty:
         return df
 
     df = df.copy()
-    df["horas_trabajadas"] = 0.0
-    df["horas_acumuladas"] = 0.0
+    df["segundos_sumados"] = 0
+    df["segundos_descontados"] = 0
+    df["segundos_neto"] = 0
 
     rows_out = []
 
-    # Procesar por empleado y día
     for nif in df["nif"].unique():
         sub_emp = df[df["nif"] == nif].copy()
 
@@ -229,53 +302,124 @@ def calcular_horas(df: pd.DataFrame) -> pd.DataFrame:
             sub = sub_emp[sub_emp["fecha_dia"] == fecha_dia].copy()
             sub = sub.sort_values("fecha_dt")
 
-            horas_acum = 0.0
+            sumados = 0
+            descontados = 0
+
             i = 0
             n = len(sub)
 
             while i < n:
                 row_i = sub.iloc[i].copy()
-                row_i["horas_trabajadas"] = 0.0
-                row_i["horas_acumuladas"] = horas_acum
+                row_i["segundos_sumados"] = sumados
+                row_i["segundos_descontados"] = descontados
+                row_i["segundos_neto"] = sumados - descontados
 
                 if i < n - 1:
-                    row_next = sub.iloc[i + 1].copy()
+                    row_j = sub.iloc[i + 1].copy()
 
-                    if row_i.get("direccion") == "entrada" and row_next.get("direccion") == "salida":
-                        # Par válido
-                        total_seconds = (row_next["fecha_dt"] - row_i["fecha_dt"]).total_seconds()
-                        if total_seconds < 0:
-                            # Datos corruptos / desorden: no acumular
+                    if row_i.get("direccion") == "entrada" and row_j.get("direccion") == "salida":
+                        delta = (row_j["fecha_dt"] - row_i["fecha_dt"]).total_seconds()
+                        if delta < 0:
                             rows_out.append(row_i)
                             i += 1
                             continue
 
-                        horas = total_seconds / 3600.0
-                        horas_acum += horas
+                        tipo_id = row_i.get("tipo")
+                        props = tipos_map.get(int(tipo_id), {}) if tipo_id is not None else {}
 
-                        row_i["horas_trabajadas"] = horas
-                        row_i["horas_acumuladas"] = horas_acum
+                        if int(props.get("descuenta_tiempo", 0)) == 1:
+                            descontados += int(round(delta))
+                        else:
+                            sumados += int(round(delta))
+
+                        row_i["segundos_sumados"] = sumados
+                        row_i["segundos_descontados"] = descontados
+                        row_i["segundos_neto"] = sumados - descontados
                         rows_out.append(row_i)
 
-                        row_next = row_next.copy()
-                        row_next["horas_trabajadas"] = 0.0
-                        row_next["horas_acumuladas"] = horas_acum
-                        rows_out.append(row_next)
+                        row_j = row_j.copy()
+                        row_j["segundos_sumados"] = sumados
+                        row_j["segundos_descontados"] = descontados
+                        row_j["segundos_neto"] = sumados - descontados
+                        rows_out.append(row_j)
 
                         i += 2
                         continue
 
-                # No hay par válido -> solo volcamos la fila con acumulado actual
                 rows_out.append(row_i)
                 i += 1
 
-    out = pd.DataFrame(rows_out)
-    out = out.sort_values(["fecha_dt", "nif"], kind="mergesort")
+    out = pd.DataFrame(rows_out).sort_values(["fecha_dt", "nif"], kind="mergesort")
     return out
 
 
 # ============================================================
-# REGLAS DE JORNADA (validación base, sin permisos)
+# VACACIONES -> bandera por día (sin horas)
+# ============================================================
+
+def map_tipo_vacaciones(tipo: int) -> str:
+    mapping = {
+        1: "Vacaciones",
+        2: "Asuntos propios",
+        8: "Asuntos propios año anterior",
+        9: "Vacaciones año anterior",
+        10: "Vacaciones año siguiente",
+    }
+    return mapping.get(int(tipo) if tipo is not None else -1, f"Tipo {tipo}")
+
+
+def expandir_vacaciones_a_dias(vacs: list, fi: str, ff: str) -> pd.DataFrame:
+    if not vacs:
+        return pd.DataFrame(columns=["nif", "Fecha", "Vacaciones_detalle", "Tiene vacaciones"])
+
+    rango_ini = datetime.strptime(fi, "%Y-%m-%d").date()
+    rango_fin = datetime.strptime(ff, "%Y-%m-%d").date()
+
+    filas = []
+    for v in vacs:
+        usuario = v.get("usuario", {}) or {}
+        nif = usuario.get("Nif") or usuario.get("nif")
+        if not nif:
+            continue
+        nif = str(nif).upper().strip()
+
+        try:
+            f_ini = datetime.strptime(v["fecha_inicio"], "%Y-%m-%d").date()
+            f_fin = datetime.strptime(v["fecha_fin"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        current = max(f_ini, rango_ini)
+        last = min(f_fin, rango_fin)
+        if current > last:
+            continue
+
+        texto = map_tipo_vacaciones(v.get("tipo")) + f" (estado {v.get('estado')})"
+        while current <= last:
+            filas.append(
+                {
+                    "nif": nif,
+                    "Fecha": current.strftime("%Y-%m-%d"),
+                    "Vacaciones_detalle": texto,
+                    "Tiene vacaciones": True,
+                }
+            )
+            current += timedelta(days=1)
+
+    if not filas:
+        return pd.DataFrame(columns=["nif", "Fecha", "Vacaciones_detalle", "Tiene vacaciones"])
+
+    dfv = pd.DataFrame(filas)
+    dfv = dfv.groupby(["nif", "Fecha"], as_index=False).agg(
+        Vacaciones_detalle=("Vacaciones_detalle", lambda s: " + ".join(sorted(set(s)))),
+        Tiene_vacaciones=("Tiene vacaciones", "max"),
+    )
+    dfv = dfv.rename(columns={"Tiene_vacaciones": "Tiene vacaciones"})
+    return dfv
+
+
+# ============================================================
+# REGLAS DE JORNADA (validación base)
 # ============================================================
 
 def calcular_minimos(depto: str, dia: int):
@@ -286,7 +430,7 @@ def calcular_minimos(depto: str, dia: int):
             return 8.5, 4
         if dia == 4:  # V
             return 6.5, 2
-        return None, None  # fin de semana u otros
+        return None, None
 
     if depto == "MOD":
         if dia in [0, 1, 2, 3, 4]:  # L-V
@@ -297,18 +441,11 @@ def calcular_minimos(depto: str, dia: int):
 
 
 def validar_incidencia(r):
-    """
-    Validación SIN permisos:
-    - Horas insuficientes
-    - Fichajes insuficientes
-    - Fichajes excesivos (cuando supera el mínimo; mantiene tu regla original)
-    """
     min_h, min_f = r["min_horas"], r["min_fichajes"]
     if pd.isna(min_h) or pd.isna(min_f):
         return None
 
     motivo = []
-
     if r["horas_dec"] < float(min_h):
         motivo.append(f"Horas insuficientes (mín {min_h}h, tiene {r['horas_dec']:.2f}h)")
 
@@ -322,7 +459,7 @@ def validar_incidencia(r):
 
 
 # ============================================================
-# UI STREAMLIT (mínima, sin “ruido”)
+# UI STREAMLIT (mínima)
 # ============================================================
 
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
@@ -337,7 +474,7 @@ with col2:
 
 st.write("---")
 
-if st.button("▶ Obtener incidencias"):
+if st.button("Consultar"):
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
@@ -349,9 +486,9 @@ if st.button("▶ Obtener incidencias"):
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
 
-    # Mensaje mínimo (sin detalles de proceso)
     with st.spinner("Procesando…"):
         try:
+            tipos_map = api_exportar_tipos_fichaje()
             departamentos_df = api_exportar_departamentos()
             empleados_df = api_exportar_empleados_completos()
 
@@ -367,10 +504,8 @@ if st.button("▶ Obtener incidencias"):
             st.error("❌ No se pudo cargar la información base.")
             st.stop()
 
-        # Fichajes en paralelo (sin bloquear; si falla un empleado, se continúa)
+        # Fichajes en paralelo (si un empleado falla, se continúa)
         fichajes_rows = []
-        total_empleados = int(len(empleados_df))
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
             futures = {
                 exe.submit(api_exportar_fichajes, row["nif"], fi, ff): row
@@ -385,52 +520,55 @@ if st.button("▶ Obtener incidencias"):
                         fichajes_rows.append(
                             {
                                 "nif": emp["nif"],
-                                "nombre_completo": emp["nombre_completo"],
-                                "departamento_nombre": emp.get("departamento_nombre"),
+                                "Nombre": emp["nombre_completo"],
+                                "Departamento": emp.get("departamento_nombre"),
                                 "id": x.get("id"),
+                                "tipo": x.get("tipo"),
                                 "direccion": x.get("direccion"),
                                 "fecha": x.get("fecha"),
                             }
                         )
                     except Exception:
-                        # Si una fila viene rara, la saltamos sin romper el proceso
                         continue
 
         if not fichajes_rows:
             st.info("No se encontraron fichajes en el rango seleccionado.")
             st.stop()
 
-        # Construcción dataframe fichajes
         df = pd.DataFrame(fichajes_rows)
         df["nif"] = df["nif"].astype(str).str.upper().str.strip()
         df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
         df = df.dropna(subset=["fecha_dt"])
-        df["fecha_dia"] = df["fecha_dt"].dt.strftime("%Y-%m-%d")
 
-        # Cálculo horas por día
-        df = calcular_horas(df)
+        # día ajustado (turno nocturno si aplica)
+        def _dia_row(r):
+            props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
+            return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
 
-        # Nº fichajes por día
+        df["fecha_dia"] = df.apply(_dia_row, axis=1)
+
+        # cálculo tiempos netos
+        df = calcular_tiempos(df, tipos_map)
+
+        # nº fichajes por día
         df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
 
-        # Resumen diario
+        # resumen diario (neto)
         resumen = (
-            df.groupby(["nif", "nombre_completo", "departamento_nombre", "fecha_dia"], as_index=False)
-            .agg(horas=("horas_acumuladas", "max"), fichajes=("Numero", "max"))
+            df.groupby(["nif", "Nombre", "Departamento", "fecha_dia"], as_index=False)
+            .agg(
+                segundos_neto=("segundos_neto", "max"),
+                fichajes=("Numero", "max"),
+            )
         )
-
-        resumen["Total trabajado"] = resumen["horas"].apply(horas_a_hhmm)
-
         resumen = resumen.rename(
             columns={
-                "nombre_completo": "Nombre",
-                "departamento_nombre": "Departamento",
                 "fecha_dia": "Fecha",
                 "fichajes": "Numero de fichajes",
             }
         )
 
-        # Validaciones
+        resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
         resumen["horas_dec"] = resumen["Total trabajado"].apply(hhmm_to_dec)
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
@@ -441,24 +579,41 @@ if st.button("▶ Obtener incidencias"):
 
         resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
 
-        resumen_final = resumen[resumen["Incidencia"].notna()].copy()
+        # Vacaciones (bandera por día, sin horas)
+        nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+        vacs = api_exportar_vacaciones(fi, ff, nifs)
+        df_vac = expandir_vacaciones_a_dias(vacs, fi, ff)
 
-        if resumen_final.empty:
-            st.success("🎉 No hay incidencias en el rango seleccionado.")
+        resumen = resumen.merge(df_vac, on=["nif", "Fecha"], how="left")
+        resumen["Tiene vacaciones"] = resumen["Tiene vacaciones"].fillna(False)
+
+        # Mostrar solo lo necesario: incidencias o vacaciones
+        salida = resumen[(resumen["Incidencia"].notna()) | (resumen["Tiene vacaciones"] == True)].copy()
+
+        if salida.empty:
+            st.success("🎉 No hay incidencias ni vacaciones en el rango seleccionado.")
             st.stop()
 
-        # Salida mínima (lo necesario)
-        resumen_final = resumen_final[
-            ["Fecha", "Nombre", "Departamento", "Total trabajado", "Numero de fichajes", "Incidencia"]
+        salida["Vacaciones_detalle"] = salida["Vacaciones_detalle"].fillna("")
+
+        salida = salida[
+            [
+                "Fecha",
+                "Nombre",
+                "Departamento",
+                "Total trabajado",
+                "Numero de fichajes",
+                "Tiene vacaciones",
+                "Vacaciones_detalle",
+                "Incidencia",
+            ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    st.subheader("📄 Incidencias")
+    st.subheader("📄 Resultado")
 
-    # Mostrar por fecha (sin detalles internos)
-    for f_dia in resumen_final["Fecha"].unique():
+    for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
-        sub = resumen_final[resumen_final["Fecha"] == f_dia]
-
+        sub = salida[salida["Fecha"] == f_dia]
         st.data_editor(
             sub,
             use_container_width=True,
@@ -467,10 +622,10 @@ if st.button("▶ Obtener incidencias"):
             num_rows="fixed",
         )
 
-    csv = resumen_final.to_csv(index=False).encode("utf-8")
+    csv = salida.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇ Descargar CSV",
         csv,
-        "fichajes_incidencias.csv",
+        "fichajes_resultado.csv",
         "text/csv",
     )
