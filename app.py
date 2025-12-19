@@ -24,7 +24,7 @@ REQ_TIMEOUT = 30
 
 
 # ==========================================
-# DESCIFRADO CRECE (Laravel payload {iv,value,mac})
+# DESCIFRADO CRECE (Laravel)
 # ==========================================
 def _strip_quotes(s: str) -> str:
     if s is None:
@@ -36,10 +36,6 @@ def _strip_quotes(s: str) -> str:
 
 
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
-    """
-    payload_b64: base64 de un JSON {"iv":"..","value":"..","mac":"..","tag":""}
-    app_key_b64: APP_KEY en base64
-    """
     payload_b64 = _strip_quotes(payload_b64)
     if not payload_b64:
         return ""
@@ -93,13 +89,6 @@ def horas_a_hhmm(horas: float) -> str:
     return f"{h:02d}:{m:02d}"
 
 
-def hhmm_to_dec(hhmm: str) -> float:
-    if not isinstance(hhmm, str) or ":" not in hhmm:
-        return 0.0
-    h, m = hhmm.split(":")
-    return int(h) + int(m) / 60.0
-
-
 def daterange(d1: date, d2: date):
     cur = d1
     while cur <= d2:
@@ -107,27 +96,8 @@ def daterange(d1: date, d2: date):
         cur += timedelta(days=1)
 
 
-def split_interval_by_day(start_dt: datetime, end_dt: datetime):
-    """
-    Divide un intervalo [start_dt, end_dt] en piezas por día.
-    Devuelve lista de (YYYY-MM-DD, segundos)
-    """
-    if end_dt <= start_dt:
-        return []
-
-    out = []
-    cur = start_dt
-    while cur.date() < end_dt.date():
-        midnight_next = datetime.combine(cur.date() + timedelta(days=1), datetime.min.time())
-        out.append((cur.strftime("%Y-%m-%d"), (midnight_next - cur).total_seconds()))
-        cur = midnight_next
-
-    out.append((cur.strftime("%Y-%m-%d"), (end_dt - cur).total_seconds()))
-    return out
-
-
 # ==========================================
-# EXPORT: DEPARTAMENTOS
+# EXPORT: DEPARTAMENTOS / EMPLEADOS
 # ==========================================
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def api_exportar_departamentos() -> pd.DataFrame:
@@ -143,9 +113,6 @@ def api_exportar_departamentos() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ==========================================
-# EXPORT: EMPLEADOS
-# ==========================================
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
@@ -181,35 +148,6 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
 
 # ==========================================
-# EXPORT: TIPOS DE FICHAJE
-# ==========================================
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def api_exportar_tipos_fichaje() -> dict:
-    """
-    Devuelve dict tipo_id -> {descuenta_tiempo, entrada, turno_nocturno}
-    """
-    url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
-    s = make_session()
-    resp = s.post(url, headers=auth_headers(), timeout=REQ_TIMEOUT)
-    resp.raise_for_status()
-
-    decrypted = decrypt_crece_payload(resp.text, APP_KEY_B64)
-    tipos = json.loads(decrypted)
-
-    m = {}
-    for t in tipos:
-        tid = t.get("id")
-        if tid is None:
-            continue
-        m[int(tid)] = {
-            "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
-            "entrada": int(t.get("entrada") or 0),
-            "turno_nocturno": int(t.get("turno_nocturno") or 0),
-        }
-    return m
-
-
-# ==========================================
 # EXPORT: FICHAJES POR EMPLEADO
 # ==========================================
 def api_exportar_fichajes(session: requests.Session, nif: str, fi: str, ff: str) -> list:
@@ -227,22 +165,18 @@ def api_exportar_fichajes(session: requests.Session, nif: str, fi: str, ff: str)
 
 
 # ==========================================
-# CÁLCULO DIARIO DE HORAS (por fichajes)
+# CÁLCULO DIARIO DE HORAS (por parejas entrada->salida)
 # ==========================================
-def calcular_diario_desde_fichajes(fichajes: list, tipos_map: dict) -> tuple[dict, dict]:
+def calcular_diario_desde_fichajes(fichajes: list):
     """
     Devuelve:
       - horas_por_dia: {YYYY-MM-DD: horas}
       - num_fichajes_por_dia: {YYYY-MM-DD: count}
-    Reglas:
-      - cuenta solo intervalos entrada->salida
-      - aplica tipos: descuenta_tiempo=1 y entrada=1 para iniciar contador
-      - divide intervalos si cruzan medianoche
     """
     horas_por_dia = {}
     num_por_dia = {}
 
-    # contar fichajes por día
+    parsed = []
     for f in fichajes:
         dt = pd.to_datetime(f.get("fecha"), format="%Y-%m-%d %H:%M:%S", errors="coerce")
         if pd.isna(dt):
@@ -250,17 +184,11 @@ def calcular_diario_desde_fichajes(fichajes: list, tipos_map: dict) -> tuple[dic
         d = dt.strftime("%Y-%m-%d")
         num_por_dia[d] = num_por_dia.get(d, 0) + 1
 
-    # ordenar por fecha asc
-    parsed = []
-    for f in fichajes:
-        dt = pd.to_datetime(f.get("fecha"), format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        if pd.isna(dt):
-            continue
         parsed.append({
             "dt": dt.to_pydatetime(),
             "direccion": f.get("direccion"),
-            "tipo": int(f.get("tipo") or 0),
         })
+
     parsed.sort(key=lambda x: x["dt"])
 
     i = 0
@@ -269,26 +197,16 @@ def calcular_diario_desde_fichajes(fichajes: list, tipos_map: dict) -> tuple[dic
         b = parsed[i + 1]
 
         if a["direccion"] == "entrada" and b["direccion"] == "salida":
-            ta = tipos_map.get(a["tipo"], {"descuenta_tiempo": 1, "entrada": 1, "turno_nocturno": 0})
-            tb = tipos_map.get(b["tipo"], {"descuenta_tiempo": 1, "entrada": 1, "turno_nocturno": 0})
-
-            # Solo contar si el tipo "inicia" y descuenta tiempo
-            if ta.get("entrada", 1) == 1 and ta.get("descuenta_tiempo", 1) == 1 and tb.get("descuenta_tiempo", 1) == 1:
-                start_dt = a["dt"]
-                end_dt = b["dt"]
-
-                # descartes de intervalos absurdos (evita basura)
-                if end_dt > start_dt:
-                    dur = (end_dt - start_dt).total_seconds()
-                    # 0 < dur <= 20h
-                    if 0 < dur <= 20 * 3600:
-                        for day, secs in split_interval_by_day(start_dt, end_dt):
-                            horas_por_dia[day] = horas_por_dia.get(day, 0.0) + secs / 3600.0
-
-                i += 2
-                continue
-
-        i += 1
+            start_dt = a["dt"]
+            end_dt = b["dt"]
+            if end_dt > start_dt:
+                secs = (end_dt - start_dt).total_seconds()
+                if 0 < secs <= 20 * 3600:
+                    day = start_dt.strftime("%Y-%m-%d")
+                    horas_por_dia[day] = horas_por_dia.get(day, 0.0) + secs / 3600.0
+            i += 2
+        else:
+            i += 1
 
     return horas_por_dia, num_por_dia
 
@@ -299,19 +217,19 @@ def calcular_diario_desde_fichajes(fichajes: list, tipos_map: dict) -> tuple[dic
 def calcular_minimos(depto: str, dia_semana: int):
     depto = (depto or "").strip().upper()
     if depto in ["ESTRUCTURA", "MOI"]:
-        if dia_semana in [0, 1, 2, 3]:  # L-J
+        if dia_semana in [0, 1, 2, 3]:
             return 8.5, 4
-        if dia_semana == 4:  # V
+        if dia_semana == 4:
             return 6.5, 2
         return None, None
     if depto == "MOD":
-        if dia_semana in [0, 1, 2, 3, 4]:  # L-V
+        if dia_semana in [0, 1, 2, 3, 4]:
             return 8.0, 2
         return None, None
     return None, None
 
 
-def validar_fila(row) -> str | None:
+def validar_fila(row):
     min_h, min_f = calcular_minimos(row["Departamento"], int(row["dia_semana"]))
     if min_h is None or min_f is None:
         return None
@@ -353,16 +271,13 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
 
-    with st.spinner("Cargando empleados, departamentos y tipos de fichaje…"):
+    with st.spinner("Cargando empleados y departamentos…"):
         departamentos_df = api_exportar_departamentos()
         empleados_df = api_exportar_empleados_completos()
-        tipos_map = api_exportar_tipos_fichaje()
-
         empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
         empleados_df["departamento_nombre"] = empleados_df["departamento_nombre"].fillna("")
         empleados_df["nombre_completo"] = empleados_df["nombre_completo"].fillna("")
 
-    # ---- parallel fichajes per employee ----
     with st.spinner("Obteniendo fichajes y calculando horas diarias…"):
         session = make_session()
         rows = []
@@ -370,8 +285,7 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
         def worker(emp_row):
             nif = str(emp_row["nif"])
             fichajes = api_exportar_fichajes(session, nif, fi, ff)
-
-            horas_por_dia, num_por_dia = calcular_diario_desde_fichajes(fichajes, tipos_map)
+            horas_por_dia, num_por_dia = calcular_diario_desde_fichajes(fichajes)
 
             out = []
             for d in daterange(fecha_inicio, fecha_fin):
@@ -392,7 +306,6 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
                 try:
                     rows.extend(fut.result())
                 except Exception:
-                    # No rompemos nunca el proceso por un empleado
                     pass
 
     df = pd.DataFrame(rows)
@@ -400,11 +313,9 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
         st.info("No se encontraron datos en el rango.")
         st.stop()
 
-    # Total trabajado diario (HH:MM)
     df["Total trabajado"] = df["horas_trabajadas"].apply(horas_a_hhmm)
     df["dia_semana"] = pd.to_datetime(df["Fecha"]).dt.weekday
 
-    # Validaciones -> solo incidencias
     df["Motivo"] = df.apply(validar_fila, axis=1)
     out = df[df["Motivo"].notna()].copy()
 
@@ -412,10 +323,8 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
         st.success("🎉 No hay incidencias en el rango seleccionado.")
         st.stop()
 
-    # Orden: Fecha asc, Nombre Completo asc
     out = out.sort_values(["Fecha", "Nombre Completo"], ascending=[True, True])
 
-    # Mostrar por fecha (una tabla por día)
     st.subheader("📄 Incidencias (Total trabajado calculado por fichajes)")
     for ds in out["Fecha"].unique():
         st.markdown(f"### 📅 Fecha {ds}")
@@ -432,7 +341,6 @@ if st.button("▶ Obtener incidencias (Total trabajado por fichajes)"):
             hide_index=True
         )
 
-    # CSV
     csv_bytes = out[[
         "Fecha",
         "Nombre Completo",
