@@ -26,6 +26,9 @@ HTTP_TIMEOUT = (5, 25)
 TOLERANCIA_MINUTOS = 5
 TOLERANCIA_HORAS = TOLERANCIA_MINUTOS / 60.0
 
+# Margen horario SOLO para MOI y ESTRUCTURA (entrada temprana y salida temprana)
+MARGEN_HORARIO_MIN = 5
+
 _SESSION = requests.Session()
 _SESSION.headers.update({"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"})
 
@@ -49,7 +52,6 @@ def norm_name(s: str) -> str:
 
 
 def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
-    # Match robusto: permite que venga con 2 apellidos
     return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
 
 
@@ -79,10 +81,6 @@ def _extract_payload_b64(resp: requests.Response) -> str:
 # ============================================================
 
 def segundos_a_hhmm(seg: float) -> str:
-    """
-    TRUNCADO a minuto (floor), NO round.
-    Evita el +1 minuto por segundos residuales.
-    """
     if seg is None or pd.isna(seg):
         return ""
     try:
@@ -142,10 +140,7 @@ def ts_to_hhmm(ts):
         return ""
 
 
-def hhmm_to_min_clock(hhmm: str) -> int | None:
-    """
-    Convierte "HH:MM" (hora del día) a minutos desde 00:00.
-    """
+def hhmm_to_min_clock(hhmm: str):
     if not isinstance(hhmm, str) or ":" not in hhmm:
         return None
     try:
@@ -167,14 +162,14 @@ SPECIAL_RULES = {
     ("MOI", norm_name("DEBORA LUIS")): {"min_fichajes": 2},
     ("MOI", norm_name("ETOR ALEGRIA")): {"min_fichajes": 2},
 
-    # MOI Miriam (si viene con apellidos, basta con el primer nombre)
+    # MOI Miriam: 09:00-14:30 => 5.5h y 2 fichajes (por nombre)
     ("MOI", norm_name("MIRIAM")): {"min_horas": 5.5, "min_fichajes": 2},
 }
 
 # Exentos de validación de entrada/salida estándar (tienen horario especial)
 SCHEDULE_EXEMPT = [
-    ( "MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ") ),
-    ( "MOI", norm_name("MIRIAM") ),
+    ("MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ")),
+    ("MOI", norm_name("MIRIAM")),
 ]
 
 # Excepciones MOI para poder entrar antes de 07:00 y salir antes de 16:30
@@ -190,7 +185,6 @@ def _lookup_special(depto_norm: str, nombre_norm: str):
     if key_full in SPECIAL_RULES:
         return SPECIAL_RULES[key_full]
 
-    # fallback por primer token (ej. MIRIAM)
     first = (nombre_norm.split(" ")[0] if nombre_norm else "")
     key_first = (depto_norm, first)
     return SPECIAL_RULES.get(key_first)
@@ -246,18 +240,15 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
 # ============================================================
 # VALIDACIÓN HORARIA (entrada/salida)
+# - MOI/ESTRUCTURA: margen 5 min SOLO para entrada temprana y salida temprana
+# - MOD: SIN margen. Si entra más tarde del límite => Entrada tarde.
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
-    """
-    Devuelve lista de incidencias de horario:
-      - Entrada temprana / tarde / fuera de rango
-      - Salida temprana
-    """
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
-    # Solo aplicamos reglas horarias en L-V (si RRHH no quiere evaluar horarios en finde)
+    # Solo L-V para reglas horarias
     if dia not in [0, 1, 2, 3, 4]:
         return []
 
@@ -270,52 +261,62 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     e_min = hhmm_to_min_clock(primera_entrada_hhmm)
     s_min = hhmm_to_min_clock(ultima_salida_hhmm)
 
-    # Si no hay marcajes, no podemos validar horario (ya saldrá por fichajes/horas)
+    # Si no hay entrada, no validamos horario
     if e_min is None:
         return incid
 
     # -------------------------
-    # MOD: entrada 05:30-06:00 (mañana) o 13:00-14:00 (tarde)
+    # MOD: Entrada válida 05:30–06:00 o 13:00–14:00
+    # SIN margen.
+    # Si entra más tarde de 06:00 -> (si es entre 06:01 y 12:59) "fuera de rango"
+    # Si entra más tarde de 14:00 -> "Entrada tarde"
     # -------------------------
     if depto_norm == "MOD":
-        m1_ini, m1_fin = 5 * 60 + 30, 6 * 60
-        m2_ini, m2_fin = 13 * 60, 14 * 60
+        ma_ini, ma_fin = 5 * 60 + 30, 6 * 60
+        ta_ini, ta_fin = 13 * 60, 14 * 60
 
-        ok = (m1_ini <= e_min <= m1_fin) or (m2_ini <= e_min <= m2_fin)
-
+        ok = (ma_ini <= e_min <= ma_fin) or (ta_ini <= e_min <= ta_fin)
         if not ok:
-            if e_min < m1_ini:
+            if e_min < ma_ini:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
-            elif m1_fin < e_min < m2_ini:
+            elif ma_fin < e_min < ta_ini:
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
-            else:  # e_min > m2_fin
+            elif e_min > ta_fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+            else:
+                incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
         return incid
 
     # -------------------------
-    # MOI: entrada 07:00-09:00 (salvo flex) y salida mínima 16:30 (salvo flex)
+    # MOI y ESTRUCTURA:
+    # Entrada válida 07:00–09:00
+    # Salida mínima 16:30
+    # Margen 5 min para:
+    #   - Entrada temprana: solo si < 06:55
+    #   - Salida temprana: solo si < 16:25
+    # Entrada tarde: SIN margen (> 09:00)
     # -------------------------
     if depto_norm in ["MOI", "ESTRUCTURA"]:
-        # Flex SOLO para MOI (Fran Diaz, Debora Luis, Etor Alegria)
+        # Flex SOLO MOI (Fran, Debora Luis, Etor Alegria)
         flex = _is_moi_flex(nombre_norm) if depto_norm == "MOI" else False
 
-        # Entrada
-        ini, fin = 7 * 60, 9 * 60
         if not flex:
-            if e_min < ini:
+            ini, fin = 7 * 60, 9 * 60
+            salida_min = 16 * 60 + 30
+
+            # Entrada temprana con margen
+            if e_min < (ini - MARGEN_HORARIO_MIN):
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            # Entrada tarde sin margen
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
-        # Salida mínima 16:30
-        if s_min is not None and not flex:
-            min_salida = 16 * 60 + 30
-            if s_min < min_salida:
+            # Salida temprana con margen
+            if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
 
         return incid
 
-    # Otros deptos: sin reglas horarias adicionales (por ahora)
     return incid
 
 
@@ -544,9 +545,6 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
 
 def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calcula primera entrada y última salida por nif+Fecha.
-    """
     if df.empty:
         return pd.DataFrame(columns=["nif", "Fecha", "primera_entrada_dt", "ultima_salida_dt"])
 
@@ -556,12 +554,11 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
     salidas = df[df["direccion"] == "salida"].groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"].max()
     salidas = salidas.rename(columns={"fecha_dia": "Fecha", "fecha_dt": "ultima_salida_dt"})
 
-    out = entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
-    return out
+    return entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
 
 
 # ============================================================
-# VALIDACIÓN PRINCIPAL (horas/fichajes) + tolerancia
+# VALIDACIÓN HORAS/FICHAJES (con tolerancia de 5 min en horas)
 # ============================================================
 
 def validar_incidencia_horas_fichajes(r) -> list[str]:
@@ -580,20 +577,19 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
     except Exception:
         horas_val = 0.0
 
-    motivo = []
+    motivos = []
 
-    # Tolerancia en el umbral inferior
     umbral_inferior = float(min_h) - TOLERANCIA_HORAS
     if horas_val < umbral_inferior:
-        motivo.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
+        motivos.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
 
     if num_fich < int(min_f):
-        motivo.append(f"Fichajes insuficientes (mín {min_f})")
+        motivos.append(f"Fichajes insuficientes (mín {min_f})")
 
     if horas_val >= umbral_inferior and num_fich > int(min_f):
-        motivo.append(f"Fichajes excesivos (mín {min_f})")
+        motivos.append(f"Fichajes excesivos (mín {min_f})")
 
-    return motivo
+    return motivos
 
 
 # ============================================================
@@ -692,7 +688,7 @@ if st.button("Consultar"):
         resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
-        # Primera entrada / última salida (para reglas horarias)
+        # Primera entrada / última salida
         io = calcular_primera_ultima(df)
         resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
         resumen["Primera entrada"] = resumen["primera_entrada_dt"].apply(ts_to_hhmm)
@@ -752,27 +748,27 @@ if st.button("Consultar"):
             axis=1,
         )
 
-        # Construimos incidencias (horas/fichajes) + horario + fin de semana trabajado
+        # Construimos incidencia final
         def build_incidencia(r) -> str:
             motivos = []
 
-            # Fin de semana: si trabaja, mostrar
+            # Fin de semana: no validamos mínimos ni horario, pero si trabaja lo mostramos
             if int(r.get("dia", 0)) in [5, 6]:
-                # trabajó si hay tiempo (validación) o fichajes
                 try:
-                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (int(r.get("Numero de fichajes", 0) or 0) > 0)
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                        int(r.get("Numero de fichajes", 0) or 0) > 0
+                    )
                 except Exception:
                     worked = False
+
                 if worked:
                     motivos.append("Trabajo en fin de semana")
-
-                # No aplicamos mínimos ni horarios (por ahora)
                 return "; ".join(motivos)
 
             # Laborables: horas/fichajes
             motivos += validar_incidencia_horas_fichajes(r)
 
-            # Laborables: reglas de horario entrada/salida
+            # Laborables: horario
             motivos += validar_horario(
                 r.get("Departamento"),
                 r.get("Nombre"),
