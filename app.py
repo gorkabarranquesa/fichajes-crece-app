@@ -1,6 +1,8 @@
 import base64
 import json
 import multiprocessing
+import random
+import time
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,7 +22,7 @@ APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
-HTTP_TIMEOUT = (5, 25)
+HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 # Tolerancia RRHH (±5 min) aplicada al mínimo de horas (para "insuficientes")
 TOLERANCIA_MINUTOS = 5
@@ -29,8 +31,23 @@ TOLERANCIA_HORAS = TOLERANCIA_MINUTOS / 60.0
 # Margen horario SOLO para MOI y ESTRUCTURA (entrada temprana y salida temprana)
 MARGEN_HORARIO_MIN = 5
 
+# Identificación fija del cliente (trazabilidad)
+USER_AGENT = "RRHH-Fichajes-Crece/1.0 (Streamlit)"
+
+# Backoff/retry seguro
+RETRY_STATUS = {429, 502, 503, 504}
+MAX_RETRIES = 4  # total intentos = 1 + MAX_RETRIES
+BACKOFF_BASE_SECONDS = 0.6  # base
+BACKOFF_MAX_SECONDS = 6.0   # techo
+
 _SESSION = requests.Session()
-_SESSION.headers.update({"Accept": "application/json", "Authorization": f"Bearer {API_TOKEN}"})
+_SESSION.headers.update(
+    {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {API_TOKEN}",
+        "User-Agent": USER_AGENT,
+    }
+)
 
 
 # ============================================================
@@ -38,6 +55,63 @@ _SESSION.headers.update({"Accept": "application/json", "Authorization": f"Bearer
 # ============================================================
 
 def _safe_fail(_exc: Exception) -> None:
+    # Nunca imprimir tokens/payloads ni mostrar trazas en pantalla
+    return None
+
+
+# ============================================================
+# SAFE REQUEST: centraliza peticiones + verify=True + retries
+# ============================================================
+
+def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_TIMEOUT):
+    """
+    Request seguro:
+    - verify=True explícito (TLS)
+    - retries con backoff para 429/502/503/504
+    - sin prints, sin excepciones verbosas
+    Devuelve requests.Response o None.
+    """
+    method = (method or "").upper().strip()
+    if method not in {"GET", "POST"}:
+        return None
+
+    last_exc = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = _SESSION.request(
+                method,
+                url,
+                data=data,
+                params=params,
+                timeout=timeout,
+                verify=True,
+            )
+
+            # Si es retryable, reintentar con backoff
+            if resp.status_code in RETRY_STATUS:
+                if attempt < MAX_RETRIES:
+                    # Exponential backoff + jitter
+                    wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    wait += random.uniform(0, 0.25)
+                    time.sleep(wait)
+                    continue
+                # Sin más reintentos
+                return resp
+
+            return resp
+
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < MAX_RETRIES:
+                wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                wait += random.uniform(0, 0.25)
+                time.sleep(wait)
+                continue
+            _safe_fail(last_exc)
+            return None
+
+    _safe_fail(last_exc if last_exc else Exception("Unknown request error"))
     return None
 
 
@@ -166,17 +240,13 @@ def hhmm_to_min_clock(hhmm: str):
 # ============================================================
 
 SPECIAL_RULES_PREFIX = [
-    # MOD David: 09:30-14:00 => 4.5h, 2 fichajes
     ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
-    # MOI Debora: mínimo fichajes 2
     ("MOI", N_DEBORA, {"min_fichajes": 2}),
-    # MOI Etor: mínimo fichajes 2
     ("MOI", N_ETOR, {"min_fichajes": 2}),
-    # MOI Miriam: 09:00-14:30 => 5.5h, 2 fichajes
     ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
 ]
 
-# Exentos de validación de entrada/salida estándar (tienen horario especial)
+# Exentos de validación de entrada/salida estándar (horario especial)
 SCHEDULE_EXEMPT_PREFIX = [
     ("MOD", N_DAVID),
     ("MOI", N_MIRIAM),
@@ -248,7 +318,7 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 # ============================================================
 # VALIDACIÓN HORARIA (entrada/salida)
 # - MOI/ESTRUCTURA: margen 5 min SOLO para entrada temprana y salida temprana
-# - MOD: SIN margen. Si entra más tarde del límite => Entrada tarde.
+# - MOD: SIN margen.
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
@@ -270,7 +340,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     if e_min is None:
         return incid
 
-    # MOD: 05:30–06:00 o 13:00–14:00 (SIN margen)
+    # MOD: entrada 05:30–06:00 o 13:00–14:00 (SIN margen)
+    # Si entra más tarde del límite del turno tarde => "Entrada tarde"
     if depto_norm == "MOD":
         ma_ini, ma_fin = 5 * 60 + 30, 6 * 60
         ta_ini, ta_fin = 13 * 60, 14 * 60
@@ -287,7 +358,7 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
         return incid
 
-    # MOI + ESTRUCTURA: 07:00–09:00, salida min 16:30
+    # MOI + ESTRUCTURA: entrada 07:00–09:00, salida min 16:30
     # Margen 5 min para entrada temprana (<06:55) y salida temprana (<16:25)
     # Entrada tarde SIN margen (>09:00)
     if depto_norm in ["MOI", "ESTRUCTURA"]:
@@ -311,13 +382,15 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
 
 # ============================================================
-# API EXPORTACIÓN
+# API EXPORTACIÓN (con safe_request)
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_departamentos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/departamentos"
-    resp = _SESSION.get(url, timeout=HTTP_TIMEOUT)
+    resp = safe_request("GET", url)
+    if resp is None:
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     resp.raise_for_status()
 
     payload_b64 = _extract_payload_b64(resp)
@@ -334,7 +407,9 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
-    resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
+    resp = safe_request("POST", url, data=data)
+    if resp is None:
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id"])
     resp.raise_for_status()
 
     payload_b64 = _extract_payload_b64(resp)
@@ -372,7 +447,9 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 def api_exportar_tipos_fichaje() -> dict:
     url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
     try:
-        resp = _SESSION.post(url, timeout=HTTP_TIMEOUT)
+        resp = safe_request("POST", url)
+        if resp is None:
+            return {}
         resp.raise_for_status()
 
         payload_b64 = _extract_payload_b64(resp)
@@ -400,7 +477,9 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
     data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "asc"}
 
     try:
-        resp = _SESSION.post(url, data=data, timeout=HTTP_TIMEOUT)
+        resp = safe_request("POST", url, data=data)
+        if resp is None:
+            return []
         resp.raise_for_status()
 
         payload_b64 = _extract_payload_b64(resp)
@@ -467,7 +546,9 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
                 payload.append(("nif[]", s))
 
     try:
-        resp = _SESSION.post(url, data=payload, timeout=HTTP_TIMEOUT)
+        resp = safe_request("POST", url, data=payload)
+        if resp is None:
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
         resp.raise_for_status()
 
         payload_b64 = _extract_payload_b64(resp)
@@ -519,7 +600,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
-                        delta_i = int(delta)
+                        delta_i = int(delta)  # truncado
                         props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
                             descontados += delta_i
