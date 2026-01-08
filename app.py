@@ -173,11 +173,17 @@ SCHEDULE_EXEMPT = [
 ]
 
 # Excepciones MOI para poder entrar antes de 07:00 y salir antes de 16:30
-MOI_FLEX = [
-    norm_name("FRAN DIAZ"),
-    norm_name("DEBORA LUIS"),
-    norm_name("ETOR ALEGRIA"),
-]
+FLEX_BY_DEPTO = {
+    # Fran es de ESTRUCTURA (no MOI)
+    "ESTRUCTURA": [
+        norm_name("FRAN DIAZ"),
+    ],
+    # Débora y Etor son MOI
+    "MOI": [
+        norm_name("DEBORA LUIS"),
+        norm_name("ETOR ALEGRIA"),
+    ],
+}
 
 
 def _lookup_special(depto_norm: str, nombre_norm: str):
@@ -197,8 +203,8 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
     return False
 
 
-def _is_moi_flex(nombre_norm: str) -> bool:
-    for pref in MOI_FLEX:
+def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
+    for pref in FLEX_BY_DEPTO.get(depto_norm, []):
         if name_startswith(nombre_norm, pref):
             return True
     return False
@@ -297,8 +303,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     # Entrada tarde: SIN margen (> 09:00)
     # -------------------------
     if depto_norm in ["MOI", "ESTRUCTURA"]:
-        # Flex SOLO MOI (Fran, Debora Luis, Etor Alegria)
-        flex = _is_moi_flex(nombre_norm) if depto_norm == "MOI" else False
+        # Flex por departamento (Fran en ESTRUCTURA, Debora/Etor en MOI)
+        flex = _is_flex(depto_norm, nombre_norm)
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
