@@ -22,7 +22,7 @@ CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)
 
-# Tolerancia RRHH (±5 min). Aplicamos para "mínimo de horas"
+# Tolerancia RRHH (±5 min) aplicada al mínimo de horas (para "insuficientes")
 TOLERANCIA_MINUTOS = 5
 TOLERANCIA_HORAS = TOLERANCIA_MINUTOS / 60.0
 
@@ -45,8 +45,12 @@ def _safe_fail(_exc: Exception) -> None:
 def norm_name(s: str) -> str:
     if s is None:
         return ""
-    # uppercase + colapsar espacios
     return " ".join(str(s).upper().strip().split())
+
+
+def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
+    # Match robusto: permite que venga con 2 apellidos
+    return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
 
 
 # ============================================================
@@ -71,7 +75,7 @@ def _extract_payload_b64(resp: requests.Response) -> str:
 
 
 # ============================================================
-# FORMATEOS TIEMPO (TRUNCADO A MINUTO: estilo CRECE)
+# TIEMPOS (TRUNCADO A MINUTO: estilo CRECE)
 # ============================================================
 
 def segundos_a_hhmm(seg: float) -> str:
@@ -88,7 +92,7 @@ def segundos_a_hhmm(seg: float) -> str:
     if seg_i < 0:
         seg_i = 0
 
-    total_min = seg_i // 60  # truncado
+    total_min = seg_i // 60
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
@@ -109,11 +113,6 @@ def hhmm_to_dec(hhmm: str) -> float:
 
 
 def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
-    """
-    Diferencia = Tiempo Contabilizado - Total trabajado
-    - Devuelve "" si son iguales o falta alguno
-    - Devuelve +HH:MM o -HH:MM
-    """
     tc_hhmm = (tc_hhmm or "").strip()
     tt_hhmm = (tt_hhmm or "").strip()
     if not tc_hhmm or not tt_hhmm:
@@ -134,38 +133,81 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     return f"{sign}{h:02d}:{m:02d}"
 
 
+def ts_to_hhmm(ts):
+    if ts is None or pd.isna(ts):
+        return ""
+    try:
+        return pd.to_datetime(ts).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def hhmm_to_min_clock(hhmm: str) -> int | None:
+    """
+    Convierte "HH:MM" (hora del día) a minutos desde 00:00.
+    """
+    if not isinstance(hhmm, str) or ":" not in hhmm:
+        return None
+    try:
+        h, m = map(int, hhmm.split(":"))
+        return h * 60 + m
+    except Exception:
+        return None
+
+
 # ============================================================
-# REGLAS ESPECIALES RRHH (NOMBRE + DEPTO)
+# REGLAS ESPECIALES RRHH (mínimos)
 # ============================================================
-# Nota: usa el nombre completo tal cual lo muestra la app (normalizado a MAYÚSCULAS y espacios).
-# Si en CRECE el nombre viene diferente, ajustamos aquí sin tocar el resto del código.
 
 SPECIAL_RULES = {
-    # 2) MOD David Rodriguez: 09:30-14:00 => 4.5h, 2 fichajes
-    ("MOD", norm_name("David Rodriguez Vazquez")): {"min_horas": 4.5, "min_fichajes": 2},
+    # MOD David Rodriguez Vazquez: 09:30-14:00 => 4.5h, 2 fichajes
+    ("MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ")): {"min_horas": 4.5, "min_fichajes": 2},
 
-    # 3) MOI Debora, Etor y Miriam: mínimo 2 fichajes
-    ("MOI", norm_name("Debora Luis Soto")): {"min_fichajes": 2},
-    ("MOI", norm_name("Etor Alegria Reparaz")): {"min_fichajes": 2},
+    # MOI Debora Luis y Etor Alegria: mínimo 2 fichajes
+    ("MOI", norm_name("DEBORA LUIS")): {"min_fichajes": 2},
+    ("MOI", norm_name("ETOR ALEGRIA")): {"min_fichajes": 2},
 
-    # 4) MOI Miriam: 09:00-14:30 => 5.5h y 2 fichajes
-    ("MOI", norm_name("Miriam Martín Muñoz")): {"min_horas": 5.5, "min_fichajes": 2},
+    # MOI Miriam (si viene con apellidos, basta con el primer nombre)
+    ("MOI", norm_name("MIRIAM")): {"min_horas": 5.5, "min_fichajes": 2},
 }
+
+# Exentos de validación de entrada/salida estándar (tienen horario especial)
+SCHEDULE_EXEMPT = [
+    ( "MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ") ),
+    ( "MOI", norm_name("MIRIAM") ),
+]
+
+# Excepciones MOI para poder entrar antes de 07:00 y salir antes de 16:30
+MOI_FLEX = [
+    norm_name("FRAN DIAZ"),
+    norm_name("DEBORA LUIS"),
+    norm_name("ETOR ALEGRIA"),
+]
 
 
 def _lookup_special(depto_norm: str, nombre_norm: str):
-    """
-    Intenta casar primero por (depto, nombre completo) y luego por (depto, primer nombre)
-    """
-    # 1) por nombre completo
     key_full = (depto_norm, nombre_norm)
     if key_full in SPECIAL_RULES:
         return SPECIAL_RULES[key_full]
 
-    # 2) por primer token (p.ej. "MIRIAM", "ETOR")
+    # fallback por primer token (ej. MIRIAM)
     first = (nombre_norm.split(" ")[0] if nombre_norm else "")
     key_first = (depto_norm, first)
     return SPECIAL_RULES.get(key_first)
+
+
+def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
+    for d, pref in SCHEDULE_EXEMPT:
+        if depto_norm == d and name_startswith(nombre_norm, pref):
+            return True
+    return False
+
+
+def _is_moi_flex(nombre_norm: str) -> bool:
+    for pref in MOI_FLEX:
+        if name_startswith(nombre_norm, pref):
+            return True
+    return False
 
 
 # ============================================================
@@ -173,15 +215,11 @@ def _lookup_special(depto_norm: str, nombre_norm: str):
 # ============================================================
 
 def calcular_minimos(depto: str, dia: int, nombre: str):
-    """
-    Devuelve (min_horas, min_fichajes) con overrides por reglas especiales.
-    """
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
     min_h, min_f = None, None
 
-    # BASE
     if depto_norm in ["ESTRUCTURA", "MOI"]:
         if dia in [0, 1, 2, 3]:       # L-J
             min_h, min_f = 8.5, 4
@@ -196,7 +234,6 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
         else:
             min_h, min_f = None, None
 
-    # OVERRIDES ESPECIALES (si aplica)
     special = _lookup_special(depto_norm, nombre_norm)
     if special:
         if "min_horas" in special and min_h is not None:
@@ -205,6 +242,80 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
             min_f = int(special["min_fichajes"])
 
     return min_h, min_f
+
+
+# ============================================================
+# VALIDACIÓN HORARIA (entrada/salida)
+# ============================================================
+
+def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
+    """
+    Devuelve lista de incidencias de horario:
+      - Entrada temprana / tarde / fuera de rango
+      - Salida temprana
+    """
+    depto_norm = (depto or "").upper().strip()
+    nombre_norm = norm_name(nombre)
+
+    # Solo aplicamos reglas horarias en L-V (si RRHH no quiere evaluar horarios en finde)
+    if dia not in [0, 1, 2, 3, 4]:
+        return []
+
+    # Exentos por horario especial
+    if _is_schedule_exempt(depto_norm, nombre_norm):
+        return []
+
+    incid = []
+
+    e_min = hhmm_to_min_clock(primera_entrada_hhmm)
+    s_min = hhmm_to_min_clock(ultima_salida_hhmm)
+
+    # Si no hay marcajes, no podemos validar horario (ya saldrá por fichajes/horas)
+    if e_min is None:
+        return incid
+
+    # -------------------------
+    # MOD: entrada 05:30-06:00 (mañana) o 13:00-14:00 (tarde)
+    # -------------------------
+    if depto_norm == "MOD":
+        m1_ini, m1_fin = 5 * 60 + 30, 6 * 60
+        m2_ini, m2_fin = 13 * 60, 14 * 60
+
+        ok = (m1_ini <= e_min <= m1_fin) or (m2_ini <= e_min <= m2_fin)
+
+        if not ok:
+            if e_min < m1_ini:
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif m1_fin < e_min < m2_ini:
+                incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
+            else:  # e_min > m2_fin
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+        return incid
+
+    # -------------------------
+    # MOI: entrada 07:00-09:00 (salvo flex) y salida mínima 16:30 (salvo flex)
+    # -------------------------
+    if depto_norm == "MOI":
+        flex = _is_moi_flex(nombre_norm)
+
+        # Entrada
+        ini, fin = 7 * 60, 9 * 60
+        if not flex:
+            if e_min < ini:
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif e_min > fin:
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+
+        # Salida mínima 16:30
+        if s_min is not None and not flex:
+            min_salida = 16 * 60 + 30
+            if s_min < min_salida:
+                incid.append(f"Salida temprana ({ultima_salida_hhmm})")
+
+        return incid
+
+    # Otros deptos: sin reglas horarias adicionales (por ahora)
+    return incid
 
 
 # ============================================================
@@ -228,7 +339,6 @@ def api_exportar_departamentos() -> pd.DataFrame:
 
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
-    # PII -> NO cache
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
@@ -355,11 +465,6 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
 
 
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
-    """
-    MISMA FORMA que te funciona:
-    - POST con nif[] repetido.
-    - desde/hasta por día (intento mismo día; fallback día+1).
-    """
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
 
@@ -437,15 +542,32 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
     return pd.DataFrame(rows_out)
 
 
+def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula primera entrada y última salida por nif+Fecha.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "Fecha", "primera_entrada_dt", "ultima_salida_dt"])
+
+    entradas = df[df["direccion"] == "entrada"].groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"].min()
+    entradas = entradas.rename(columns={"fecha_dia": "Fecha", "fecha_dt": "primera_entrada_dt"})
+
+    salidas = df[df["direccion"] == "salida"].groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"].max()
+    salidas = salidas.rename(columns={"fecha_dia": "Fecha", "fecha_dt": "ultima_salida_dt"})
+
+    out = entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
+    return out
+
+
 # ============================================================
-# VALIDACIÓN (con tolerancia ±5 minutos en horas)
+# VALIDACIÓN PRINCIPAL (horas/fichajes) + tolerancia
 # ============================================================
 
-def validar_incidencia(r) -> str:
+def validar_incidencia_horas_fichajes(r) -> list[str]:
     min_h = r.get("min_horas")
     min_f = r.get("min_fichajes")
     if pd.isna(min_h) or pd.isna(min_f):
-        return ""
+        return []
 
     try:
         num_fich = int(r.get("Numero de fichajes", 0) or 0)
@@ -459,22 +581,18 @@ def validar_incidencia(r) -> str:
 
     motivo = []
 
-    # 1) Tolerancia ±5 min -> para "insuficientes" permitimos min_h - 5 min
+    # Tolerancia en el umbral inferior
     umbral_inferior = float(min_h) - TOLERANCIA_HORAS
     if horas_val < umbral_inferior:
-        motivo.append(
-            f"Horas insuficientes (mín {min_h}h, tolerancia {TOLERANCIA_MINUTOS}m, tiene {horas_val:.2f}h)"
-        )
+        motivo.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
 
-    # 2) Fichajes (sin tolerancia)
     if num_fich < int(min_f):
-        motivo.append(f"Fichajes insuficientes (mín {min_f}, tiene {num_fich})")
+        motivo.append(f"Fichajes insuficientes (mín {min_f})")
 
-    # 3) Fichajes excesivos (misma regla que ya teníais)
     if horas_val >= umbral_inferior and num_fich > int(min_f):
-        motivo.append(f"Fichajes excesivos (mín {min_f}, tiene {num_fich})")
+        motivo.append(f"Fichajes excesivos (mín {min_f})")
 
-    return "; ".join(motivo)
+    return motivo
 
 
 # ============================================================
@@ -567,18 +685,19 @@ if st.button("Consultar"):
             .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
         )
 
-        # Tiempo neto por marcajes (segundos)
+        # Total trabajado por marcajes
         neto = calcular_tiempos_neto(df, tipos_map)
         resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
         resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
-
         resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
-        # ============================================================
-        # TIEMPO CONTABILIZADO (POR DÍA) - MISMA FORMA
-        # Intento 1: (desde=dia, hasta=dia) / Fallback: (hasta=dia+1)
-        # ============================================================
+        # Primera entrada / última salida (para reglas horarias)
+        io = calcular_primera_ultima(df)
+        resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
+        resumen["Primera entrada"] = resumen["primera_entrada_dt"].apply(ts_to_hhmm)
+        resumen["Última salida"] = resumen["ultima_salida_dt"].apply(ts_to_hhmm)
 
+        # Tiempo contabilizado por día (misma forma: intento mismo día, fallback día+1)
         nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
         tc_rows = []
@@ -610,13 +729,13 @@ if st.button("Consultar"):
         resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
         resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
 
-        # Diferencia (solo si distinto)
+        # Diferencia
         resumen["Diferencia"] = resumen.apply(
             lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
             axis=1
         )
 
-        # Validación: si hay contabilizado, valida con contabilizado; si no, con marcajes
+        # Validación usa contabilizado si existe; si no, marcajes
         resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
         resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
 
@@ -626,19 +745,50 @@ if st.button("Consultar"):
 
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
-        # Minimos por depto+día + especiales por persona
+        # Minimos por depto + día + persona (especiales)
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
             lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
             axis=1,
         )
 
-        resumen["Incidencia"] = resumen.apply(validar_incidencia, axis=1)
+        # Construimos incidencias (horas/fichajes) + horario + fin de semana trabajado
+        def build_incidencia(r) -> str:
+            motivos = []
 
-        # ✅ SOLO QUIEN NO CUMPLE
+            # Fin de semana: si trabaja, mostrar
+            if int(r.get("dia", 0)) in [5, 6]:
+                # trabajó si hay tiempo (validación) o fichajes
+                try:
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (int(r.get("Numero de fichajes", 0) or 0) > 0)
+                except Exception:
+                    worked = False
+                if worked:
+                    motivos.append("Trabajo en fin de semana")
+
+                # No aplicamos mínimos ni horarios (por ahora)
+                return "; ".join(motivos)
+
+            # Laborables: horas/fichajes
+            motivos += validar_incidencia_horas_fichajes(r)
+
+            # Laborables: reglas de horario entrada/salida
+            motivos += validar_horario(
+                r.get("Departamento"),
+                r.get("Nombre"),
+                int(r.get("dia", 0)),
+                r.get("Primera entrada", ""),
+                r.get("Última salida", ""),
+            )
+
+            return "; ".join(motivos)
+
+        resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
+
+        # Solo mostramos quien tenga incidencia (incluye fin de semana trabajado)
         salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
 
         if salida.empty:
-            st.success("🎉 No hay incidencias en el rango seleccionado.")
+            st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
             st.stop()
 
         salida = salida[
@@ -646,6 +796,8 @@ if st.button("Consultar"):
                 "Fecha",
                 "Nombre",
                 "Departamento",
+                "Primera entrada",
+                "Última salida",
                 "Total trabajado",
                 "Tiempo Contabilizado",
                 "Diferencia",
@@ -654,7 +806,6 @@ if st.button("Consultar"):
             ]
         ].sort_values(["Fecha", "Nombre"], kind="mergesort")
 
-    # Vista mínima (sin subheader)
     for f_dia in salida["Fecha"].unique():
         st.markdown(f"### 📅 {f_dia}")
         sub = salida[salida["Fecha"] == f_dia]
