@@ -295,8 +295,9 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     # -------------------------
     # MOI: entrada 07:00-09:00 (salvo flex) y salida mínima 16:30 (salvo flex)
     # -------------------------
-    if depto_norm == "MOI":
-        flex = _is_moi_flex(nombre_norm)
+    if depto_norm in ["MOI", "ESTRUCTURA"]:
+        # Flex SOLO para MOI (Fran Diaz, Debora Luis, Etor Alegria)
+        flex = _is_moi_flex(nombre_norm) if depto_norm == "MOI" else False
 
         # Entrada
         ini, fin = 7 * 60, 9 * 60
