@@ -56,6 +56,17 @@ def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
 
 
 # ============================================================
+# NOMBRES (tal cual CRECE)
+# ============================================================
+
+N_DAVID = norm_name("David Rodriguez Vazquez")
+N_DEBORA = norm_name("Debora Luis Soto")
+N_ETOR = norm_name("Etor Alegria Reparaz")
+N_FRAN = norm_name("Fran Diaz Arozarena")
+N_MIRIAM = norm_name("Miriam Martín Muñoz")
+
+
+# ============================================================
 # DESCIFRADO CRECE (AES-CBC)
 # ============================================================
 
@@ -151,53 +162,42 @@ def hhmm_to_min_clock(hhmm: str):
 
 
 # ============================================================
-# REGLAS ESPECIALES RRHH (mínimos)
+# REGLAS ESPECIALES RRHH (mínimos) - por prefijo nombre
 # ============================================================
 
-SPECIAL_RULES = {
-    # MOD David Rodriguez Vazquez: 09:30-14:00 => 4.5h, 2 fichajes
-    ("MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ")): {"min_horas": 4.5, "min_fichajes": 2},
-
-    # MOI Debora Luis y Etor Alegria: mínimo 2 fichajes
-    ("MOI", norm_name("DEBORA LUIS")): {"min_fichajes": 2},
-    ("MOI", norm_name("ETOR ALEGRIA")): {"min_fichajes": 2},
-
-    # MOI Miriam: 09:00-14:30 => 5.5h y 2 fichajes (por nombre)
-    ("MOI", norm_name("MIRIAM")): {"min_horas": 5.5, "min_fichajes": 2},
-}
-
-# Exentos de validación de entrada/salida estándar (tienen horario especial)
-SCHEDULE_EXEMPT = [
-    ("MOD", norm_name("DAVID RODRIGUEZ VAZQUEZ")),
-    ("MOI", norm_name("MIRIAM")),
+SPECIAL_RULES_PREFIX = [
+    # MOD David: 09:30-14:00 => 4.5h, 2 fichajes
+    ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
+    # MOI Debora: mínimo fichajes 2
+    ("MOI", N_DEBORA, {"min_fichajes": 2}),
+    # MOI Etor: mínimo fichajes 2
+    ("MOI", N_ETOR, {"min_fichajes": 2}),
+    # MOI Miriam: 09:00-14:30 => 5.5h, 2 fichajes
+    ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
 ]
 
-# Excepciones MOI para poder entrar antes de 07:00 y salir antes de 16:30
+# Exentos de validación de entrada/salida estándar (tienen horario especial)
+SCHEDULE_EXEMPT_PREFIX = [
+    ("MOD", N_DAVID),
+    ("MOI", N_MIRIAM),
+]
+
+# Flex por departamento (pueden entrar antes de 07:00 y salir antes de 16:30)
 FLEX_BY_DEPTO = {
-    # Fran es de ESTRUCTURA (no MOI)
-    "ESTRUCTURA": [
-        norm_name("FRAN DIAZ"),
-    ],
-    # Débora y Etor son MOI
-    "MOI": [
-        norm_name("DEBORA LUIS"),
-        norm_name("ETOR ALEGRIA"),
-    ],
+    "ESTRUCTURA": [N_FRAN],
+    "MOI": [N_DEBORA, N_ETOR],
 }
 
 
 def _lookup_special(depto_norm: str, nombre_norm: str):
-    key_full = (depto_norm, nombre_norm)
-    if key_full in SPECIAL_RULES:
-        return SPECIAL_RULES[key_full]
-
-    first = (nombre_norm.split(" ")[0] if nombre_norm else "")
-    key_first = (depto_norm, first)
-    return SPECIAL_RULES.get(key_first)
+    for d, pref, rules in SPECIAL_RULES_PREFIX:
+        if depto_norm == d and name_startswith(nombre_norm, pref):
+            return rules
+    return None
 
 
 def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
-    for d, pref in SCHEDULE_EXEMPT:
+    for d, pref in SCHEDULE_EXEMPT_PREFIX:
         if depto_norm == d and name_startswith(nombre_norm, pref):
             return True
     return False
@@ -234,6 +234,7 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
         else:
             min_h, min_f = None, None
 
+    # Overrides especiales por persona
     special = _lookup_special(depto_norm, nombre_norm)
     if special:
         if "min_horas" in special and min_h is not None:
@@ -254,7 +255,7 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
-    # Solo L-V para reglas horarias
+    # Solo L-V
     if dia not in [0, 1, 2, 3, 4]:
         return []
 
@@ -263,20 +264,13 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
         return []
 
     incid = []
-
     e_min = hhmm_to_min_clock(primera_entrada_hhmm)
     s_min = hhmm_to_min_clock(ultima_salida_hhmm)
 
-    # Si no hay entrada, no validamos horario
     if e_min is None:
         return incid
 
-    # -------------------------
-    # MOD: Entrada válida 05:30–06:00 o 13:00–14:00
-    # SIN margen.
-    # Si entra más tarde de 06:00 -> (si es entre 06:01 y 12:59) "fuera de rango"
-    # Si entra más tarde de 14:00 -> "Entrada tarde"
-    # -------------------------
+    # MOD: 05:30–06:00 o 13:00–14:00 (SIN margen)
     if depto_norm == "MOD":
         ma_ini, ma_fin = 5 * 60 + 30, 6 * 60
         ta_ini, ta_fin = 13 * 60, 14 * 60
@@ -293,31 +287,21 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
         return incid
 
-    # -------------------------
-    # MOI y ESTRUCTURA:
-    # Entrada válida 07:00–09:00
-    # Salida mínima 16:30
-    # Margen 5 min para:
-    #   - Entrada temprana: solo si < 06:55
-    #   - Salida temprana: solo si < 16:25
-    # Entrada tarde: SIN margen (> 09:00)
-    # -------------------------
+    # MOI + ESTRUCTURA: 07:00–09:00, salida min 16:30
+    # Margen 5 min para entrada temprana (<06:55) y salida temprana (<16:25)
+    # Entrada tarde SIN margen (>09:00)
     if depto_norm in ["MOI", "ESTRUCTURA"]:
-        # Flex por departamento (Fran en ESTRUCTURA, Debora/Etor en MOI)
         flex = _is_flex(depto_norm, nombre_norm)
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
             salida_min = 16 * 60 + 30
 
-            # Entrada temprana con margen
             if e_min < (ini - MARGEN_HORARIO_MIN):
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
-            # Entrada tarde sin margen
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
-            # Salida temprana con margen
             if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
 
@@ -535,7 +519,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
-                        delta_i = int(delta)  # truncado
+                        delta_i = int(delta)
                         props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
                             descontados += delta_i
@@ -564,7 +548,7 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# VALIDACIÓN HORAS/FICHAJES (con tolerancia de 5 min en horas)
+# VALIDACIÓN HORAS/FICHAJES (con tolerancia 5 min en horas)
 # ============================================================
 
 def validar_incidencia_horas_fichajes(r) -> list[str]:
@@ -754,7 +738,7 @@ if st.button("Consultar"):
             axis=1,
         )
 
-        # Construimos incidencia final
+        # Incidencia final
         def build_incidencia(r) -> str:
             motivos = []
 
