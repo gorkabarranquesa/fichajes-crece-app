@@ -303,10 +303,15 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
 # ============================================================
 # VALIDACIÓN HORARIA (entrada/salida)
-# CAMBIO 1: Viernes (MOI/ESTRUCTURA) salida mínima 13:30
-# - Entrada válida L–V: 07:00–09:00
-# - Salida mínima L–J: 16:30
-# - Salida mínima V: 13:30
+# - MOI/ESTRUCTURA:
+#   Entrada L–V 07:00–09:00 (tarde sin margen)
+#   Salida mínima L–J 16:30, V 13:30 (temprana con margen 5 min)
+# - MOD:
+#   Turno detectado por hora de entrada:
+#     < 12:00 => mañana, >= 12:00 => tarde
+#   Mañana: válida 05:30–06:00; fuera de rango (06:00,14:00]; tarde >14:00
+#   Tarde:  válida 13:00–14:00; fuera de rango (14:00,22:00]; tarde >22:00
+#   Sin margen
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
@@ -328,47 +333,58 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     if e_min is None:
         return incid
 
-    # MOD: sin cambios
+    # -------------------------
+    # MOD (nuevo por turnos)
+    # -------------------------
     if depto_norm == "MOD":
-        ma_ini, ma_fin = 5 * 60 + 30, 6 * 60
-        ta_ini, ta_fin = 13 * 60, 14 * 60
+        # Detectar turno por hora de entrada (simple y estable)
+        turno = "manana" if e_min < (12 * 60) else "tarde"
 
-        ok = (ma_ini <= e_min <= ma_fin) or (ta_ini <= e_min <= ta_fin)
-        if not ok:
-            if e_min < ma_ini:
+        if turno == "manana":
+            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60          # 05:30–06:00
+            fin_turno = 14 * 60                           # 14:00
+
+            if e_min < ini_ok:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
-            elif ma_fin < e_min < ta_ini:
+            elif ini_ok <= e_min <= fin_ok:
+                pass  # ok
+            elif e_min <= fin_turno:
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
-            elif e_min > ta_fin:
-                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
             else:
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+
+        else:
+            ini_ok, fin_ok = 13 * 60, 14 * 60            # 13:00–14:00
+            fin_turno = 22 * 60                          # 22:00
+
+            if e_min < ini_ok:
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif ini_ok <= e_min <= fin_ok:
+                pass  # ok
+            elif e_min <= fin_turno:
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
+            else:
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+
         return incid
 
-    # MOI + ESTRUCTURA: entrada 07:00–09:00 (L-V)
-    # salida mínima L-J 16:30, viernes 13:30
+    # -------------------------
+    # MOI + ESTRUCTURA (igual)
+    # -------------------------
     if depto_norm in ["MOI", "ESTRUCTURA"]:
         flex = _is_flex(depto_norm, nombre_norm)
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
 
-            # SALIDA MÍNIMA SEGÚN DÍA:
-            # L-J (0-3): 16:30
-            # V (4): 13:30
-            if dia == 4:
-                salida_min = 13 * 60 + 30
-            else:
-                salida_min = 16 * 60 + 30
+            # L-J: 16:30, V: 13:30
+            salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
-            # Entrada temprana con margen
             if e_min < (ini - MARGEN_HORARIO_MIN):
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
-            # Entrada tarde sin margen
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
-            # Salida temprana con margen
             if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
 
