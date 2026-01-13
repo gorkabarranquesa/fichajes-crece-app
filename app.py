@@ -127,6 +127,7 @@ N_DEBORA = norm_name("Debora Luis Soto")
 N_ETOR = norm_name("Etor Alegria Reparaz")
 N_FRAN = norm_name("Fran Diaz Arozarena")
 N_MIRIAM = norm_name("Miriam Martín Muñoz")
+N_BEATRIZ = norm_name("Beatriz Andueza Roncal")  # <-- NUEVA EXCEPCIÓN
 
 
 # ============================================================
@@ -233,6 +234,8 @@ SPECIAL_RULES_PREFIX = [
     ("MOI", N_DEBORA, {"min_fichajes": 2}),
     ("MOI", N_ETOR, {"min_fichajes": 2}),
     ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
+    # NUEVA regla:
+    ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2}),  # L-V 6:30 y 2 fichajes
 ]
 
 SCHEDULE_EXEMPT_PREFIX = [
@@ -291,6 +294,7 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
         else:
             min_h, min_f = None, None
 
+    # Overrides especiales por persona
     special = _lookup_special(depto_norm, nombre_norm)
     if special:
         if "min_horas" in special and min_h is not None:
@@ -303,15 +307,6 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
 # ============================================================
 # VALIDACIÓN HORARIA (entrada/salida)
-# - MOI/ESTRUCTURA:
-#   Entrada L–V 07:00–09:00 (tarde sin margen)
-#   Salida mínima L–J 16:30, V 13:30 (temprana con margen 5 min)
-# - MOD:
-#   Turno detectado por hora de entrada:
-#     < 12:00 => mañana, >= 12:00 => tarde
-#   Mañana: válida 05:30–06:00; fuera de rango (06:00,14:00]; tarde >14:00
-#   Tarde:  válida 13:00–14:00; fuera de rango (14:00,22:00]; tarde >22:00
-#   Sin margen
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
@@ -333,34 +328,28 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     if e_min is None:
         return incid
 
-    # -------------------------
-    # MOD (nuevo por turnos)
-    # -------------------------
+    # MOD (por turnos)
     if depto_norm == "MOD":
-        # Detectar turno por hora de entrada (simple y estable)
         turno = "manana" if e_min < (12 * 60) else "tarde"
 
         if turno == "manana":
-            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60          # 05:30–06:00
-            fin_turno = 14 * 60                           # 14:00
-
+            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60      # 05:30–06:00
+            fin_turno = 14 * 60                       # 14:00
             if e_min < ini_ok:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
-                pass  # ok
+                pass
             elif e_min <= fin_turno:
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
             else:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
-
         else:
-            ini_ok, fin_ok = 13 * 60, 14 * 60            # 13:00–14:00
-            fin_turno = 22 * 60                          # 22:00
-
+            ini_ok, fin_ok = 13 * 60, 14 * 60         # 13:00–14:00
+            fin_turno = 22 * 60                       # 22:00
             if e_min < ini_ok:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
-                pass  # ok
+                pass
             elif e_min <= fin_turno:
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
             else:
@@ -368,16 +357,12 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
         return incid
 
-    # -------------------------
-    # MOI + ESTRUCTURA (igual)
-    # -------------------------
+    # MOI + ESTRUCTURA (entrada L–V 07:00–09:00; salida L–J 16:30, V 13:30)
     if depto_norm in ["MOI", "ESTRUCTURA"]:
         flex = _is_flex(depto_norm, nombre_norm)
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
-
-            # L-J: 16:30, V: 13:30
             salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
             if e_min < (ini - MARGEN_HORARIO_MIN):
