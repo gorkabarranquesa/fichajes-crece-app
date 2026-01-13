@@ -49,14 +49,12 @@ _SESSION.headers.update(
     }
 )
 
-
 # ============================================================
 # SEGURIDAD: no loguear detalles (PII, tokens, payloads)
 # ============================================================
 
 def _safe_fail(_exc: Exception) -> None:
     return None
-
 
 # ============================================================
 # SAFE REQUEST: centraliza peticiones + verify=True + retries
@@ -103,9 +101,8 @@ def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_
     _safe_fail(last_exc if last_exc else Exception("Unknown request error"))
     return None
 
-
 # ============================================================
-# NORMALIZACIÓN NOMBRES (para reglas especiales)
+# NORMALIZACIÓN NOMBRES
 # ============================================================
 
 def norm_name(s: str) -> str:
@@ -113,10 +110,8 @@ def norm_name(s: str) -> str:
         return ""
     return " ".join(str(s).upper().strip().split())
 
-
 def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
     return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
-
 
 # ============================================================
 # NOMBRES (tal cual CRECE)
@@ -127,8 +122,7 @@ N_DEBORA = norm_name("Debora Luis Soto")
 N_ETOR = norm_name("Etor Alegria Reparaz")
 N_FRAN = norm_name("Fran Diaz Arozarena")
 N_MIRIAM = norm_name("Miriam Martín Muñoz")
-N_BEATRIZ = norm_name("Beatriz Andueza Roncal")  # <-- NUEVA EXCEPCIÓN
-
+N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
 
 # ============================================================
 # DESCIFRADO CRECE (AES-CBC)
@@ -146,13 +140,11 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
     decrypted = unpad(cipher.decrypt(ct), AES.block_size)
     return decrypted.decode("utf-8")
 
-
 def _extract_payload_b64(resp: requests.Response) -> str:
     return (resp.text or "").strip().strip('"').strip()
 
-
 # ============================================================
-# TIEMPOS (TRUNCADO A MINUTO: estilo CRECE)
+# TIEMPOS (TRUNCADO A MINUTO)
 # ============================================================
 
 def segundos_a_hhmm(seg: float) -> str:
@@ -170,7 +162,6 @@ def segundos_a_hhmm(seg: float) -> str:
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
 
-
 def hhmm_to_min(hhmm: str) -> int:
     if not isinstance(hhmm, str) or ":" not in hhmm:
         return 0
@@ -180,10 +171,8 @@ def hhmm_to_min(hhmm: str) -> int:
     except Exception:
         return 0
 
-
 def hhmm_to_dec(hhmm: str) -> float:
     return hhmm_to_min(hhmm) / 60.0
-
 
 def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     tc_hhmm = (tc_hhmm or "").strip()
@@ -205,7 +194,6 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     m = diff % 60
     return f"{sign}{h:02d}:{m:02d}"
 
-
 def ts_to_hhmm(ts):
     if ts is None or pd.isna(ts):
         return ""
@@ -213,7 +201,6 @@ def ts_to_hhmm(ts):
         return pd.to_datetime(ts).strftime("%H:%M")
     except Exception:
         return ""
-
 
 def hhmm_to_min_clock(hhmm: str):
     if not isinstance(hhmm, str) or ":" not in hhmm:
@@ -224,9 +211,9 @@ def hhmm_to_min_clock(hhmm: str):
     except Exception:
         return None
 
-
 # ============================================================
-# REGLAS ESPECIALES RRHH (mínimos) - por prefijo nombre
+# REGLAS ESPECIALES RRHH (mínimos)
+# + Beatriz (ESTRUCTURA) con umbral excesivos especial
 # ============================================================
 
 SPECIAL_RULES_PREFIX = [
@@ -234,8 +221,8 @@ SPECIAL_RULES_PREFIX = [
     ("MOI", N_DEBORA, {"min_fichajes": 2}),
     ("MOI", N_ETOR, {"min_fichajes": 2}),
     ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
-    # NUEVA regla:
-    ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2}),  # L-V 6:30 y 2 fichajes
+    # NUEVO: Beatriz (ESTRUCTURA)
+    ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2, "max_fichajes_ok": 4}),
 ]
 
 SCHEDULE_EXEMPT_PREFIX = [
@@ -248,13 +235,11 @@ FLEX_BY_DEPTO = {
     "MOI": [N_DEBORA, N_ETOR],
 }
 
-
 def _lookup_special(depto_norm: str, nombre_norm: str):
     for d, pref, rules in SPECIAL_RULES_PREFIX:
         if depto_norm == d and name_startswith(nombre_norm, pref):
             return rules
     return None
-
 
 def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
     for d, pref in SCHEDULE_EXEMPT_PREFIX:
@@ -262,13 +247,11 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
             return True
     return False
 
-
 def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
     for pref in FLEX_BY_DEPTO.get(depto_norm, []):
         if name_startswith(nombre_norm, pref):
             return True
     return False
-
 
 # ============================================================
 # REGLAS BASE DE JORNADA
@@ -294,7 +277,6 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
         else:
             min_h, min_f = None, None
 
-    # Overrides especiales por persona
     special = _lookup_special(depto_norm, nombre_norm)
     if special:
         if "min_horas" in special and min_h is not None:
@@ -304,20 +286,17 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
     return min_h, min_f
 
-
 # ============================================================
-# VALIDACIÓN HORARIA (entrada/salida)
+# VALIDACIÓN HORARIA (MOI/ESTRUCTURA + MOD por turnos)
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
-    # Solo L-V
     if dia not in [0, 1, 2, 3, 4]:
         return []
 
-    # Exentos por horario especial
     if _is_schedule_exempt(depto_norm, nombre_norm):
         return []
 
@@ -328,13 +307,12 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     if e_min is None:
         return incid
 
-    # MOD (por turnos)
     if depto_norm == "MOD":
         turno = "manana" if e_min < (12 * 60) else "tarde"
 
         if turno == "manana":
-            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60      # 05:30–06:00
-            fin_turno = 14 * 60                       # 14:00
+            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60
+            fin_turno = 14 * 60
             if e_min < ini_ok:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
@@ -344,8 +322,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
             else:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
         else:
-            ini_ok, fin_ok = 13 * 60, 14 * 60         # 13:00–14:00
-            fin_turno = 22 * 60                       # 22:00
+            ini_ok, fin_ok = 13 * 60, 14 * 60
+            fin_turno = 22 * 60
             if e_min < ini_ok:
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
@@ -354,10 +332,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
                 incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
             else:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
-
         return incid
 
-    # MOI + ESTRUCTURA (entrada L–V 07:00–09:00; salida L–J 16:30, V 13:30)
     if depto_norm in ["MOI", "ESTRUCTURA"]:
         flex = _is_flex(depto_norm, nombre_norm)
 
@@ -372,14 +348,12 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
             if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
-
         return incid
 
     return incid
 
-
 # ============================================================
-# API EXPORTACIÓN (con safe_request)
+# API EXPORTACIÓN
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -398,7 +372,6 @@ def api_exportar_departamentos() -> pd.DataFrame:
         [{"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")}
          for d in (departamentos or [])]
     )
-
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
@@ -427,18 +400,13 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
 
         lista.append(
-            {
-                "nif": e.get("nif"),
-                "nombre_completo": nombre_completo,
-                "departamento_id": e.get("departamento"),
-            }
+            {"nif": e.get("nif"), "nombre_completo": nombre_completo, "departamento_id": e.get("departamento")}
         )
 
     df = pd.DataFrame(lista)
     if not df.empty:
         df["nif"] = df["nif"].astype(str).str.upper().str.strip()
     return df
-
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_tipos_fichaje() -> dict:
@@ -468,7 +436,6 @@ def api_exportar_tipos_fichaje() -> dict:
         _safe_fail(e)
         return {}
 
-
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
     url = f"{API_URL_BASE}/exportacion/fichajes"
     data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "asc"}
@@ -490,7 +457,6 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
         _safe_fail(e)
         return []
 
-
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     filas = []
 
@@ -511,11 +477,7 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
 
         if isinstance(val, list) and len(val) >= 4:
             filas.append(
-                {
-                    "nif": k,
-                    "tiempoEfectivo_seg": val[-2],
-                    "tiempoContabilizado_seg": val[-1],
-                }
+                {"nif": k, "tiempoEfectivo_seg": val[-2], "tiempoContabilizado_seg": val[-1]}
             )
             return
 
@@ -530,7 +492,6 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
     df["nif"] = df["nif"].astype(str).str.upper().str.strip()
     return df
-
 
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
@@ -560,7 +521,6 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
         _safe_fail(e)
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
-
 # ============================================================
 # DÍA (turno nocturno)
 # ============================================================
@@ -570,9 +530,8 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
         return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
     return fecha_dt.date().strftime("%Y-%m-%d")
 
-
 # ============================================================
-# TIEMPO POR FICHAJES (neto) - segundos enteros
+# TIEMPO POR FICHAJES (neto)
 # ============================================================
 
 def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
@@ -611,7 +570,6 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
     return pd.DataFrame(rows_out)
 
-
 def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["nif", "Fecha", "primera_entrada_dt", "ultima_salida_dt"])
@@ -624,9 +582,9 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
 
     return entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
 
-
 # ============================================================
-# VALIDACIÓN HORAS/FICHAJES (con tolerancia 5 min en horas)
+# VALIDACIÓN HORAS/FICHAJES
+# - Beatriz: excesivos solo si > 4
 # ============================================================
 
 def validar_incidencia_horas_fichajes(r) -> list[str]:
@@ -654,11 +612,20 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
     if num_fich < int(min_f):
         motivos.append(f"Fichajes insuficientes (mín {min_f})")
 
-    if horas_val >= umbral_inferior and num_fich > int(min_f):
-        motivos.append(f"Fichajes excesivos (mín {min_f})")
+    # Umbral de excesivos: por defecto > min_f, pero Beatriz tiene >4
+    max_ok = r.get("max_fichajes_ok")
+    if pd.notna(max_ok):
+        try:
+            max_ok_i = int(max_ok)
+        except Exception:
+            max_ok_i = None
+        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
+            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
+    else:
+        if horas_val >= umbral_inferior and num_fich > int(min_f):
+            motivos.append(f"Fichajes excesivos (mín {min_f})")
 
     return motivos
-
 
 # ============================================================
 # UI
@@ -688,21 +655,15 @@ if st.button("Consultar"):
     ff = fecha_fin.strftime("%Y-%m-%d")
 
     with st.spinner("Procesando…"):
-        try:
-            tipos_map = api_exportar_tipos_fichaje()
-            departamentos_df = api_exportar_departamentos()
-            empleados_df = api_exportar_empleados_completos()
-            if empleados_df.empty:
-                st.warning("No hay empleados disponibles.")
-                st.stop()
-
-            empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
-            empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
-
-        except Exception as e:
-            _safe_fail(e)
-            st.error("❌ No se pudo cargar la información base.")
+        tipos_map = api_exportar_tipos_fichaje()
+        departamentos_df = api_exportar_departamentos()
+        empleados_df = api_exportar_empleados_completos()
+        if empleados_df.empty:
+            st.warning("No hay empleados disponibles.")
             st.stop()
+
+        empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
+        empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
 
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
@@ -710,20 +671,17 @@ if st.button("Consultar"):
             for fut in as_completed(futures):
                 emp = futures[fut]
                 for x in (fut.result() or []):
-                    try:
-                        fichajes_rows.append(
-                            {
-                                "nif": emp["nif"],
-                                "Nombre": emp["nombre_completo"],
-                                "Departamento": emp.get("departamento_nombre"),
-                                "id": x.get("id"),
-                                "tipo": x.get("tipo"),
-                                "direccion": x.get("direccion"),
-                                "fecha": x.get("fecha"),
-                            }
-                        )
-                    except Exception:
-                        continue
+                    fichajes_rows.append(
+                        {
+                            "nif": emp["nif"],
+                            "Nombre": emp["nombre_completo"],
+                            "Departamento": emp.get("departamento_nombre"),
+                            "id": x.get("id"),
+                            "tipo": x.get("tipo"),
+                            "direccion": x.get("direccion"),
+                            "fecha": x.get("fecha"),
+                        }
+                    )
 
         if not fichajes_rows:
             st.info("No se encontraron fichajes en el rango seleccionado.")
@@ -802,6 +760,15 @@ if st.button("Consultar"):
 
         resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
+        # Añadimos max_fichajes_ok cuando aplique (Beatriz)
+        def _max_ok(r):
+            sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
+            if sp and "max_fichajes_ok" in sp:
+                return sp["max_fichajes_ok"]
+            return pd.NA
+
+        resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
+
         resumen[["min_horas", "min_fichajes"]] = resumen.apply(
             lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
             axis=1,
@@ -811,19 +778,14 @@ if st.button("Consultar"):
             motivos = []
 
             if int(r.get("dia", 0)) in [5, 6]:
-                try:
-                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
-                        int(r.get("Numero de fichajes", 0) or 0) > 0
-                    )
-                except Exception:
-                    worked = False
-
+                worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                    int(r.get("Numero de fichajes", 0) or 0) > 0
+                )
                 if worked:
                     motivos.append("Trabajo en fin de semana")
                 return "; ".join(motivos)
 
             motivos += validar_incidencia_horas_fichajes(r)
-
             motivos += validar_horario(
                 r.get("Departamento"),
                 r.get("Nombre"),
