@@ -352,8 +352,41 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     return incid
 
 # ============================================================
-# API EXPORTACIÓN
+# API EXPORTACIÓN (catálogos + empleados/fichajes)
 # ============================================================
+
+def _try_export_list(endpoint: str) -> list:
+    """
+    Intenta GET y luego POST para un endpoint de exportación.
+    Devuelve lista (si la API responde y se puede descifrar), si no [].
+    """
+    url = f"{API_URL_BASE}{endpoint}"
+
+    # 1) GET
+    resp = safe_request("GET", url)
+    if resp is not None and resp.status_code < 400:
+        try:
+            payload_b64 = _extract_payload_b64(resp)
+            if payload_b64:
+                decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                parsed = json.loads(decrypted)
+                return parsed if isinstance(parsed, list) else []
+        except Exception as e:
+            _safe_fail(e)
+
+    # 2) POST
+    resp = safe_request("POST", url)
+    if resp is not None and resp.status_code < 400:
+        try:
+            payload_b64 = _extract_payload_b64(resp)
+            if payload_b64:
+                decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                parsed = json.loads(decrypted)
+                return parsed if isinstance(parsed, list) else []
+        except Exception as e:
+            _safe_fail(e)
+
+    return []
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_departamentos() -> pd.DataFrame:
@@ -372,13 +405,61 @@ def api_exportar_departamentos() -> pd.DataFrame:
          for d in (departamentos or [])]
     )
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_empresas() -> pd.DataFrame:
+    # Intentamos endpoints típicos (si alguno existe en tu instancia)
+    candidates = [
+        "/exportacion/empresas",
+        "/exportacion/empresa",
+    ]
+    for ep in candidates:
+        lst = _try_export_list(ep)
+        if lst:
+            rows = []
+            for x in lst:
+                if isinstance(x, dict):
+                    eid = x.get("id")
+                    nom = x.get("nombre") or x.get("name") or x.get("empresa") or x.get("razon_social")
+                    if eid is not None:
+                        rows.append({"empresa_id": eid, "empresa_nombre": str(nom or "").strip()})
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df["empresa_nombre"] = df["empresa_nombre"].replace("", pd.NA).fillna("—")
+            return df
+    return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_sedes() -> pd.DataFrame:
+    # Intentamos endpoints típicos (si alguno existe en tu instancia)
+    candidates = [
+        "/exportacion/sedes",
+        "/exportacion/sede",
+        "/exportacion/centros",
+        "/exportacion/centros-trabajo",
+    ]
+    for ep in candidates:
+        lst = _try_export_list(ep)
+        if lst:
+            rows = []
+            for x in lst:
+                if isinstance(x, dict):
+                    sid = x.get("id")
+                    nom = x.get("nombre") or x.get("name") or x.get("sede") or x.get("centro")
+                    if sid is not None:
+                        rows.append({"sede_id": sid, "sede_nombre": str(nom or "").strip()})
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df["sede_nombre"] = df["sede_nombre"].replace("", pd.NA).fillna("—")
+            return df
+    return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+
 def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
     resp = safe_request("POST", url, data=data)
     if resp is None:
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa", "sede"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id"])
     resp.raise_for_status()
 
     payload_b64 = _extract_payload_b64(resp)
@@ -398,16 +479,14 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
 
-        # IMPORTANTÍSIMO:
-        # aquí NO inventamos endpoints. Solo tomamos lo que venga en /exportacion/empleados.
-        # Si "empresa"/"sede" vienen como ID o texto depende de tu instancia, pero al menos lo propagamos.
+        # En tu instancia vienen como números (según captura). Los guardamos como IDs.
         lista.append(
             {
                 "nif": e.get("nif"),
                 "nombre_completo": nombre_completo,
                 "departamento_id": e.get("departamento"),
-                "empresa": e.get("empresa"),
-                "sede": e.get("sede"),
+                "empresa_id": e.get("empresa"),
+                "sede_id": e.get("sede"),
             }
         )
 
@@ -640,16 +719,85 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
 st.title("📊 Fichajes CRECE Personas")
 
+# ---- Cargar catálogos para filtros previos (cacheado) ----
+empresas_df = api_exportar_empresas()
+sedes_df = api_exportar_sedes()
+
+empresas_map = {}
+if not empresas_df.empty:
+    empresas_map = {str(r["empresa_id"]): str(r["empresa_nombre"]) for _, r in empresas_df.iterrows()}
+
+sedes_map = {}
+if not sedes_df.empty:
+    sedes_map = {str(r["sede_id"]): str(r["sede_nombre"]) for _, r in sedes_df.iterrows()}
+
+# ---- Inputs fecha ----
 hoy = date.today()
 col1, col2 = st.columns(2)
 with col1:
-    fecha_inicio = st.date_input("Fecha inicio", value=hoy, max_value=hoy)
+    fecha_inicio = st.date_input("Fecha inicio", value=hoy, max_value=hoy, key="fi_input")
 with col2:
-    fecha_fin = st.date_input("Fecha fin", value=hoy, max_value=hoy)
+    fecha_fin = st.date_input("Fecha fin", value=hoy, max_value=hoy, key="ff_input")
 
 st.write("---")
 
-if st.button("Consultar"):
+# ============================================================
+# FILTROS PREVIOS (ANTES DE CONSULTAR)
+# ============================================================
+st.subheader("🔎 Filtros (antes de consultar)")
+
+pre1, pre2 = st.columns(2)
+
+def _fmt_empresa(x):
+    return empresas_map.get(str(x), str(x))
+
+def _fmt_sede(x):
+    return sedes_map.get(str(x), str(x))
+
+if not empresas_df.empty:
+    emp_opts = [str(x) for x in empresas_df["empresa_id"].tolist()]
+    with pre1:
+        pre_empresas = st.multiselect(
+            "Empresa",
+            options=emp_opts,
+            default=st.session_state.get("pre_empresas", emp_opts),
+            format_func=_fmt_empresa,
+            key="pre_empresas",
+        )
+else:
+    with pre1:
+        st.caption("Catálogo de empresas no disponible (se mostrará ID).")
+        pre_empresas = []
+
+if not sedes_df.empty:
+    sede_opts = [str(x) for x in sedes_df["sede_id"].tolist()]
+    with pre2:
+        pre_sedes = st.multiselect(
+            "Sede",
+            options=sede_opts,
+            default=st.session_state.get("pre_sedes", sede_opts),
+            format_func=_fmt_sede,
+            key="pre_sedes",
+        )
+else:
+    with pre2:
+        st.caption("Catálogo de sedes no disponible (se mostrará ID).")
+        pre_sedes = []
+
+# Botones
+b1, b2 = st.columns([1, 1])
+with b1:
+    do_query = st.button("Consultar", use_container_width=True)
+with b2:
+    if st.button("Limpiar resultados", use_container_width=True):
+        st.session_state.pop("salida_base", None)
+        st.session_state.pop("salida_fi", None)
+        st.session_state.pop("salida_ff", None)
+
+# ============================================================
+# EJECUCIÓN CONSULTA (solo cuando se pulsa)
+# ============================================================
+if do_query:
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
@@ -672,16 +820,40 @@ if st.button("Consultar"):
         empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
         empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
 
-        # Propagamos empresa/sede (vengan como vengan); si no vienen, “—”
-        if "empresa" not in empleados_df.columns:
-            empleados_df["empresa"] = "—"
-        if "sede" not in empleados_df.columns:
-            empleados_df["sede"] = "—"
+        # Normalizamos IDs como string para mapping/filtrado consistente
+        if "empresa_id" not in empleados_df.columns:
+            empleados_df["empresa_id"] = None
+        if "sede_id" not in empleados_df.columns:
+            empleados_df["sede_id"] = None
 
-        empleados_df["empresa"] = empleados_df["empresa"].fillna("—").astype(str)
-        empleados_df["sede"] = empleados_df["sede"].fillna("—").astype(str)
-        empleados_df.loc[empleados_df["empresa"].str.strip().eq(""), "empresa"] = "—"
-        empleados_df.loc[empleados_df["sede"].str.strip().eq(""), "sede"] = "—"
+        empleados_df["empresa_id"] = empleados_df["empresa_id"].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).strip().isdigit() else (str(x).strip() if pd.notna(x) else ""))
+        empleados_df["sede_id"] = empleados_df["sede_id"].apply(lambda x: str(int(x)) if pd.notna(x) and str(x).strip().isdigit() else (str(x).strip() if pd.notna(x) else ""))
+
+        # Aplicar filtros previos (para consultar solo lo filtrado)
+        if pre_empresas:
+            empleados_df = empleados_df[empleados_df["empresa_id"].isin(set(pre_empresas))].copy()
+        if pre_sedes:
+            empleados_df = empleados_df[empleados_df["sede_id"].isin(set(pre_sedes))].copy()
+
+        if empleados_df.empty:
+            st.info("No hay empleados que coincidan con Empresa/Sede seleccionadas.")
+            st.stop()
+
+        # Mapear nombres empresa/sede (si hay catálogo); si no, cae al ID
+        def _empresa_nombre(eid: str) -> str:
+            s = (eid or "").strip()
+            if not s:
+                return "—"
+            return empresas_map.get(s, s)
+
+        def _sede_nombre(sid: str) -> str:
+            s = (sid or "").strip()
+            if not s:
+                return "—"
+            return sedes_map.get(s, s)
+
+        empleados_df["Empresa"] = empleados_df["empresa_id"].apply(_empresa_nombre)
+        empleados_df["Sede"] = empleados_df["sede_id"].apply(_sede_nombre)
 
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
@@ -693,8 +865,8 @@ if st.button("Consultar"):
                         {
                             "nif": emp["nif"],
                             "Nombre": emp["nombre_completo"],
-                            "Empresa": emp.get("empresa", "—"),
-                            "Sede": emp.get("sede", "—"),
+                            "Empresa": emp.get("Empresa", "—"),
+                            "Sede": emp.get("Sede", "—"),
                             "Departamento": emp.get("departamento_nombre"),
                             "id": x.get("id"),
                             "tipo": x.get("tipo"),
@@ -817,69 +989,89 @@ if st.button("Consultar"):
 
         resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
 
-        salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
+        salida_base = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
 
-        # FORZAMOS columnas aunque algo haya venido raro
-        if "Empresa" not in salida.columns:
-            salida["Empresa"] = "—"
-        if "Sede" not in salida.columns:
-            salida["Sede"] = "—"
+        if salida_base.empty:
+            st.session_state["salida_base"] = salida_base
+            st.session_state["salida_fi"] = fi
+            st.session_state["salida_ff"] = ff
+        else:
+            salida_base = salida_base[
+                [
+                    "Fecha",
+                    "Empresa",
+                    "Sede",
+                    "Nombre",
+                    "Departamento",
+                    "Primera entrada",
+                    "Última salida",
+                    "Total trabajado",
+                    "Tiempo Contabilizado",
+                    "Diferencia",
+                    "Numero de fichajes",
+                    "Incidencia",
+                ]
+            ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
-    # ============================================================
-    # FILTROS (FUERA DEL SPINNER para que SIEMPRE se vean)
-    # ============================================================
-    if salida.empty:
-        st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
-        st.stop()
+            st.session_state["salida_base"] = salida_base
+            st.session_state["salida_fi"] = fi
+            st.session_state["salida_ff"] = ff
 
-    st.write("---")
-    st.subheader("🔎 Filtros")
+# ============================================================
+# MOSTRAR RESULTADOS + FILTROS (SIN PERDER EL RESULTADO)
+# ============================================================
+salida_base = st.session_state.get("salida_base", None)
 
-    empresas = sorted(salida["Empresa"].fillna("—").astype(str).unique().tolist())
-    sedes = sorted(salida["Sede"].fillna("—").astype(str).unique().tolist())
+if salida_base is None:
+    st.info("Selecciona fechas, filtra si quieres, y pulsa **Consultar**.")
+    st.stop()
 
-    f1, f2 = st.columns(2)
-    with f1:
-        sel_empresas = st.multiselect("Empresa", options=empresas, default=empresas)
-    with f2:
-        sel_sedes = st.multiselect("Sede", options=sedes, default=sedes)
+if salida_base.empty:
+    st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
+    st.stop()
 
-    if sel_empresas:
-        salida = salida[salida["Empresa"].astype(str).isin(set(sel_empresas))].copy()
-    else:
-        salida = salida.iloc[0:0].copy()
+st.write("---")
+st.subheader("🧰 Filtros (sobre el resultado)")
 
-    if sel_sedes:
-        salida = salida[salida["Sede"].astype(str).isin(set(sel_sedes))].copy()
-    else:
-        salida = salida.iloc[0:0].copy()
+# Estos filtros NO recalculan nada: solo filtran lo guardado en session_state
+empresas_res = sorted(salida_base["Empresa"].fillna("—").astype(str).unique().tolist())
+sedes_res = sorted(salida_base["Sede"].fillna("—").astype(str).unique().tolist())
 
-    if salida.empty:
-        st.info("No hay resultados con los filtros seleccionados.")
-        st.stop()
+f1, f2 = st.columns(2)
+with f1:
+    sel_empresas_res = st.multiselect(
+        "Empresa (resultado)",
+        options=empresas_res,
+        default=st.session_state.get("sel_empresas_res", empresas_res),
+        key="sel_empresas_res",
+    )
+with f2:
+    sel_sedes_res = st.multiselect(
+        "Sede (resultado)",
+        options=sedes_res,
+        default=st.session_state.get("sel_sedes_res", sedes_res),
+        key="sel_sedes_res",
+    )
 
-    # Columnas finales (incluimos Empresa y Sede)
-    salida = salida[
-        [
-            "Fecha",
-            "Empresa",
-            "Sede",
-            "Nombre",
-            "Departamento",
-            "Primera entrada",
-            "Última salida",
-            "Total trabajado",
-            "Tiempo Contabilizado",
-            "Diferencia",
-            "Numero de fichajes",
-            "Incidencia",
-        ]
-    ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
+salida = salida_base.copy()
+if sel_empresas_res:
+    salida = salida[salida["Empresa"].astype(str).isin(set(sel_empresas_res))].copy()
+else:
+    salida = salida.iloc[0:0].copy()
 
-    for f_dia in salida["Fecha"].unique():
-        st.markdown(f"### 📅 {f_dia}")
-        sub = salida[salida["Fecha"] == f_dia]
-        st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+if sel_sedes_res:
+    salida = salida[salida["Sede"].astype(str).isin(set(sel_sedes_res))].copy()
+else:
+    salida = salida.iloc[0:0].copy()
 
-    csv = salida.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
+if salida.empty:
+    st.info("No hay resultados con los filtros seleccionados.")
+    st.stop()
+
+for f_dia in salida["Fecha"].unique():
+    st.markdown(f"### 📅 {f_dia}")
+    sub = salida[salida["Fecha"] == f_dia]
+    st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+
+csv = salida.to_csv(index=False).encode("utf-8")
+st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
