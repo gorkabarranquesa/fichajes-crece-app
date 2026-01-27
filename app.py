@@ -164,7 +164,6 @@ def _try_parse_encrypted_response(resp: requests.Response):
             if isinstance(c, str):
                 s = c.strip().strip('"').strip()
 
-                # JSON string con iv/value dentro
                 if s.startswith("{") and s.endswith("}"):
                     obj = json.loads(s)
                     if isinstance(obj, dict) and "iv" in obj and "value" in obj:
@@ -172,7 +171,6 @@ def _try_parse_encrypted_response(resp: requests.Response):
                         dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
                         return json.loads(dec)
 
-                # base64 de JSON {iv,value}
                 try:
                     dec_json_raw = base64.b64decode(s).decode("utf-8")
                     obj = json.loads(dec_json_raw)
@@ -392,6 +390,45 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
     return incid
 
+def validar_incidencia_horas_fichajes(r) -> list[str]:
+    min_h = r.get("min_horas")
+    min_f = r.get("min_fichajes")
+    if pd.isna(min_h) or pd.isna(min_f):
+        return []
+
+    try:
+        num_fich = int(r.get("Numero de fichajes", 0) or 0)
+    except Exception:
+        num_fich = 0
+
+    try:
+        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
+    except Exception:
+        horas_val = 0.0
+
+    motivos = []
+
+    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
+    if horas_val < umbral_inferior:
+        motivos.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
+
+    if num_fich < int(min_f):
+        motivos.append(f"Fichajes insuficientes (mín {min_f})")
+
+    max_ok = r.get("max_fichajes_ok")
+    if pd.notna(max_ok):
+        try:
+            max_ok_i = int(max_ok)
+        except Exception:
+            max_ok_i = None
+        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
+            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
+    else:
+        if horas_val >= umbral_inferior and num_fich > int(min_f):
+            motivos.append(f"Fichajes excesivos (mín {min_f})")
+
+    return motivos
+
 # ============================================================
 # API EXPORTACIÓN / INFORMES
 # ============================================================
@@ -499,8 +536,6 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
         }
 
-        # Guardamos también campos “estado/contrato” si vienen, para filtrar sin fichajes
-        # (no fallará si no existen)
         for k in [
             "deleted_at",
             "activo",
@@ -642,6 +677,97 @@ def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
         return None
 
 # ============================================================
+# HELPERS BAJAS (ROBUSTO)
+# ============================================================
+
+def _to_float_any(x) -> float:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return 0.0
+    try:
+        if isinstance(x, str):
+            s = x.strip().replace(",", ".")
+            return float(s) if s else 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+def _extract_rows_from_informe(rep):
+    """
+    Normaliza la respuesta de /informes/empleados a lista de dicts.
+    """
+    if rep is None:
+        return []
+
+    if isinstance(rep, list):
+        return [r for r in rep if isinstance(r, dict)]
+
+    if isinstance(rep, dict):
+        # formatos típicos
+        for k in ["data", "empleados", "results", "resultado", "items"]:
+            v = rep.get(k)
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+
+        # a veces viene como dict por clave: {"0000000086": {...}, ...}
+        vals = list(rep.values())
+        if vals and all(isinstance(v, dict) for v in vals):
+            return vals
+
+    return []
+
+def _get_horas_baja_from_row(row: dict) -> float:
+    """
+    Saca horas de baja de un row, incluso si viene anidado.
+    """
+    if not isinstance(row, dict):
+        return 0.0
+
+    # 1) campos directos
+    candidates = [
+        "horas_baja",
+        "horasBaja",
+        "horas_de_baja",
+        "horas_baja_total",
+        "total_horas_baja",
+        "horas_baja_dia",
+        "horas_baja_diarias",
+        "horas_baja_hoy",
+        "horas_baja_parte",
+    ]
+    for c in candidates:
+        if c in row:
+            return _to_float_any(row.get(c))
+
+    # 2) anidado: baja / ausencias / partes...
+    for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
+        v = row.get(k)
+        if isinstance(v, dict):
+            for c in candidates:
+                if c in v:
+                    return _to_float_any(v.get(c))
+            # también puede ser "horas"
+            if "horas" in v:
+                return _to_float_any(v.get("horas"))
+        elif isinstance(v, list):
+            # si hay lista de bajas con horas
+            best = 0.0
+            for it in v:
+                if isinstance(it, dict):
+                    h = _get_horas_baja_from_row(it)
+                    if h > best:
+                        best = h
+            if best > 0:
+                return best
+
+    return 0.0
+
+def _pick_key(df: pd.DataFrame, names: list[str]):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+# ============================================================
 # DÍA (turno nocturno) + tiempos netos
 # ============================================================
 
@@ -698,45 +824,6 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
 
     return entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
 
-def validar_incidencia_horas_fichajes(r) -> list[str]:
-    min_h = r.get("min_horas")
-    min_f = r.get("min_fichajes")
-    if pd.isna(min_h) or pd.isna(min_f):
-        return []
-
-    try:
-        num_fich = int(r.get("Numero de fichajes", 0) or 0)
-    except Exception:
-        num_fich = 0
-
-    try:
-        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
-    except Exception:
-        horas_val = 0.0
-
-    motivos = []
-
-    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
-    if horas_val < umbral_inferior:
-        motivos.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
-
-    if num_fich < int(min_f):
-        motivos.append(f"Fichajes insuficientes (mín {min_f})")
-
-    max_ok = r.get("max_fichajes_ok")
-    if pd.notna(max_ok):
-        try:
-            max_ok_i = int(max_ok)
-        except Exception:
-            max_ok_i = None
-        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
-            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
-    else:
-        if horas_val >= umbral_inferior and num_fich > int(min_f):
-            motivos.append(f"Fichajes excesivos (mín {min_f})")
-
-    return motivos
-
 # ============================================================
 # FILTRO "ACTIVO / CONTRATO" (robusto)
 # ============================================================
@@ -747,7 +834,6 @@ def _parse_date_any(x):
     s = str(x).strip()
     if not s:
         return None
-    # intentos de parseo
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -759,34 +845,26 @@ def _parse_date_any(x):
         return None
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
-    """
-    Devuelve máscara booleana: True si el empleado parece estar en activo o con contrato activo.
-    Se apoya en varias columnas típicas si existen. Si no existen, se asume activo (no bloquea).
-    """
     if df_emp.empty:
         return pd.Series([], dtype=bool)
 
-    # 1) deleted_at: si existe y NO es null => no activo
     if "deleted_at" in df_emp.columns:
         deleted = df_emp["deleted_at"].notna() & df_emp["deleted_at"].astype(str).str.strip().ne("") & df_emp["deleted_at"].astype(str).str.lower().ne("null")
     else:
         deleted = pd.Series([False] * len(df_emp))
 
-    # 2) flags directos
     flags_true = pd.Series([False] * len(df_emp))
     for col in ["activo", "en_activo", "contrato_activo"]:
         if col in df_emp.columns:
             s = df_emp[col]
             flags_true = flags_true | s.astype(str).str.strip().str.lower().isin(["1", "true", "t", "si", "sí", "yes", "y"])
 
-    # 3) estado/situacion
     estado_ok = pd.Series([False] * len(df_emp))
     for col in ["estado", "situacion"]:
         if col in df_emp.columns:
             s = df_emp[col].astype(str).str.strip().str.upper()
             estado_ok = estado_ok | s.isin(["ACTIVO", "ALTA", "EN ALTA", "EN_ALTA", "ACTIVE"])
 
-    # 4) fecha_baja: si existe y está informada (<= hoy) => no activo
     if "fecha_baja" in df_emp.columns:
         fb = df_emp["fecha_baja"].apply(_parse_date_any)
         fb_has = fb.notna()
@@ -795,16 +873,12 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
     else:
         baja = pd.Series([False] * len(df_emp))
 
-    # 5) fin contrato: si existe y es >= hoy => activo/contrato vigente
     fin_ok = pd.Series([False] * len(df_emp))
     for col in ["fecha_fin_contrato", "fin_contrato"]:
         if col in df_emp.columns:
             fc = df_emp[col].apply(_parse_date_any)
             fin_ok = fin_ok | (fc.notna() & (fc >= date.today()))
 
-    # Estrategia:
-    # - Si hay indicadores explícitos (flags/estado/fin_ok), usamos esos.
-    # - Si no hay ninguno, asumimos activo salvo deleted_at o fecha_baja.
     any_signal_cols = any(c in df_emp.columns for c in ["activo", "en_activo", "contrato_activo", "estado", "situacion", "fecha_fin_contrato", "fin_contrato"])
     if any_signal_cols:
         active = (flags_true | estado_ok | fin_ok) & (~deleted) & (~baja)
@@ -848,11 +922,10 @@ if not sedes_df.empty and "sede_id" in sedes_df.columns:
 empleados_df["Empresa"] = empleados_df["empresa_id"].map(emp_map).fillna("").astype(str)
 empleados_df["Sede"] = empleados_df["sede_id"].map(sede_map).fillna("").astype(str)
 
-# Fallback SOLO si hiciera falta (pero luego aplicamos allowlist por nombre)
+# fallback mínimo (no debería usarse si catálogo ok)
 empleados_df.loc[empleados_df["Empresa"].str.strip().eq(""), "Empresa"] = empleados_df["empresa_id"]
 empleados_df.loc[empleados_df["Sede"].str.strip().eq(""), "Sede"] = empleados_df["sede_id"]
 
-# ---- Aplicar allowlist (por nombre normalizado) ----
 empleados_df["Empresa_norm"] = empleados_df["Empresa"].apply(_norm_key)
 empleados_df["Sede_norm"] = empleados_df["Sede"].apply(_norm_key)
 
@@ -879,7 +952,6 @@ st.write("---")
 st.subheader("🔎 Filtros")
 f1, f2 = st.columns(2)
 
-# Opciones: EXACTAMENTE las allowlist (en el mismo texto), pero solo si existen en datos.
 empresas_opts = [x for x in ALLOWED_EMPRESAS if _norm_key(x) in set(empleados_df["Empresa_norm"].unique())]
 sedes_opts = [x for x in ALLOWED_SEDES if _norm_key(x) in set(empleados_df["Sede_norm"].unique())]
 
@@ -888,7 +960,6 @@ with f1:
 with f2:
     sel_sedes = st.multiselect("Sede", options=sedes_opts, default=sedes_opts)
 
-# Filtrado previo de empleados
 empleados_filtrados = empleados_df[
     empleados_df["Empresa"].apply(_norm_key).isin({_norm_key(x) for x in sel_empresas}) &
     empleados_df["Sede"].apply(_norm_key).isin({_norm_key(x) for x in sel_sedes})
@@ -905,7 +976,6 @@ def _iter_days(d0: date, d1: date):
 def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list) -> str:
     return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}"
 
-# session_state
 for k, v in [
     ("last_sig", ""),
     ("result_incidencias", {}),
@@ -1098,7 +1168,7 @@ if consultar:
                     "Total trabajado","Tiempo Contabilizado","Diferencia","Numero de fichajes","Incidencia"
                 ])
 
-        # --------- BAJAS (día a día) ----------
+        # --------- BAJAS (día a día) - FIX ROBUSTO ----------
         bajas_por_dia = {}
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
@@ -1110,56 +1180,34 @@ if consultar:
         for cur in _iter_days(d0, d1):
             day = cur.strftime("%Y-%m-%d")
             rep = api_informe_empleados(day, day)
-            if rep is None:
-                continue
-
-            if isinstance(rep, dict) and "data" in rep and isinstance(rep["data"], list):
-                rows = rep["data"]
-            elif isinstance(rep, list):
-                rows = rep
-            elif isinstance(rep, dict):
-                rows = list(rep.values())
-            else:
-                rows = []
-
+            rows = _extract_rows_from_informe(rep)
             if not rows:
                 continue
 
+            # dataframe de informe
             df_rep = pd.DataFrame(rows)
             if df_rep.empty:
                 continue
 
-            col_hb = None
-            for c in ["horas_baja", "horasBaja", "horas_de_baja", "horas"]:
-                if c in df_rep.columns:
-                    col_hb = c
-                    break
-            if col_hb is None:
-                continue
-
-            def _to_float(x):
-                try:
-                    return float(x)
-                except Exception:
-                    return 0.0
-
-            df_rep["horas_baja"] = df_rep[col_hb].apply(_to_float)
+            # calcula horas_baja robusto (directo/anidado)
+            df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
             df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
             if df_rep.empty:
                 continue
 
-            key_nif = None
-            for c in ["nif", "NIF", "dni", "DNI"]:
-                if c in df_rep.columns:
-                    key_nif = c
-                    break
+            # escoger clave de unión (nif o num_empleado)
+            key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
+            key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
 
             merged = None
             if key_nif is not None:
                 df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
                 merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="left")
+            elif key_num is not None:
+                df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
+                merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="left")
 
-            if merged is None:
+            if merged is None or merged.empty:
                 continue
 
             out = pd.DataFrame({
@@ -1178,7 +1226,6 @@ if consultar:
         # --------- SIN FICHAJES (solo ACTIVO / CONTRATO) ----------
         sin_por_dia = {}
 
-        # aquí aplicamos el filtro que has pedido:
         base_emp_sin = base_emp.copy()
         mask_activo = empleado_activo_o_contrato(base_emp_sin)
         base_emp_sin = base_emp_sin[mask_activo].copy()
