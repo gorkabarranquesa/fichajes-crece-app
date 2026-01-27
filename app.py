@@ -1167,7 +1167,7 @@ if consultar:
                 # Filtrado adicional por seguridad (solo empleados filtrados)
                 out = out[out["Nombre"].astype(str).str.strip().ne("")]
 
-// (sin días_baja: pedido por ti)
+
             if not out.empty:
                 bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
 
