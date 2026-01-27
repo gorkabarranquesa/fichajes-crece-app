@@ -314,52 +314,6 @@ with st.expander("🧪 Inspeccionar /informes/empleados (descifrado)", expanded=
 
 
 # ============================================================
-# UI: Panel de inspección (opcional)
-# ============================================================
-
-with st.expander("🧪 Inspeccionar /informes/empleados (descifrado)", expanded=False):
-    st.caption("Esto hace una llamada REAL con tus secretos (token+key) y te enseña la estructura/keys. "
-               "No imprime tokens ni payloads cifrados.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        dbg_desde = st.text_input("fecha_desde (YYYY-MM-DD)", value="2026-01-01")
-    with c2:
-        dbg_hasta = st.text_input("fecha_hasta (YYYY-MM-DD)", value="2026-12-31")
-
-    show_preview = st.checkbox("Mostrar vista previa de 3 registros (recortada)", value=False)
-
-    if st.button("Ejecutar inspección /informes/empleados"):
-        parsed = api_informes_empleados_raw(dbg_desde, dbg_hasta)
-
-        if parsed is None:
-            st.error("No se pudo obtener/descifrar el informe (revisa endpoint, token, key o formato body).")
-        else:
-            st.success(f"Respuesta descifrada OK. Tipo: {type(parsed).__name__}")
-
-            records = _flatten_records(parsed)
-            st.write(f"Registros (dict por empleado) detectados: {len(records)}")
-
-            # Keys globales
-            all_keys = set()
-            for r in records:
-                all_keys |= set(r.keys())
-            all_keys = sorted(all_keys)
-
-            st.write("Claves detectadas (union):")
-            st.code("\n".join(all_keys) if all_keys else "(sin claves)")
-
-            # Sugerir keys de bajas
-            leave_keys = _guess_leave_keys(records)
-            st.write("Candidatos de campos relacionados con baja/ausencia:")
-            st.code("\n".join(leave_keys) if leave_keys else "(no se detectaron por nombre)")
-
-            if show_preview:
-                st.write("Vista previa (recortada):")
-                st.json(_safe_preview_records(records, max_rows=3))
-
-
-# ============================================================
 # NORMALIZACIÓN NOMBRES
 # ============================================================
 
