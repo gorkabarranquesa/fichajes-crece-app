@@ -140,7 +140,6 @@ def b64decode_any(s: str) -> bytes:
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1].strip()
 
-    # padding
     pad = (-len(s)) % 4
     if pad:
         s += "=" * pad
@@ -148,14 +147,9 @@ def b64decode_any(s: str) -> bytes:
     try:
         return base64.urlsafe_b64decode(s.encode("utf-8"))
     except Exception:
-        # fallback a estándar
         return base64.b64decode(s.encode("utf-8"))
 
 def _looks_like_b64_any(s: str) -> bool:
-    """
-    Detecta si una cadena parece base64/base64url.
-    Permite A-Z a-z 0-9 + / - _ = y saltos de línea.
-    """
     s = (s or "").strip()
     if len(s) < 40:
         return False
@@ -182,10 +176,6 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
     return decrypted.decode("utf-8")
 
 def decrypt_crece_payload_from_dict(payload: dict, app_key_b64: str) -> str:
-    """
-    Descifra cuando el endpoint devuelve DIRECTAMENTE dict:
-      {"iv":"...","value":"..."}  (iv/value pueden ser base64url)
-    """
     iv = b64decode_any(payload.get("iv") or "")
     ct = b64decode_any(payload.get("value") or payload.get("ciphertext") or "")
     key = b64decode_any(app_key_b64)
@@ -198,7 +188,120 @@ def _extract_payload_b64(resp: requests.Response) -> str:
     return (resp.text or "").strip().strip('"').strip("'").strip()
 
 # ============================================================
-# TIEMPOS (TRUNCADO A MINUTO)
+# HELPERS: extracción robusta de respuesta (plano/cifrado/base64url)
+# ============================================================
+
+def _try_parse_json_text(txt: str):
+    txt = (txt or "").strip()
+    if not txt:
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        return None
+
+def _extract_possible_payload(resp: requests.Response):
+    """
+    Soporta:
+      - JSON plano list/dict
+      - dict {iv,value}
+      - wrapper dict con payload en data/payload/result/encrypted/content
+      - JSON-string que contiene base64url "eyJpdiI6..."
+      - body base64 directo
+    """
+    raw_text = (resp.text or "").strip()
+
+    # 1) resp.json()
+    try:
+        parsed = resp.json()
+
+        if isinstance(parsed, str) and _looks_like_b64_any(parsed):
+            return None, parsed.strip(), None, raw_text
+
+        if isinstance(parsed, (list, dict)):
+            if isinstance(parsed, dict) and ("iv" in parsed) and (("value" in parsed) or ("ciphertext" in parsed)):
+                return None, None, parsed, raw_text
+
+            if isinstance(parsed, dict):
+                for k in ["data", "payload", "result", "encrypted", "content"]:
+                    v = parsed.get(k)
+                    if isinstance(v, str) and _looks_like_b64_any(v):
+                        return None, v.strip(), None, raw_text
+                    if isinstance(v, dict) and ("iv" in v) and (("value" in v) or ("ciphertext" in v)):
+                        return None, None, v, raw_text
+
+            return parsed, None, None, raw_text
+    except Exception:
+        pass
+
+    # 2) JSON desde texto
+    parsed_text = _try_parse_json_text(raw_text)
+    if isinstance(parsed_text, str) and _looks_like_b64_any(parsed_text):
+        return None, parsed_text.strip(), None, raw_text
+
+    if isinstance(parsed_text, (list, dict)):
+        if isinstance(parsed_text, dict) and ("iv" in parsed_text) and (("value" in parsed_text) or ("ciphertext" in parsed_text)):
+            return None, None, parsed_text, raw_text
+
+        if isinstance(parsed_text, dict):
+            for k in ["data", "payload", "result", "encrypted", "content"]:
+                v = parsed_text.get(k)
+                if isinstance(v, str) and _looks_like_b64_any(v):
+                    return None, v.strip(), None, raw_text
+                if isinstance(v, dict) and ("iv" in v) and (("value" in v) or ("ciphertext" in v)):
+                    return None, None, v, raw_text
+
+        return parsed_text, None, None, raw_text
+
+    # 3) base64 directo
+    body = raw_text.strip().strip('"').strip("'").strip()
+    if _looks_like_b64_any(body):
+        return None, body, None, raw_text
+
+    return None, None, None, raw_text
+
+def _flatten_records(parsed):
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return [x for x in parsed if isinstance(x, dict)]
+    if isinstance(parsed, dict):
+        for k in ["empleados", "data", "result"]:
+            v = parsed.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+        out = []
+        for _, v in parsed.items():
+            if isinstance(v, dict):
+                out.append(v)
+            elif isinstance(v, list):
+                out.extend([x for x in v if isinstance(x, dict)])
+        return out
+    return []
+
+def _pick_key_case_insensitive(d: dict, candidates: list[str]):
+    if not isinstance(d, dict):
+        return None
+    lower_map = {str(k).lower(): k for k in d.keys()}
+    for c in candidates:
+        kc = lower_map.get(str(c).lower())
+        if kc is not None:
+            return kc
+    return None
+
+def _as_float(x):
+    try:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+def _as_str(x):
+    return "" if x is None else str(x).strip()
+
+# ============================================================
+# TIEMPOS
 # ============================================================
 
 def segundos_a_hhmm(seg: float) -> str:
@@ -266,8 +369,7 @@ def hhmm_to_min_clock(hhmm: str):
         return None
 
 # ============================================================
-# REGLAS ESPECIALES RRHH (mínimos)
-# + Beatriz (ESTRUCTURA) con umbral excesivos especial
+# REGLAS ESPECIALES RRHH
 # ============================================================
 
 SPECIAL_RULES_PREFIX = [
@@ -275,7 +377,6 @@ SPECIAL_RULES_PREFIX = [
     ("MOI", N_DEBORA, {"min_fichajes": 2}),
     ("MOI", N_ETOR, {"min_fichajes": 2}),
     ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
-    # NUEVO: Beatriz (ESTRUCTURA)
     ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2, "max_fichajes_ok": 4}),
 ]
 
@@ -318,15 +419,15 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     min_h, min_f = None, None
 
     if depto_norm in ["ESTRUCTURA", "MOI"]:
-        if dia in [0, 1, 2, 3]:       # L-J
+        if dia in [0, 1, 2, 3]:
             min_h, min_f = 8.5, 4
-        elif dia == 4:                # V
+        elif dia == 4:
             min_h, min_f = 6.5, 2
         else:
             min_h, min_f = None, None
 
     elif depto_norm == "MOD":
-        if dia in [0, 1, 2, 3, 4]:    # L-V
+        if dia in [0, 1, 2, 3, 4]:
             min_h, min_f = 8.0, 2
         else:
             min_h, min_f = None, None
@@ -341,7 +442,7 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     return min_h, min_f
 
 # ============================================================
-# VALIDACIÓN HORARIA (MOI/ESTRUCTURA + MOD por turnos)
+# VALIDACIÓN HORARIA
 # ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
@@ -407,7 +508,108 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
     return incid
 
 # ============================================================
-# API EXPORTACIÓN (departamentos / empleados / tipos / fichajes / tiempo)
+# API: Export genérico (para mapping id->nombre)
+# ============================================================
+
+def _export_list_try(endpoint: str, *, method_prefer="GET"):
+    """
+    Intenta llamar al endpoint y devolver lista parseada descifrada.
+    Soporta respuesta cifrada tipo exportación CRECE.
+    """
+    url = f"{API_URL_BASE}/{endpoint.lstrip('/')}"
+    methods = ["GET", "POST"] if method_prefer == "GET" else ["POST", "GET"]
+
+    for m in methods:
+        try:
+            resp = safe_request(m, url)
+            if resp is None:
+                continue
+            if resp.status_code >= 400:
+                continue
+
+            payload_b64 = _extract_payload_b64(resp)
+            if not payload_b64:
+                continue
+
+            decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+            parsed = json.loads(decrypted)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception as e:
+            _safe_fail(e)
+            continue
+
+    return None
+
+def _build_id_name_df(items, id_keys, name_keys, df_cols=("id", "nombre")) -> pd.DataFrame:
+    rows = []
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+
+        id_val = None
+        for k in id_keys:
+            if k in it and it.get(k) is not None:
+                id_val = it.get(k)
+                break
+
+        name_val = None
+        for k in name_keys:
+            if k in it and it.get(k) is not None:
+                name_val = it.get(k)
+                break
+
+        if id_val is None:
+            continue
+
+        rows.append({"id": str(id_val).strip(), "nombre": "" if name_val is None else str(name_val).strip()})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=list(df_cols))
+    df = df.drop_duplicates(subset=["id"], keep="first")
+    return df.rename(columns={"id": df_cols[0], "nombre": df_cols[1]})
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_empresas() -> pd.DataFrame:
+    """
+    Construye mapping empresa_id -> empresa_nombre probando endpoints habituales.
+    Si tu instancia usa otro endpoint, no rompe: devuelve DF vacío.
+    """
+    candidates = [
+        ("exportacion/empresas", "GET"),
+        ("exportacion/empresa", "GET"),
+        ("exportacion/companias", "GET"),
+        ("exportacion/compania", "GET"),
+    ]
+    for ep, pref in candidates:
+        items = _export_list_try(ep, method_prefer=pref)
+        if items:
+            return _build_id_name_df(items, id_keys=["id", "empresa_id", "cod", "codigo"], name_keys=["nombre", "name", "descripcion", "description"],
+                                     df_cols=("empresa_id", "empresa_nombre"))
+    return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_sedes() -> pd.DataFrame:
+    """
+    Construye mapping sede_id -> sede_nombre probando endpoints habituales.
+    """
+    candidates = [
+        ("exportacion/sedes", "GET"),
+        ("exportacion/sede", "GET"),
+        ("exportacion/centros", "GET"),
+        ("exportacion/centros-trabajo", "GET"),
+        ("exportacion/centros_trabajo", "GET"),
+    ]
+    for ep, pref in candidates:
+        items = _export_list_try(ep, method_prefer=pref)
+        if items:
+            return _build_id_name_df(items, id_keys=["id", "sede_id", "centro_id", "codigo", "cod"], name_keys=["nombre", "name", "descripcion", "description"],
+                                     df_cols=("sede_id", "sede_nombre"))
+    return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+
+# ============================================================
+# API EXPORTACIÓN: Departamentos / Empleados / Tipos / Fichajes / Tiempo
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -429,16 +631,19 @@ def api_exportar_departamentos() -> pd.DataFrame:
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
     """
-    IMPORTANTE:
-    - Incluye empresa y sede (si vienen en payload)
-    - Si tu API devuelve solo IDs, aquí al menos no rompe: se mostrará el valor recibido.
+    Devuelve empleados con:
+      - nif
+      - num_empleado (si existe)
+      - departamento_id
+      - empresa_id / sede_id (si existen)
+    Luego en UI se traducen a nombres con mappings.
     """
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
     resp = safe_request("POST", url, data=data)
     if resp is None:
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa", "sede"])
+        return pd.DataFrame(columns=["nif", "num_empleado", "nombre_completo", "departamento_id", "empresa_id", "sede_id"])
     resp.raise_for_status()
 
     payload_b64 = _extract_payload_b64(resp)
@@ -458,25 +663,29 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
 
-        # Empresa / Sede: preferimos nombre si viene; si no, lo que venga.
-        empresa = e.get("empresa_nombre") or e.get("empresa") or e.get("cod_empresa") or e.get("empresa_id")
-        sede = e.get("sede_nombre") or e.get("sede") or e.get("centro") or e.get("sede_id")
+        # claves frecuentes
+        nif = e.get("nif")
+        num_empleado = e.get("num_empleado") or e.get("numero_empleado") or e.get("empleado") or e.get("id_empleado") or e.get("id")
+        empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa")
+        sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
 
         lista.append(
             {
-                "nif": e.get("nif"),
+                "nif": nif,
+                "num_empleado": "" if num_empleado is None else str(num_empleado).strip(),
                 "nombre_completo": nombre_completo,
                 "departamento_id": e.get("departamento"),
-                "Empresa": ("" if empresa is None else str(empresa).strip()),
-                "Sede": ("" if sede is None else str(sede).strip()),
+                "empresa_id": "" if empresa_id is None else str(empresa_id).strip(),
+                "sede_id": "" if sede_id is None else str(sede_id).strip(),
             }
         )
 
     df = pd.DataFrame(lista)
     if not df.empty:
         df["nif"] = df["nif"].astype(str).str.upper().str.strip()
-        df["Empresa"] = df["Empresa"].astype(str).str.strip()
-        df["Sede"] = df["Sede"].astype(str).str.strip()
+        df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
+        df["empresa_id"] = df["empresa_id"].astype(str).str.strip()
+        df["sede_id"] = df["sede_id"].astype(str).str.strip()
     return df
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -596,87 +805,9 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
 # INFORMES: /informes/empleados (DESCIFRADO ROBUSTO)
 # ============================================================
 
-def _try_parse_json_text(txt: str):
-    txt = (txt or "").strip()
-    if not txt:
-        return None
-    try:
-        return json.loads(txt)
-    except Exception:
-        return None
-
-def _extract_possible_payload(resp: requests.Response):
-    """
-    Devuelve:
-      - parsed_json (list/dict si JSON plano)
-      - payload_b64 (str si base64 directo o embebido)
-      - payload_dict (dict si {iv,value} directo o embebido)
-      - raw_text
-    IMPORTANTE: soporta el caso real visto por ti:
-      Content-Type: application/json
-      resp.json() -> "eyJpdiI6..."
-    """
-    raw_text = (resp.text or "").strip()
-
-    # 1) Intento JSON por resp.json()
-    try:
-        parsed = resp.json()
-
-        # Caso clave: JSON-string que contiene base64/base64url
-        if isinstance(parsed, str) and _looks_like_b64_any(parsed):
-            return None, parsed.strip(), None, raw_text
-
-        # JSON plano list/dict
-        if isinstance(parsed, (list, dict)):
-            # cifrado directo {iv,value}
-            if isinstance(parsed, dict) and ("iv" in parsed) and (("value" in parsed) or ("ciphertext" in parsed)):
-                return None, None, parsed, raw_text
-
-            # wrappers con payload dentro
-            if isinstance(parsed, dict):
-                for k in ["data", "payload", "result", "encrypted", "content"]:
-                    v = parsed.get(k)
-                    if isinstance(v, str) and _looks_like_b64_any(v):
-                        return None, v.strip(), None, raw_text
-                    if isinstance(v, dict) and ("iv" in v) and (("value" in v) or ("ciphertext" in v)):
-                        return None, None, v, raw_text
-
-            return parsed, None, None, raw_text
-    except Exception:
-        pass
-
-    # 2) Si no, intentamos parsear como JSON desde texto
-    parsed_text = _try_parse_json_text(raw_text)
-    if isinstance(parsed_text, str) and _looks_like_b64_any(parsed_text):
-        return None, parsed_text.strip(), None, raw_text
-
-    if isinstance(parsed_text, (list, dict)):
-        if isinstance(parsed_text, dict) and ("iv" in parsed_text) and (("value" in parsed_text) or ("ciphertext" in parsed_text)):
-            return None, None, parsed_text, raw_text
-        if isinstance(parsed_text, dict):
-            for k in ["data", "payload", "result", "encrypted", "content"]:
-                v = parsed_text.get(k)
-                if isinstance(v, str) and _looks_like_b64_any(v):
-                    return None, v.strip(), None, raw_text
-                if isinstance(v, dict) and ("iv" in v) and (("value" in v) or ("ciphertext" in v)):
-                    return None, None, v, raw_text
-        return parsed_text, None, None, raw_text
-
-    # 3) Body base64 directo (sin JSON)
-    body = raw_text.strip().strip('"').strip("'").strip()
-    if _looks_like_b64_any(body):
-        return None, body, None, raw_text
-
-    return None, None, None, raw_text
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_informes_empleados(fecha_desde: str, fecha_hasta: str):
-    """
-    Devuelve objeto parseado (list/dict) del informe, o None si falla.
-    """
     url = f"{API_URL_BASE}/informes/empleados"
-
-    # probamos body JSON (lo que tú indicas)
     try:
         resp = safe_request("POST", url, json_body={"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta})
         if resp is None:
@@ -685,72 +816,28 @@ def api_informes_empleados(fecha_desde: str, fecha_hasta: str):
 
         parsed_json, payload_b64, payload_dict, _ = _extract_possible_payload(resp)
 
-        # JSON plano
         if isinstance(parsed_json, (list, dict)):
             return parsed_json
 
-        # cifrado directo dict
         if isinstance(payload_dict, dict):
             decrypted = decrypt_crece_payload_from_dict(payload_dict, APP_KEY_B64)
             return json.loads(decrypted)
 
-        # base64/base64url envolvente (CASO REAL)
         if payload_b64:
             decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
             return json.loads(decrypted)
 
         return None
-
     except Exception as e:
         _safe_fail(e)
         return None
 
-def _flatten_records(parsed):
-    if parsed is None:
-        return []
-    if isinstance(parsed, list):
-        return [x for x in parsed if isinstance(x, dict)]
-    if isinstance(parsed, dict):
-        for k in ["empleados", "data", "result"]:
-            v = parsed.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        out = []
-        for _, v in parsed.items():
-            if isinstance(v, dict):
-                out.append(v)
-            elif isinstance(v, list):
-                out.extend([x for x in v if isinstance(x, dict)])
-        return out
-    return []
-
-def _pick_key_case_insensitive(d: dict, candidates: list[str]):
-    if not isinstance(d, dict):
-        return None
-    lower_map = {str(k).lower(): k for k in d.keys()}
-    for c in candidates:
-        kc = lower_map.get(str(c).lower())
-        if kc is not None:
-            return kc
-    return None
-
-def _as_float(x):
-    try:
-        if x is None or (isinstance(x, str) and x.strip() == ""):
-            return 0.0
-        return float(x)
-    except Exception:
-        return 0.0
-
-def _as_str(x):
-    return "" if x is None else str(x).strip()
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def obtener_bajas_por_dia(fi: str, ff: str) -> pd.DataFrame:
     """
-    Consulta /informes/empleados día a día para detectar horas_baja > 0 o dias_baja > 0.
-    Devuelve DF con columnas:
-      Fecha, nif, horas_baja, dias_baja
+    Consulta /informes/empleados día a día:
+      - detecta horas_baja > 0
+      - guarda nif y num_empleado si existen (para poder enriquecer)
     """
     d0 = datetime.strptime(fi, "%Y-%m-%d").date()
     d1 = datetime.strptime(ff, "%Y-%m-%d").date()
@@ -763,31 +850,26 @@ def obtener_bajas_por_dia(fi: str, ff: str) -> pd.DataFrame:
         recs = _flatten_records(parsed)
 
         for r in recs:
-            # localizar claves posibles (según cómo venga)
             k_nif = _pick_key_case_insensitive(r, ["nif", "dni", "documento"])
+            k_num = _pick_key_case_insensitive(r, ["num_empleado", "numero_empleado", "empleado", "id_empleado", "id"])
             k_horas = _pick_key_case_insensitive(r, ["horas_baja", "horas baja", "horasbaja"])
-            k_dias = _pick_key_case_insensitive(r, ["dias_baja", "días_baja", "dias baja", "diasbaja"])
 
-            nif = _as_str(r.get(k_nif)) if k_nif else ""
+            nif = _as_str(r.get(k_nif)).upper() if k_nif else ""
+            num_emp = _as_str(r.get(k_num)) if k_num else ""
             horas_baja = _as_float(r.get(k_horas)) if k_horas else 0.0
-            dias_baja = _as_float(r.get(k_dias)) if k_dias else 0.0
 
-            if (horas_baja > 0) or (dias_baja > 0):
+            if horas_baja > 0:
                 rows.append(
-                    {
-                        "Fecha": day,
-                        "nif": nif.upper(),
-                        "horas_baja": horas_baja,
-                        "dias_baja": dias_baja,
-                    }
+                    {"Fecha": day, "nif": nif, "num_empleado": num_emp, "horas_baja": horas_baja}
                 )
 
         cur += timedelta(days=1)
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["Fecha", "nif", "horas_baja", "dias_baja"])
+        return pd.DataFrame(columns=["Fecha", "nif", "num_empleado", "horas_baja"])
     df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+    df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
     return df
 
 # ============================================================
@@ -853,7 +935,6 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
 
 # ============================================================
 # VALIDACIÓN HORAS/FICHAJES
-# - Beatriz: excesivos solo si > 4
 # ============================================================
 
 def validar_incidencia_horas_fichajes(r) -> list[str]:
@@ -904,20 +985,41 @@ st.title("📊 Fichajes CRECE Personas")
 
 hoy = date.today()
 
-# --- Cargamos datos base para filtros ANTES de consultar (sin perder resultados al cambiar)
+# --- Carga base (para filtros antes de consultar)
 departamentos_df = api_exportar_departamentos()
+empresas_map = api_exportar_empresas()
+sedes_map = api_exportar_sedes()
+
 empleados_df_base = api_exportar_empleados_completos()
+
 if not empleados_df_base.empty:
     empleados_df_base = empleados_df_base.merge(departamentos_df, on="departamento_id", how="left")
-    empleados_df_base["nif"] = empleados_df_base["nif"].astype(str).str.upper().str.strip()
-    empleados_df_base["Departamento"] = empleados_df_base.get("departamento_nombre")
-    # Asegurar columnas
-    if "Empresa" not in empleados_df_base.columns:
-        empleados_df_base["Empresa"] = ""
-    if "Sede" not in empleados_df_base.columns:
-        empleados_df_base["Sede"] = ""
 
-# --- Filtros previos
+    # traducir Empresa/Sede a nombres (si tenemos mappings)
+    if not empresas_map.empty:
+        empleados_df_base = empleados_df_base.merge(empresas_map, on="empresa_id", how="left")
+    else:
+        empleados_df_base["empresa_nombre"] = pd.NA
+
+    if not sedes_map.empty:
+        empleados_df_base = empleados_df_base.merge(sedes_map, on="sede_id", how="left")
+    else:
+        empleados_df_base["sede_nombre"] = pd.NA
+
+    # columnas finales SIEMPRE en nombre (fallback a id si no hay mapping)
+    empleados_df_base["Empresa"] = empleados_df_base["empresa_nombre"]
+    empleados_df_base.loc[empleados_df_base["Empresa"].isna() | (empleados_df_base["Empresa"].astype(str).str.strip() == ""), "Empresa"] = empleados_df_base["empresa_id"]
+
+    empleados_df_base["Sede"] = empleados_df_base["sede_nombre"]
+    empleados_df_base.loc[empleados_df_base["Sede"].isna() | (empleados_df_base["Sede"].astype(str).str.strip() == ""), "Sede"] = empleados_df_base["sede_id"]
+
+    # limpieza
+    empleados_df_base["nif"] = empleados_df_base["nif"].astype(str).str.upper().str.strip()
+    empleados_df_base["Empresa"] = empleados_df_base["Empresa"].astype(str).str.strip()
+    empleados_df_base["Sede"] = empleados_df_base["Sede"].astype(str).str.strip()
+    empleados_df_base["Departamento"] = empleados_df_base.get("departamento_nombre")
+
+# --- Inputs
 st.write("---")
 col1, col2 = st.columns(2)
 with col1:
@@ -940,7 +1042,7 @@ with f2:
 
 st.write("---")
 
-# Mantener resultados aunque cambies filtros después
+# Persistencia resultados
 if "ultimo_resultado" not in st.session_state:
     st.session_state.ultimo_resultado = None
 if "ultimo_bajas" not in st.session_state:
@@ -963,7 +1065,7 @@ if st.button("Consultar"):
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
 
-    # Filtrar empleados ANTES de consultar
+    # Filtrar empleados antes de consultar
     empleados_df = empleados_df_base.copy()
     if empresas_opts:
         empleados_df = empleados_df[empleados_df["Empresa"].isin(empresas_sel)]
@@ -1116,30 +1218,61 @@ if st.button("Consultar"):
 
         salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
 
-        # --- BAJAS: día a día (según tu requisito)
+        # --- BAJAS: día a día
         bajas_df = obtener_bajas_por_dia(fi, ff)
 
-        # Enriquecer bajas con datos del empleado (Nombre, Empresa, Sede, Departamento)
+        # Enriquecer bajas con datos del empleado:
+        #   1) merge por nif
+        #   2) para los que falten, merge por num_empleado
         if not bajas_df.empty:
-            base_min = empleados_df_base[["nif", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]].copy()
+            base_min = empleados_df_base[
+                ["nif", "num_empleado", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]
+            ].copy()
             base_min["nif"] = base_min["nif"].astype(str).str.upper().str.strip()
-            bajas_df = bajas_df.merge(base_min, on="nif", how="left")
-            bajas_df = bajas_df.rename(
+            base_min["num_empleado"] = base_min["num_empleado"].astype(str).str.strip()
+
+            # merge por nif
+            bx = bajas_df.merge(base_min, on="nif", how="left", suffixes=("", "_b"))
+
+            # los que no tengan nombre y sí tengan num_empleado, intentamos por num_empleado
+            mask_missing = bx["nombre_completo"].isna() | (bx["nombre_completo"].astype(str).str.strip() == "")
+            if mask_missing.any():
+                bx_missing = bx[mask_missing].copy()
+                bx_ok = bx[~mask_missing].copy()
+
+                # para evitar conflictos, quitamos columnas del merge anterior
+                cols_to_drop = ["nombre_completo", "Empresa", "Sede", "departamento_nombre", "num_empleado_b"]
+                for c in cols_to_drop:
+                    if c in bx_missing.columns:
+                        bx_missing = bx_missing.drop(columns=[c])
+
+                bx_missing = bx_missing.merge(
+                    base_min.rename(columns={"num_empleado": "num_empleado"}),
+                    on="num_empleado",
+                    how="left",
+                    suffixes=("", "_b2"),
+                )
+
+                bx = pd.concat([bx_ok, bx_missing], ignore_index=True)
+
+            bx = bx.rename(
                 columns={
                     "nombre_completo": "Nombre",
                     "departamento_nombre": "Departamento",
                 }
             )
-            bajas_df["Nombre"] = bajas_df["Nombre"].fillna("")
-            bajas_df["Empresa"] = bajas_df["Empresa"].fillna("")
-            bajas_df["Sede"] = bajas_df["Sede"].fillna("")
-            bajas_df["Departamento"] = bajas_df["Departamento"].fillna("")
-            bajas_df["Horas baja"] = bajas_df["horas_baja"].apply(lambda x: f"{x:.2f}".rstrip("0").rstrip("."))
-            bajas_df["Días baja"] = bajas_df["dias_baja"].apply(lambda x: f"{x:.2f}".rstrip("0").rstrip("."))
-            bajas_df = bajas_df[["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Horas baja", "Días baja"]]
+            bx["Nombre"] = bx["Nombre"].fillna("")
+            bx["Empresa"] = bx["Empresa"].fillna("")
+            bx["Sede"] = bx["Sede"].fillna("")
+            bx["Departamento"] = bx["Departamento"].fillna("")
+
+            # Horas baja (solo esta columna; quitamos días baja)
+            bx["Horas baja"] = bx["horas_baja"].apply(lambda x: f"{x:.2f}".rstrip("0").rstrip("."))
+
+            bajas_df = bx[["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Horas baja"]].copy()
             bajas_df = bajas_df.sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
-        # Guardar en session_state para que no se pierda al cambiar filtros
+        # guardar resultados
         st.session_state.ultimo_resultado = salida
         st.session_state.ultimo_bajas = bajas_df
         st.session_state.ultimo_rango = (fi, ff)
@@ -1157,7 +1290,6 @@ if salida is None:
 
 if salida.empty:
     st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
-    # Aunque no haya incidencias, sí podrían existir bajas; mostramos solo bajas si existen.
     if bajas_df is not None and not bajas_df.empty:
         for f_dia in bajas_df["Fecha"].unique():
             st.markdown(f"### 🏥 Bajas — {f_dia}")
@@ -1165,7 +1297,7 @@ if salida.empty:
             st.data_editor(subb, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
     st.stop()
 
-# Columns finales incidencias
+# Tabla incidencias (ya con nombres Empresa/Sede)
 salida = salida[
     [
         "Fecha",
@@ -1183,7 +1315,7 @@ salida = salida[
     ]
 ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
-# Pintado por día (incidencias + bajas del mismo día si las hay)
+# Pintado por día (incidencias + bajas)
 for f_dia in salida["Fecha"].unique():
     st.markdown(f"### 📅 {f_dia}")
 
