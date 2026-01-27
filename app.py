@@ -40,6 +40,9 @@ MAX_RETRIES = 4  # total intentos = 1 + MAX_RETRIES
 BACKOFF_BASE_SECONDS = 0.6  # base
 BACKOFF_MAX_SECONDS = 6.0   # techo
 
+# Para no saturar /informes/empleados cuando vamos día a día
+MAX_WORKERS_BAJAS_DIAS = 6
+
 _SESSION = requests.Session()
 _SESSION.headers.update(
     {
@@ -362,7 +365,6 @@ def _try_export_list(endpoint: str) -> list:
     """
     url = f"{API_URL_BASE}{endpoint}"
 
-    # 1) GET
     resp = safe_request("GET", url)
     if resp is not None and resp.status_code < 400:
         try:
@@ -374,7 +376,6 @@ def _try_export_list(endpoint: str) -> list:
         except Exception as e:
             _safe_fail(e)
 
-    # 2) POST
     resp = safe_request("POST", url)
     if resp is not None and resp.status_code < 400:
         try:
@@ -606,14 +607,10 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 # ============================================================
-# INFORME EMPLEADOS (BAJAS)
+# INFORME EMPLEADOS (BAJAS) - CORREGIDO: día a día
 # ============================================================
 
 def _parse_horas_baja(val) -> float:
-    """
-    Devuelve horas en decimal si puede, si no 0.0
-    Acepta: float/int, "HH:MM", "H.MM", None
-    """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0.0
     if isinstance(val, (int, float)):
@@ -631,15 +628,6 @@ def _parse_horas_baja(val) -> float:
         return max(0.0, float(s.replace(",", ".")))
     except Exception:
         return 0.0
-
-def _infer_fecha_from_record(rec: dict) -> str:
-    for k in ("fecha", "Fecha", "dia", "día", "date", "fecha_dia"):
-        if k in rec and rec.get(k):
-            try:
-                return pd.to_datetime(rec.get(k)).date().strftime("%Y-%m-%d")
-            except Exception:
-                pass
-    return ""
 
 def _infer_nif_from_record(rec: dict) -> str:
     for k in ("nif", "NIF", "dni", "DNI", "documento", "num_documento"):
@@ -662,40 +650,32 @@ def _infer_horas_baja(rec: dict) -> float:
             return _parse_horas_baja(rec.get(k))
     return 0.0
 
-@st.cache_data(show_spinner=False, ttl=600)
-def api_informe_empleados_bajas(fi: str, ff: str, nifs: list[str] | None = None) -> pd.DataFrame:
+def _call_informe_empleados_1dia(fecha: str, nifs: list[str]) -> list[dict]:
     """
-    Llama a /informes/empleados una sola vez.
-    Devuelve DataFrame con columnas: nif, Fecha, dias_baja, horas_baja
-    (y solo filas con baja > 0 se filtrarán después).
+    Llama a /informes/empleados para un solo día (desde=hasta=fecha).
+    Devuelve lista de dicts (por empleado) parseada/normalizada mínimamente.
     """
     url = f"{API_URL_BASE}/informes/empleados"
 
-    # Probamos formatos típicos (según manuales suelen variar)
-    payload_variants = []
+    # Intentamos variantes por compatibilidad
+    payload_variants = [
+        [("desde", fecha), ("hasta", fecha)],
+        [("fecha_desde", fecha), ("fecha_hasta", fecha)],
+        [("fecha_inicio", fecha), ("fecha_fin", fecha)],
+    ]
 
-    # Variante 1: fecha_inicio/fecha_fin
-    p1 = [("fecha_inicio", fi), ("fecha_fin", ff)]
-    if nifs:
-        for x in nifs:
-            if x:
-                p1.append(("nif[]", x))
-    payload_variants.append(p1)
+    # Añadimos nifs a cada payload si procede
+    out_rows = []
+    for base_payload in payload_variants:
+        payload = list(base_payload)
+        if nifs:
+            for x in nifs:
+                if x:
+                    payload.append(("nif[]", x))
 
-    # Variante 2: desde/hasta
-    p2 = [("desde", fi), ("hasta", ff)]
-    if nifs:
-        for x in nifs:
-            if x:
-                p2.append(("nif[]", x))
-    payload_variants.append(p2)
-
-    for payload in payload_variants:
         try:
             resp = safe_request("POST", url, data=payload)
-            if resp is None:
-                continue
-            if resp.status_code >= 400:
+            if resp is None or resp.status_code >= 400:
                 continue
 
             payload_b64 = _extract_payload_b64(resp)
@@ -705,56 +685,82 @@ def api_informe_empleados_bajas(fi: str, ff: str, nifs: list[str] | None = None)
             decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
             parsed = json.loads(decrypted)
 
-            rows = []
-
-            # Caso A: lista de registros (ideal)
+            # Caso A: lista de dicts por empleado
             if isinstance(parsed, list):
                 for rec in parsed:
-                    if not isinstance(rec, dict):
-                        continue
-                    nif = _infer_nif_from_record(rec)
-                    fecha = _infer_fecha_from_record(rec)
-                    dias = _infer_dias_baja(rec)
-                    horas = _infer_horas_baja(rec)
-                    if nif and fecha:
-                        rows.append({"nif": nif, "Fecha": fecha, "dias_baja": dias, "horas_baja": horas})
+                    if isinstance(rec, dict):
+                        out_rows.append(rec)
+                return out_rows
 
-            # Caso B: dict por empleado (nif -> info)
-            elif isinstance(parsed, dict):
+            # Caso B: dict por empleado
+            if isinstance(parsed, dict):
                 for _, v in parsed.items():
                     if isinstance(v, dict):
-                        nif = _infer_nif_from_record(v)
-                        fecha = _infer_fecha_from_record(v)
-                        dias = _infer_dias_baja(v)
-                        horas = _infer_horas_baja(v)
-                        if nif and fecha:
-                            rows.append({"nif": nif, "Fecha": fecha, "dias_baja": dias, "horas_baja": horas})
+                        out_rows.append(v)
                     elif isinstance(v, list):
                         for rec in v:
-                            if not isinstance(rec, dict):
-                                continue
-                            nif = _infer_nif_from_record(rec)
-                            fecha = _infer_fecha_from_record(rec)
-                            dias = _infer_dias_baja(rec)
-                            horas = _infer_horas_baja(rec)
-                            if nif and fecha:
-                                rows.append({"nif": nif, "Fecha": fecha, "dias_baja": dias, "horas_baja": horas})
-
-            df = pd.DataFrame(rows)
-            if df.empty:
-                return pd.DataFrame(columns=["nif", "Fecha", "dias_baja", "horas_baja"])
-
-            df["nif"] = df["nif"].astype(str).str.upper().str.strip()
-            df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.date.astype(str)
-            df["dias_baja"] = pd.to_numeric(df["dias_baja"], errors="coerce").fillna(0.0)
-            df["horas_baja"] = pd.to_numeric(df["horas_baja"], errors="coerce").fillna(0.0)
-            return df
+                            if isinstance(rec, dict):
+                                out_rows.append(rec)
+                return out_rows
 
         except Exception as e:
             _safe_fail(e)
             continue
 
-    return pd.DataFrame(columns=["nif", "Fecha", "dias_baja", "horas_baja"])
+    return []
+
+@st.cache_data(show_spinner=False, ttl=600)
+def api_informe_empleados_bajas_dia_a_dia(fi: str, ff: str, nifs_key: str) -> pd.DataFrame:
+    """
+    Cachea por (fi, ff, nifs_key). nifs_key es una string estable (p.ej. 'NIF1|NIF2|...').
+    """
+    nifs = [x for x in (nifs_key or "").split("|") if x.strip()]
+    d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+    d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+
+    # Ejecutar en paralelo por días (suave)
+    fechas = []
+    cur = d0
+    while cur <= d1:
+        fechas.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+
+    rows = []
+
+    def worker(f):
+        recs = _call_informe_empleados_1dia(f, nifs)
+        return f, recs
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_BAJAS_DIAS) as exe:
+        futs = [exe.submit(worker, f) for f in fechas]
+        for fut in as_completed(futs):
+            fecha, recs = fut.result()
+            for rec in (recs or []):
+                nif = _infer_nif_from_record(rec)
+                if not nif:
+                    continue
+                dias = _infer_dias_baja(rec)
+                horas = _infer_horas_baja(rec)
+                if (dias > 0.0) or (horas > 0.0):
+                    rows.append(
+                        {
+                            "nif": nif,
+                            "Fecha": fecha,
+                            "dias_baja": float(dias),
+                            "horas_baja": float(horas),
+                        }
+                    )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "Fecha", "dias_baja", "horas_baja"])
+
+    df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.date.astype(str)
+    df["dias_baja"] = pd.to_numeric(df["dias_baja"], errors="coerce").fillna(0.0)
+    df["horas_baja"] = pd.to_numeric(df["horas_baja"], errors="coerce").fillna(0.0)
+
+    return df
 
 # ============================================================
 # DÍA (turno nocturno)
@@ -969,7 +975,6 @@ if do_query:
         empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
         empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
 
-        # Normalizamos IDs como string para mapping/filtrado consistente
         if "empresa_id" not in empleados_df.columns:
             empleados_df["empresa_id"] = None
         if "sede_id" not in empleados_df.columns:
@@ -982,7 +987,7 @@ if do_query:
             lambda x: str(int(x)) if pd.notna(x) and str(x).strip().isdigit() else (str(x).strip() if pd.notna(x) else "")
         )
 
-        # Aplicar filtros previos (para consultar solo lo filtrado)
+        # Aplicar filtros previos (consultar solo lo filtrado)
         if pre_empresas:
             empleados_df = empleados_df[empleados_df["empresa_id"].isin(set(pre_empresas))].copy()
         if pre_sedes:
@@ -992,7 +997,6 @@ if do_query:
             st.info("No hay empleados que coincidan con Empresa/Sede seleccionadas.")
             st.stop()
 
-        # Mapear nombres empresa/sede (si hay catálogo); si no, cae al ID
         def _empresa_nombre(eid: str) -> str:
             s = (eid or "").strip()
             if not s:
@@ -1008,38 +1012,29 @@ if do_query:
         empleados_df["Empresa"] = empleados_df["empresa_id"].apply(_empresa_nombre)
         empleados_df["Sede"] = empleados_df["sede_id"].apply(_sede_nombre)
 
-        # ---- (NUEVO) Informe de empleados para bajas (una sola llamada) ----
+        # ---- BAJAS: CORREGIDO día a día ----
         nifs_filtrados = empleados_df["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-        bajas_raw = api_informe_empleados_bajas(fi, ff, nifs=nifs_filtrados)
+        nifs_key = "|".join(sorted(nifs_filtrados))
+        bajas_raw = api_informe_empleados_bajas_dia_a_dia(fi, ff, nifs_key=nifs_key)
 
         if bajas_raw.empty:
             bajas_base = pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"])
         else:
-            # Filtrar solo bajas reales
-            bajas_raw = bajas_raw[
-                (bajas_raw["dias_baja"] > 0.0) | (bajas_raw["horas_baja"] > 0.0)
-            ].copy()
+            emp_info = empleados_df[["nif", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]].copy()
+            emp_info = emp_info.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
 
-            if bajas_raw.empty:
-                bajas_base = pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"])
-            else:
-                # Enriquecer con info del empleado (nombre/empresa/sede/depto)
-                emp_info = empleados_df[["nif", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]].copy()
-                emp_info = emp_info.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
+            bajas_base = bajas_raw.merge(emp_info, on="nif", how="left")
+            bajas_base["Nombre"] = bajas_base["Nombre"].fillna(bajas_base["nif"])
+            bajas_base["Empresa"] = bajas_base["Empresa"].fillna("—")
+            bajas_base["Sede"] = bajas_base["Sede"].fillna("—")
+            bajas_base["Departamento"] = bajas_base["Departamento"].fillna("—")
 
-                bajas_base = bajas_raw.merge(emp_info, on="nif", how="left")
-                bajas_base["Nombre"] = bajas_base["Nombre"].fillna(bajas_base["nif"])
-                bajas_base["Empresa"] = bajas_base["Empresa"].fillna("—")
-                bajas_base["Sede"] = bajas_base["Sede"].fillna("—")
-                bajas_base["Departamento"] = bajas_base["Departamento"].fillna("—")
+            bajas_base["dias_baja"] = bajas_base["dias_baja"].astype(float).round(2)
+            bajas_base["horas_baja"] = bajas_base["horas_baja"].astype(float).round(2)
 
-                # Presentación amigable
-                bajas_base["dias_baja"] = bajas_base["dias_baja"].astype(float).round(2)
-                bajas_base["horas_baja"] = bajas_base["horas_baja"].astype(float).round(2)
-
-                bajas_base = bajas_base[
-                    ["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"]
-                ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
+            bajas_base = bajas_base[
+                ["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"]
+            ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
         st.session_state["bajas_base"] = bajas_base
 
@@ -1065,6 +1060,7 @@ if do_query:
                     )
 
         if not fichajes_rows:
+            # Guardamos vacío pero mantenemos bajas_base en sesión
             st.info("No se encontraron fichajes en el rango seleccionado.")
             st.session_state["salida_base"] = pd.DataFrame()
             st.session_state["salida_fi"] = fi
@@ -1213,22 +1209,32 @@ if do_query:
 # MOSTRAR RESULTADOS + FILTROS (SIN PERDER EL RESULTADO)
 # ============================================================
 salida_base = st.session_state.get("salida_base", None)
-bajas_base = st.session_state.get("bajas_base", pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"]))
+bajas_base = st.session_state.get(
+    "bajas_base",
+    pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"])
+)
 
 if salida_base is None:
     st.info("Selecciona fechas, filtra si quieres, y pulsa **Consultar**.")
     st.stop()
 
-if salida_base.empty:
-    st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
-    # OJO: aunque no haya incidencias, si quieres que se sigan viendo bajas, quita este stop
-    st.stop()
-
+# Aunque no haya incidencias, mantenemos la app viva para poder mostrar bajas si existen
 st.write("---")
 st.subheader("🧰 Filtros (sobre el resultado)")
 
-empresas_res = sorted(salida_base["Empresa"].fillna("—").astype(str).unique().tolist())
-sedes_res = sorted(salida_base["Sede"].fillna("—").astype(str).unique().tolist())
+# Construimos opciones desde lo disponible (incidencias o bajas)
+empresas_set = set()
+sedes_set = set()
+
+if salida_base is not None and not salida_base.empty:
+    empresas_set |= set(salida_base["Empresa"].fillna("—").astype(str).unique().tolist())
+    sedes_set |= set(salida_base["Sede"].fillna("—").astype(str).unique().tolist())
+if bajas_base is not None and not bajas_base.empty:
+    empresas_set |= set(bajas_base["Empresa"].fillna("—").astype(str).unique().tolist())
+    sedes_set |= set(bajas_base["Sede"].fillna("—").astype(str).unique().tolist())
+
+empresas_res = sorted(list(empresas_set)) if empresas_set else ["—"]
+sedes_res = sorted(list(sedes_set)) if sedes_set else ["—"]
 
 f1, f2 = st.columns(2)
 with f1:
@@ -1246,54 +1252,59 @@ with f2:
         key="sel_sedes_res",
     )
 
-# Filtrado de incidencias en pantalla (sin recalcular)
-salida = salida_base.copy()
-if sel_empresas_res:
-    salida = salida[salida["Empresa"].astype(str).isin(set(sel_empresas_res))].copy()
-else:
-    salida = salida.iloc[0:0].copy()
-
-if sel_sedes_res:
-    salida = salida[salida["Sede"].astype(str).isin(set(sel_sedes_res))].copy()
-else:
-    salida = salida.iloc[0:0].copy()
-
-# Filtrado de bajas con los mismos filtros (consistencia visual)
-bajas_show = bajas_base.copy()
-if not bajas_show.empty:
+def _apply_filters(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        return df_in
+    df_out = df_in.copy()
     if sel_empresas_res:
-        bajas_show = bajas_show[bajas_show["Empresa"].astype(str).isin(set(sel_empresas_res))].copy()
+        df_out = df_out[df_out["Empresa"].astype(str).isin(set(sel_empresas_res))].copy()
     else:
-        bajas_show = bajas_show.iloc[0:0].copy()
+        return df_out.iloc[0:0].copy()
 
     if sel_sedes_res:
-        bajas_show = bajas_show[bajas_show["Sede"].astype(str).isin(set(sel_sedes_res))].copy()
+        df_out = df_out[df_out["Sede"].astype(str).isin(set(sel_sedes_res))].copy()
     else:
-        bajas_show = bajas_show.iloc[0:0].copy()
+        return df_out.iloc[0:0].copy()
 
-if salida.empty:
+    return df_out
+
+salida = _apply_filters(salida_base) if salida_base is not None else pd.DataFrame()
+bajas_show = _apply_filters(bajas_base) if bajas_base is not None else pd.DataFrame()
+
+# Pintar por día: incidencias + tabla de bajas si aplica
+# Priorizamos días presentes en cualquiera de los dos (para que si solo hay bajas, se vea)
+dias = []
+if salida is not None and not salida.empty:
+    dias += list(salida["Fecha"].unique())
+if bajas_show is not None and not bajas_show.empty:
+    dias += list(bajas_show["Fecha"].unique())
+
+dias = sorted(set(dias))
+
+if not dias:
     st.info("No hay resultados con los filtros seleccionados.")
     st.stop()
 
-# Pintar por día: incidencias + (NUEVO) tabla de bajas si aplica
-for f_dia in salida["Fecha"].unique():
+for f_dia in dias:
     st.markdown(f"### 📅 {f_dia}")
 
-    sub = salida[salida["Fecha"] == f_dia]
-    st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+    sub = salida[salida["Fecha"] == f_dia] if (salida is not None and not salida.empty) else pd.DataFrame()
+    if sub is not None and not sub.empty:
+        st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+    else:
+        st.caption("Sin incidencias este día.")
 
-    # Tabla de bajas (solo si hay)
-    if bajas_show is not None and not bajas_show.empty:
-        sub_b = bajas_show[bajas_show["Fecha"] == f_dia]
-        if not sub_b.empty:
-            st.markdown("#### 🏥 Empleados de baja")
-            st.data_editor(
-                sub_b[["Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"]],
-                use_container_width=True,
-                hide_index=True,
-                disabled=True,
-                num_rows="fixed",
-            )
+    sub_b = bajas_show[bajas_show["Fecha"] == f_dia] if (bajas_show is not None and not bajas_show.empty) else pd.DataFrame()
+    if sub_b is not None and not sub_b.empty:
+        st.markdown("#### 🏥 Empleados de baja")
+        st.data_editor(
+            sub_b[["Empresa", "Sede", "Nombre", "Departamento", "dias_baja", "horas_baja"]],
+            use_container_width=True,
+            hide_index=True,
+            disabled=True,
+            num_rows="fixed",
+        )
 
-csv = salida.to_csv(index=False).encode("utf-8")
+# CSV: solo incidencias (como antes)
+csv = (salida if salida is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8")
 st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
