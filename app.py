@@ -130,13 +130,9 @@ N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
 # ============================================================
 
 def b64decode_any(s: str) -> bytes:
-    """
-    Decodifica base64 estándar o base64url, con/sin padding.
-    """
     if s is None:
         raise ValueError("b64decode_any: empty")
     s = str(s).strip()
-    # eliminar comillas externas si vienen
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1].strip()
 
@@ -161,14 +157,11 @@ def _looks_like_b64_any(s: str) -> bool:
 # ============================================================
 
 def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
-    """
-    payload_b64: base64/base64url de un JSON {"iv":"...","value":"..."}
-    """
     json_raw = b64decode_any(payload_b64).decode("utf-8", errors="strict")
     payload = json.loads(json_raw)
 
     iv = b64decode_any(payload["iv"])
-    ct = b64decode_any(payload["value"])
+    ct = b64decode_any(payload.get("value") or payload.get("ciphertext"))
     key = b64decode_any(app_key_b64)
 
     cipher = AES.new(key, AES.MODE_CBC, iv)
@@ -201,17 +194,8 @@ def _try_parse_json_text(txt: str):
         return None
 
 def _extract_possible_payload(resp: requests.Response):
-    """
-    Soporta:
-      - JSON plano list/dict
-      - dict {iv,value}
-      - wrapper dict con payload en data/payload/result/encrypted/content
-      - JSON-string que contiene base64url "eyJpdiI6..."
-      - body base64 directo
-    """
     raw_text = (resp.text or "").strip()
 
-    # 1) resp.json()
     try:
         parsed = resp.json()
 
@@ -234,7 +218,6 @@ def _extract_possible_payload(resp: requests.Response):
     except Exception:
         pass
 
-    # 2) JSON desde texto
     parsed_text = _try_parse_json_text(raw_text)
     if isinstance(parsed_text, str) and _looks_like_b64_any(parsed_text):
         return None, parsed_text.strip(), None, raw_text
@@ -253,7 +236,6 @@ def _extract_possible_payload(resp: requests.Response):
 
         return parsed_text, None, None, raw_text
 
-    # 3) base64 directo
     body = raw_text.strip().strip('"').strip("'").strip()
     if _looks_like_b64_any(body):
         return None, body, None, raw_text
@@ -512,10 +494,6 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 # ============================================================
 
 def _export_list_try(endpoint: str, *, method_prefer="GET"):
-    """
-    Intenta llamar al endpoint y devolver lista parseada descifrada.
-    Soporta respuesta cifrada tipo exportación CRECE.
-    """
     url = f"{API_URL_BASE}/{endpoint.lstrip('/')}"
     methods = ["GET", "POST"] if method_prefer == "GET" else ["POST", "GET"]
 
@@ -572,10 +550,6 @@ def _build_id_name_df(items, id_keys, name_keys, df_cols=("id", "nombre")) -> pd
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_empresas() -> pd.DataFrame:
-    """
-    Construye mapping empresa_id -> empresa_nombre probando endpoints habituales.
-    Si tu instancia usa otro endpoint, no rompe: devuelve DF vacío.
-    """
     candidates = [
         ("exportacion/empresas", "GET"),
         ("exportacion/empresa", "GET"),
@@ -585,15 +559,16 @@ def api_exportar_empresas() -> pd.DataFrame:
     for ep, pref in candidates:
         items = _export_list_try(ep, method_prefer=pref)
         if items:
-            return _build_id_name_df(items, id_keys=["id", "empresa_id", "cod", "codigo"], name_keys=["nombre", "name", "descripcion", "description"],
-                                     df_cols=("empresa_id", "empresa_nombre"))
+            return _build_id_name_df(
+                items,
+                id_keys=["id", "empresa_id", "cod", "codigo"],
+                name_keys=["nombre", "name", "descripcion", "description"],
+                df_cols=("empresa_id", "empresa_nombre"),
+            )
     return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_sedes() -> pd.DataFrame:
-    """
-    Construye mapping sede_id -> sede_nombre probando endpoints habituales.
-    """
     candidates = [
         ("exportacion/sedes", "GET"),
         ("exportacion/sede", "GET"),
@@ -604,12 +579,16 @@ def api_exportar_sedes() -> pd.DataFrame:
     for ep, pref in candidates:
         items = _export_list_try(ep, method_prefer=pref)
         if items:
-            return _build_id_name_df(items, id_keys=["id", "sede_id", "centro_id", "codigo", "cod"], name_keys=["nombre", "name", "descripcion", "description"],
-                                     df_cols=("sede_id", "sede_nombre"))
+            return _build_id_name_df(
+                items,
+                id_keys=["id", "sede_id", "centro_id", "codigo", "cod"],
+                name_keys=["nombre", "name", "descripcion", "description"],
+                df_cols=("sede_id", "sede_nombre"),
+            )
     return pd.DataFrame(columns=["sede_id", "sede_nombre"])
 
 # ============================================================
-# API EXPORTACIÓN: Departamentos / Empleados / Tipos / Fichajes / Tiempo
+# API EXPORTACIÓN
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -630,14 +609,6 @@ def api_exportar_departamentos() -> pd.DataFrame:
     )
 
 def api_exportar_empleados_completos() -> pd.DataFrame:
-    """
-    Devuelve empleados con:
-      - nif
-      - num_empleado (si existe)
-      - departamento_id
-      - empresa_id / sede_id (si existen)
-    Luego en UI se traducen a nombres con mappings.
-    """
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
@@ -663,7 +634,6 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
 
-        # claves frecuentes
         nif = e.get("nif")
         num_empleado = e.get("num_empleado") or e.get("numero_empleado") or e.get("empleado") or e.get("id_empleado") or e.get("id")
         empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa")
@@ -802,7 +772,7 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 # ============================================================
-# INFORMES: /informes/empleados (DESCIFRADO ROBUSTO)
+# INFORMES: /informes/empleados
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -834,11 +804,6 @@ def api_informes_empleados(fecha_desde: str, fecha_hasta: str):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def obtener_bajas_por_dia(fi: str, ff: str) -> pd.DataFrame:
-    """
-    Consulta /informes/empleados día a día:
-      - detecta horas_baja > 0
-      - guarda nif y num_empleado si existen (para poder enriquecer)
-    """
     d0 = datetime.strptime(fi, "%Y-%m-%d").date()
     d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
@@ -859,9 +824,7 @@ def obtener_bajas_por_dia(fi: str, ff: str) -> pd.DataFrame:
             horas_baja = _as_float(r.get(k_horas)) if k_horas else 0.0
 
             if horas_baja > 0:
-                rows.append(
-                    {"Fecha": day, "nif": nif, "num_empleado": num_emp, "horas_baja": horas_baja}
-                )
+                rows.append({"Fecha": day, "nif": nif, "num_empleado": num_emp, "horas_baja": horas_baja})
 
         cur += timedelta(days=1)
 
@@ -871,6 +834,66 @@ def obtener_bajas_por_dia(fi: str, ff: str) -> pd.DataFrame:
     df["nif"] = df["nif"].astype(str).str.upper().str.strip()
     df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
     return df
+
+# ============================================================
+# NUEVO: Empleados sin fichajes por día
+# ============================================================
+
+def construir_sin_fichajes_por_dia(fi: str, ff: str, empleados_filtrados: pd.DataFrame, df_fichajes: pd.DataFrame) -> pd.DataFrame:
+    """
+    empleados_filtrados: DF con columnas al menos [nif, nombre_completo, Empresa, Sede, departamento_nombre]
+    df_fichajes: DF con columna fecha_dia y nif (ya ajustada por turno nocturno)
+    """
+    if empleados_filtrados is None or empleados_filtrados.empty:
+        return pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento"])
+
+    empleados_base = empleados_filtrados[
+        ["nif", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]
+    ].copy()
+
+    empleados_base["nif"] = empleados_base["nif"].astype(str).str.upper().str.strip()
+
+    d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+    d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+
+    # nifs que han fichado por día
+    punched_by_day = {}
+    if df_fichajes is not None and not df_fichajes.empty and "fecha_dia" in df_fichajes.columns:
+        tmp = df_fichajes.dropna(subset=["nif", "fecha_dia"]).copy()
+        tmp["nif"] = tmp["nif"].astype(str).str.upper().str.strip()
+        tmp["fecha_dia"] = tmp["fecha_dia"].astype(str).str.strip()
+        punched_by_day = tmp.groupby("fecha_dia")["nif"].apply(lambda s: set(s.tolist())).to_dict()
+
+    rows = []
+    cur = d0
+    while cur <= d1:
+        day = cur.strftime("%Y-%m-%d")
+        punched_set = punched_by_day.get(day, set())
+
+        missing = empleados_base[~empleados_base["nif"].isin(punched_set)].copy()
+        if not missing.empty:
+            missing["Fecha"] = day
+            missing = missing.rename(
+                columns={
+                    "nombre_completo": "Nombre",
+                    "departamento_nombre": "Departamento",
+                }
+            )
+            missing["Nombre"] = missing["Nombre"].fillna("")
+            missing["Departamento"] = missing["Departamento"].fillna("")
+            missing["Empresa"] = missing["Empresa"].fillna("")
+            missing["Sede"] = missing["Sede"].fillna("")
+
+            rows.append(missing[["Fecha", "Empresa", "Sede", "Nombre", "Departamento"]])
+
+        cur += timedelta(days=1)
+
+    if not rows:
+        return pd.DataFrame(columns=["Fecha", "Empresa", "Sede", "Nombre", "Departamento"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
+    return out
 
 # ============================================================
 # DÍA (turno nocturno)
@@ -989,13 +1012,11 @@ hoy = date.today()
 departamentos_df = api_exportar_departamentos()
 empresas_map = api_exportar_empresas()
 sedes_map = api_exportar_sedes()
-
 empleados_df_base = api_exportar_empleados_completos()
 
 if not empleados_df_base.empty:
     empleados_df_base = empleados_df_base.merge(departamentos_df, on="departamento_id", how="left")
 
-    # traducir Empresa/Sede a nombres (si tenemos mappings)
     if not empresas_map.empty:
         empleados_df_base = empleados_df_base.merge(empresas_map, on="empresa_id", how="left")
     else:
@@ -1006,20 +1027,23 @@ if not empleados_df_base.empty:
     else:
         empleados_df_base["sede_nombre"] = pd.NA
 
-    # columnas finales SIEMPRE en nombre (fallback a id si no hay mapping)
     empleados_df_base["Empresa"] = empleados_df_base["empresa_nombre"]
-    empleados_df_base.loc[empleados_df_base["Empresa"].isna() | (empleados_df_base["Empresa"].astype(str).str.strip() == ""), "Empresa"] = empleados_df_base["empresa_id"]
+    empleados_df_base.loc[
+        empleados_df_base["Empresa"].isna() | (empleados_df_base["Empresa"].astype(str).str.strip() == ""),
+        "Empresa"
+    ] = empleados_df_base["empresa_id"]
 
     empleados_df_base["Sede"] = empleados_df_base["sede_nombre"]
-    empleados_df_base.loc[empleados_df_base["Sede"].isna() | (empleados_df_base["Sede"].astype(str).str.strip() == ""), "Sede"] = empleados_df_base["sede_id"]
+    empleados_df_base.loc[
+        empleados_df_base["Sede"].isna() | (empleados_df_base["Sede"].astype(str).str.strip() == ""),
+        "Sede"
+    ] = empleados_df_base["sede_id"]
 
-    # limpieza
     empleados_df_base["nif"] = empleados_df_base["nif"].astype(str).str.upper().str.strip()
     empleados_df_base["Empresa"] = empleados_df_base["Empresa"].astype(str).str.strip()
     empleados_df_base["Sede"] = empleados_df_base["Sede"].astype(str).str.strip()
     empleados_df_base["Departamento"] = empleados_df_base.get("departamento_nombre")
 
-# --- Inputs
 st.write("---")
 col1, col2 = st.columns(2)
 with col1:
@@ -1047,6 +1071,8 @@ if "ultimo_resultado" not in st.session_state:
     st.session_state.ultimo_resultado = None
 if "ultimo_bajas" not in st.session_state:
     st.session_state.ultimo_bajas = None
+if "ultimo_sin_fichajes" not in st.session_state:
+    st.session_state.ultimo_sin_fichajes = None
 if "ultimo_rango" not in st.session_state:
     st.session_state.ultimo_rango = None
 
@@ -1099,131 +1125,29 @@ if st.button("Consultar"):
                         }
                     )
 
-        if not fichajes_rows:
-            st.info("No se encontraron fichajes en el rango seleccionado.")
-            st.session_state.ultimo_resultado = None
-            st.session_state.ultimo_bajas = None
-            st.session_state.ultimo_rango = (fi, ff)
-            st.stop()
-
-        df = pd.DataFrame(fichajes_rows)
-        df["nif"] = df["nif"].astype(str).str.upper().str.strip()
-        df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
-        df = df.dropna(subset=["fecha_dt"])
-
-        def _dia_row(r):
-            props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
-            return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
-
-        df["fecha_dia"] = df.apply(_dia_row, axis=1)
-
-        df["Numero"] = df.groupby(["nif", "fecha_dia"])["id"].transform("count")
-        conteo = (
-            df.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede", "fecha_dia"], as_index=False)
-            .agg(Numero=("Numero", "max"))
-            .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
+        # DF fichajes base (aunque esté vacío) para construir "sin fichajes"
+        df_fich = pd.DataFrame(fichajes_rows) if fichajes_rows else pd.DataFrame(
+            columns=["nif", "Nombre", "Departamento", "Empresa", "Sede", "id", "tipo", "direccion", "fecha"]
         )
 
-        neto = calcular_tiempos_neto(df, tipos_map)
-        resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
-        resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
-        resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
+        if not df_fich.empty:
+            df_fich["nif"] = df_fich["nif"].astype(str).str.upper().str.strip()
+            df_fich["fecha_dt"] = pd.to_datetime(df_fich["fecha"], errors="coerce")
+            df_fich = df_fich.dropna(subset=["fecha_dt"])
 
-        io = calcular_primera_ultima(df)
-        resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
-        resumen["Primera entrada"] = resumen["primera_entrada_dt"].apply(ts_to_hhmm)
-        resumen["Última salida"] = resumen["ultima_salida_dt"].apply(ts_to_hhmm)
+            def _dia_row(r):
+                props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
+                return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
 
-        nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+            df_fich["fecha_dia"] = df_fich.apply(_dia_row, axis=1)
 
-        tc_rows = []
-        d0 = datetime.strptime(fi, "%Y-%m-%d").date()
-        d1 = datetime.strptime(ff, "%Y-%m-%d").date()
-
-        cur = d0
-        while cur <= d1:
-            desde = cur.strftime("%Y-%m-%d")
-
-            df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
-            if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
-                hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
-                df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
-
-            if not df_tc.empty:
-                df_tc["Fecha"] = desde
-                tc_rows.append(df_tc)
-
-            cur += timedelta(days=1)
-
-        if tc_rows:
-            tc = pd.concat(tc_rows, ignore_index=True)
-            tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
-            tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
-        else:
-            tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
-
-        resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
-        resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
-
-        resumen["Diferencia"] = resumen.apply(
-            lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
-            axis=1
-        )
-
-        resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
-        resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
-
-        resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
-        mask_tc = resumen["Tiempo Contabilizado"].astype(str).str.strip().ne("")
-        resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
-
-        resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
-
-        def _max_ok(r):
-            sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
-            if sp and "max_fichajes_ok" in sp:
-                return sp["max_fichajes_ok"]
-            return pd.NA
-
-        resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
-
-        resumen[["min_horas", "min_fichajes"]] = resumen.apply(
-            lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
-            axis=1,
-        )
-
-        def build_incidencia(r) -> str:
-            motivos = []
-
-            if int(r.get("dia", 0)) in [5, 6]:
-                worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
-                    int(r.get("Numero de fichajes", 0) or 0) > 0
-                )
-                if worked:
-                    motivos.append("Trabajo en fin de semana")
-                return "; ".join(motivos)
-
-            motivos += validar_incidencia_horas_fichajes(r)
-            motivos += validar_horario(
-                r.get("Departamento"),
-                r.get("Nombre"),
-                int(r.get("dia", 0)),
-                r.get("Primera entrada", ""),
-                r.get("Última salida", ""),
-            )
-
-            return "; ".join(motivos)
-
-        resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
-
-        salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
+        # --- NUEVO: construir sin fichajes por día (con df_fich ya ajustado)
+        sin_fichajes_df = construir_sin_fichajes_por_dia(fi, ff, empleados_df, df_fich)
 
         # --- BAJAS: día a día
         bajas_df = obtener_bajas_por_dia(fi, ff)
 
-        # Enriquecer bajas con datos del empleado:
-        #   1) merge por nif
-        #   2) para los que falten, merge por num_empleado
+        # Enriquecer bajas con datos del empleado
         if not bajas_df.empty:
             base_min = empleados_df_base[
                 ["nif", "num_empleado", "nombre_completo", "Empresa", "Sede", "departamento_nombre"]
@@ -1231,16 +1155,12 @@ if st.button("Consultar"):
             base_min["nif"] = base_min["nif"].astype(str).str.upper().str.strip()
             base_min["num_empleado"] = base_min["num_empleado"].astype(str).str.strip()
 
-            # merge por nif
             bx = bajas_df.merge(base_min, on="nif", how="left", suffixes=("", "_b"))
-
-            # los que no tengan nombre y sí tengan num_empleado, intentamos por num_empleado
             mask_missing = bx["nombre_completo"].isna() | (bx["nombre_completo"].astype(str).str.strip() == "")
             if mask_missing.any():
                 bx_missing = bx[mask_missing].copy()
                 bx_ok = bx[~mask_missing].copy()
 
-                # para evitar conflictos, quitamos columnas del merge anterior
                 cols_to_drop = ["nombre_completo", "Empresa", "Sede", "departamento_nombre", "num_empleado_b"]
                 for c in cols_to_drop:
                     if c in bx_missing.columns:
@@ -1255,26 +1175,129 @@ if st.button("Consultar"):
 
                 bx = pd.concat([bx_ok, bx_missing], ignore_index=True)
 
-            bx = bx.rename(
-                columns={
-                    "nombre_completo": "Nombre",
-                    "departamento_nombre": "Departamento",
-                }
-            )
+            bx = bx.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
             bx["Nombre"] = bx["Nombre"].fillna("")
             bx["Empresa"] = bx["Empresa"].fillna("")
             bx["Sede"] = bx["Sede"].fillna("")
             bx["Departamento"] = bx["Departamento"].fillna("")
-
-            # Horas baja (solo esta columna; quitamos días baja)
             bx["Horas baja"] = bx["horas_baja"].apply(lambda x: f"{x:.2f}".rstrip("0").rstrip("."))
 
             bajas_df = bx[["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Horas baja"]].copy()
             bajas_df = bajas_df.sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
-        # guardar resultados
+        # --- Incidencias (si no hay fichajes, salida vacía pero NO paramos)
+        if df_fich.empty:
+            salida = pd.DataFrame(columns=[
+                "Fecha", "Empresa", "Sede", "Nombre", "Departamento",
+                "Primera entrada", "Última salida", "Total trabajado",
+                "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
+            ])
+        else:
+            df_fich["Numero"] = df_fich.groupby(["nif", "fecha_dia"])["id"].transform("count")
+            conteo = (
+                df_fich.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede", "fecha_dia"], as_index=False)
+                .agg(Numero=("Numero", "max"))
+                .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
+            )
+
+            neto = calcular_tiempos_neto(df_fich, tipos_map)
+            resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
+            resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
+            resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
+
+            io = calcular_primera_ultima(df_fich)
+            resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
+            resumen["Primera entrada"] = resumen["primera_entrada_dt"].apply(ts_to_hhmm)
+            resumen["Última salida"] = resumen["ultima_salida_dt"].apply(ts_to_hhmm)
+
+            nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+
+            tc_rows = []
+            d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+            d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+
+            cur = d0
+            while cur <= d1:
+                desde = cur.strftime("%Y-%m-%d")
+
+                df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
+                if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+                    hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+                    df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
+
+                if not df_tc.empty:
+                    df_tc["Fecha"] = desde
+                    tc_rows.append(df_tc)
+
+                cur += timedelta(days=1)
+
+            if tc_rows:
+                tc = pd.concat(tc_rows, ignore_index=True)
+                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+                tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
+            else:
+                tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
+
+            resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
+            resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
+
+            resumen["Diferencia"] = resumen.apply(
+                lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
+                axis=1
+            )
+
+            resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+            resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
+
+            resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
+            mask_tc = resumen["Tiempo Contabilizado"].astype(str).str.strip().ne("")
+            resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
+
+            resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
+
+            def _max_ok(r):
+                sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
+                if sp and "max_fichajes_ok" in sp:
+                    return sp["max_fichajes_ok"]
+                return pd.NA
+
+            resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
+
+            resumen[["min_horas", "min_fichajes"]] = resumen.apply(
+                lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
+                axis=1,
+            )
+
+            def build_incidencia(r) -> str:
+                motivos = []
+
+                if int(r.get("dia", 0)) in [5, 6]:
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                        int(r.get("Numero de fichajes", 0) or 0) > 0
+                    )
+                    if worked:
+                        motivos.append("Trabajo en fin de semana")
+                    return "; ".join(motivos)
+
+                motivos += validar_incidencia_horas_fichajes(r)
+                motivos += validar_horario(
+                    r.get("Departamento"),
+                    r.get("Nombre"),
+                    int(r.get("dia", 0)),
+                    r.get("Primera entrada", ""),
+                    r.get("Última salida", ""),
+                )
+
+                return "; ".join(motivos)
+
+            resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
+
+            salida = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
+
+        # Guardar resultados
         st.session_state.ultimo_resultado = salida
         st.session_state.ultimo_bajas = bajas_df
+        st.session_state.ultimo_sin_fichajes = sin_fichajes_df
         st.session_state.ultimo_rango = (fi, ff)
 
 # ============================================================
@@ -1283,50 +1306,70 @@ if st.button("Consultar"):
 
 salida = st.session_state.ultimo_resultado
 bajas_df = st.session_state.ultimo_bajas
+sin_fichajes_df = st.session_state.ultimo_sin_fichajes
+rango = st.session_state.ultimo_rango
 
-if salida is None:
+if rango is None:
     st.info("Selecciona rango y filtros y pulsa **Consultar**.")
     st.stop()
 
-if salida.empty:
+fi, ff = rango
+
+# Preparar lista de días para render
+d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+dias = []
+cur = d0
+while cur <= d1:
+    dias.append(cur.strftime("%Y-%m-%d"))
+    cur += timedelta(days=1)
+
+# Tabla incidencias (si hay)
+if salida is None or salida.empty:
     st.success("🎉 No hay incidencias ni trabajos en fin de semana en el rango seleccionado.")
-    if bajas_df is not None and not bajas_df.empty:
-        for f_dia in bajas_df["Fecha"].unique():
-            st.markdown(f"### 🏥 Bajas — {f_dia}")
-            subb = bajas_df[bajas_df["Fecha"] == f_dia].copy()
-            st.data_editor(subb, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
-    st.stop()
+else:
+    salida = salida[
+        [
+            "Fecha",
+            "Empresa",
+            "Sede",
+            "Nombre",
+            "Departamento",
+            "Primera entrada",
+            "Última salida",
+            "Total trabajado",
+            "Tiempo Contabilizado",
+            "Diferencia",
+            "Numero de fichajes",
+            "Incidencia",
+        ]
+    ].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
 
-# Tabla incidencias (ya con nombres Empresa/Sede)
-salida = salida[
-    [
-        "Fecha",
-        "Empresa",
-        "Sede",
-        "Nombre",
-        "Departamento",
-        "Primera entrada",
-        "Última salida",
-        "Total trabajado",
-        "Tiempo Contabilizado",
-        "Diferencia",
-        "Numero de fichajes",
-        "Incidencia",
-    ]
-].sort_values(["Fecha", "Empresa", "Sede", "Nombre"], kind="mergesort")
-
-# Pintado por día (incidencias + bajas)
-for f_dia in salida["Fecha"].unique():
+# Render por día: Incidencias + Bajas + Sin fichajes
+for f_dia in dias:
     st.markdown(f"### 📅 {f_dia}")
 
-    sub = salida[salida["Fecha"] == f_dia].copy()
-    st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+    if salida is not None and not salida.empty:
+        sub = salida[salida["Fecha"] == f_dia].copy()
+        if not sub.empty:
+            st.data_editor(sub, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        else:
+            st.caption("Sin incidencias este día.")
 
+    # Bajas
     if bajas_df is not None and not bajas_df.empty:
         subb = bajas_df[bajas_df["Fecha"] == f_dia].copy()
         if not subb.empty:
             st.markdown(f"#### 🏥 Empleados de baja — {f_dia}")
             st.data_editor(subb, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
-csv = salida.to_csv(index=False).encode("utf-8")
+    # Sin fichajes
+    if sin_fichajes_df is not None and not sin_fichajes_df.empty:
+        subnf = sin_fichajes_df[sin_fichajes_df["Fecha"] == f_dia].copy()
+        if not subnf.empty:
+            st.markdown(f"#### 🚫 Empleados sin fichajes — {f_dia}")
+            st.data_editor(subnf, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+
+# CSV (solo incidencias, como antes)
+csv = (salida if salida is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8")
 st.download_button("⬇ Descargar CSV", csv, "fichajes_incidencias.csv", "text/csv")
