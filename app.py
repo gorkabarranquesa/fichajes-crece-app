@@ -105,6 +105,142 @@ def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_
     return None
 
 # ============================================================
+# DEBUG / INSPECCIÓN SEGURA: /informes/empleados (DESCIFRADO)
+# ============================================================
+
+def api_informes_empleados_raw(fecha_desde: str, fecha_hasta: str):
+    """
+    Llama a /informes/empleados con JSON body.
+    Devuelve el objeto ya descifrado (list/dict/lo que sea) o None.
+    """
+    url = f"{API_URL_BASE}/informes/empleados"
+
+    # IMPORTANTE: body JSON como pide el usuario
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+
+    try:
+        # La API a veces espera form-data; pero tú has indicado JSON body.
+        # Forzamos JSON usando requests directamente para no tocar safe_request.
+        # Aun así, mantenemos verify=True y headers de sesión.
+        resp = _SESSION.post(url, json=body, timeout=HTTP_TIMEOUT, verify=True)
+        if resp is None:
+            return None
+        resp.raise_for_status()
+
+        payload_b64 = _extract_payload_b64(resp)
+        if not payload_b64:
+            return None
+
+        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+        return json.loads(decrypted)
+
+    except Exception as e:
+        _safe_fail(e)
+        return None
+
+
+def _flatten_records(parsed):
+    """
+    Normaliza lo que venga (list/dict/otros) a lista de dicts por empleado.
+    """
+    if parsed is None:
+        return []
+
+    if isinstance(parsed, list):
+        return [x for x in parsed if isinstance(x, dict)]
+
+    if isinstance(parsed, dict):
+        out = []
+        for _, v in parsed.items():
+            if isinstance(v, dict):
+                out.append(v)
+            elif isinstance(v, list):
+                out.extend([x for x in v if isinstance(x, dict)])
+        return out
+
+    return []
+
+
+def _guess_leave_keys(records: list[dict]) -> list[str]:
+    """
+    Devuelve candidatos de claves relacionadas con baja/ausencia.
+    """
+    if not records:
+        return []
+
+    candidates = set()
+    key_words = ["baja", "ausen", "it", "incap", "leave", "sick", "absence"]
+    for r in records:
+        for k in r.keys():
+            ks = str(k).lower()
+            if any(w in ks for w in key_words):
+                candidates.add(k)
+    return sorted(candidates)
+
+
+def _safe_preview_records(records: list[dict], max_rows=3):
+    """
+    Muestra solo unas filas y recorta valores largos para no volcar PII en exceso.
+    """
+    def _short(v):
+        s = str(v)
+        if len(s) > 80:
+            return s[:80] + "…"
+        return s
+
+    preview = []
+    for r in records[:max_rows]:
+        preview.append({k: _short(v) for k, v in r.items()})
+    return preview
+
+
+# ============================================================
+# UI: Panel de inspección (opcional)
+# ============================================================
+
+with st.expander("🧪 Inspeccionar /informes/empleados (descifrado)", expanded=False):
+    st.caption("Esto hace una llamada REAL con tus secretos (token+key) y te enseña la estructura/keys. "
+               "No imprime tokens ni payloads cifrados.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        dbg_desde = st.text_input("fecha_desde (YYYY-MM-DD)", value="2026-01-01")
+    with c2:
+        dbg_hasta = st.text_input("fecha_hasta (YYYY-MM-DD)", value="2026-12-31")
+
+    show_preview = st.checkbox("Mostrar vista previa de 3 registros (recortada)", value=False)
+
+    if st.button("Ejecutar inspección /informes/empleados"):
+        parsed = api_informes_empleados_raw(dbg_desde, dbg_hasta)
+
+        if parsed is None:
+            st.error("No se pudo obtener/descifrar el informe (revisa endpoint, token, key o formato body).")
+        else:
+            st.success(f"Respuesta descifrada OK. Tipo: {type(parsed).__name__}")
+
+            records = _flatten_records(parsed)
+            st.write(f"Registros (dict por empleado) detectados: {len(records)}")
+
+            # Keys globales
+            all_keys = set()
+            for r in records:
+                all_keys |= set(r.keys())
+            all_keys = sorted(all_keys)
+
+            st.write("Claves detectadas (union):")
+            st.code("\n".join(all_keys) if all_keys else "(sin claves)")
+
+            # Sugerir keys de bajas
+            leave_keys = _guess_leave_keys(records)
+            st.write("Candidatos de campos relacionados con baja/ausencia:")
+            st.code("\n".join(leave_keys) if leave_keys else "(no se detectaron por nombre)")
+
+            if show_preview:
+                st.write("Vista previa (recortada):")
+                st.json(_safe_preview_records(records, max_rows=3))
+
+
+# ============================================================
 # NORMALIZACIÓN NOMBRES
 # ============================================================
 
