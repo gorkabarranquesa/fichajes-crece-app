@@ -105,50 +105,136 @@ def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_
     return None
 
 # ============================================================
-# DEBUG / INSPECCIÓN SEGURA: /informes/empleados (DESCIFRADO)
+# DEBUG / INSPECCIÓN SEGURA: /informes/empleados (ROBUSTO)
 # ============================================================
+
+def _try_parse_json_text(txt: str):
+    txt = (txt or "").strip()
+    if not txt:
+        return None
+    # A veces viene envuelto en comillas
+    if (txt.startswith('"') and txt.endswith('"')) or (txt.startswith("'") and txt.endswith("'")):
+        txt = txt[1:-1].strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        return None
+
+def _looks_like_b64(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    # muy básico: base64 suele ser largo y con A-Z a-z 0-9 + / =
+    if len(s) < 40:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    return all(c in allowed for c in s)
+
+def _extract_possible_payload(resp: requests.Response):
+    """
+    Devuelve:
+      - parsed_json (si resp ya es json plano)
+      - payload_b64 (si detecta base64 directo o embebido)
+      - raw_text (si no)
+    """
+    raw_text = (resp.text or "").strip()
+
+    # 1) Si el server responde JSON plano
+    try:
+        parsed = resp.json()
+        if isinstance(parsed, (list, dict)):
+            # Puede ser JSON plano o un wrapper con payload base64 dentro
+            if isinstance(parsed, dict):
+                for k in ["data", "payload", "result", "value", "encrypted", "content"]:
+                    v = parsed.get(k)
+                    if isinstance(v, str) and _looks_like_b64(v):
+                        return None, v.strip(), raw_text
+            return parsed, None, raw_text
+    except Exception:
+        pass
+
+    # 2) Si el body es JSON en texto (sin header correcto)
+    parsed_text = _try_parse_json_text(raw_text)
+    if isinstance(parsed_text, (list, dict)):
+        if isinstance(parsed_text, dict):
+            for k in ["data", "payload", "result", "value", "encrypted", "content"]:
+                v = parsed_text.get(k)
+                if isinstance(v, str) and _looks_like_b64(v):
+                    return None, v.strip(), raw_text
+        return parsed_text, None, raw_text
+
+    # 3) Si el body parece base64 directo (típico exportación)
+    payload_b64 = (raw_text or "").strip().strip('"').strip("'").strip()
+    if _looks_like_b64(payload_b64):
+        return None, payload_b64, raw_text
+
+    return None, None, raw_text
 
 def api_informes_empleados_raw(fecha_desde: str, fecha_hasta: str):
     """
-    Llama a /informes/empleados con JSON body.
-    Devuelve el objeto ya descifrado (list/dict/lo que sea) o None.
+    Llama a /informes/empleados probando JSON y form-data.
+    Devuelve el objeto final (list/dict) ya listo (descifrado si aplica).
     """
     url = f"{API_URL_BASE}/informes/empleados"
 
-    # IMPORTANTE: body JSON como pide el usuario
-    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+    # Probamos combinaciones habituales
+    attempts = [
+        ("json", {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}),
+        ("data", {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}),
+        ("json", {"fecha_inicio": fecha_desde, "fecha_fin": fecha_hasta}),
+        ("data", {"fecha_inicio": fecha_desde, "fecha_fin": fecha_hasta}),
+    ]
 
-    try:
-        # La API a veces espera form-data; pero tú has indicado JSON body.
-        # Forzamos JSON usando requests directamente para no tocar safe_request.
-        # Aun así, mantenemos verify=True y headers de sesión.
-        resp = _SESSION.post(url, json=body, timeout=HTTP_TIMEOUT, verify=True)
-        if resp is None:
-            return None
-        resp.raise_for_status()
+    last_error = None
 
-        payload_b64 = _extract_payload_b64(resp)
-        if not payload_b64:
-            return None
+    for mode, body in attempts:
+        try:
+            if mode == "json":
+                resp = _SESSION.post(url, json=body, timeout=HTTP_TIMEOUT, verify=True)
+            else:
+                resp = _SESSION.post(url, data=body, timeout=HTTP_TIMEOUT, verify=True)
 
-        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        return json.loads(decrypted)
+            if resp is None:
+                continue
 
-    except Exception as e:
-        _safe_fail(e)
-        return None
+            # Si hay error HTTP, saltamos a siguiente intento
+            if resp.status_code >= 400:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+
+            parsed_json, payload_b64, raw_text = _extract_possible_payload(resp)
+
+            # Caso A: JSON plano ya usable
+            if isinstance(parsed_json, (list, dict)):
+                return parsed_json
+
+            # Caso B: viene cifrado base64
+            if payload_b64:
+                try:
+                    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                    return json.loads(decrypted)
+                except Exception as e:
+                    last_error = f"Decrypt/JSON error: {type(e).__name__}"
+                    continue
+
+            # Caso C: respuesta rara (no json, no b64)
+            last_error = f"Unrecognized response (len={len(raw_text)})"
+            continue
+
+        except Exception as e:
+            _safe_fail(e)
+            last_error = f"{type(e).__name__}"
+            continue
+
+    _safe_fail(Exception(f"api_informes_empleados_raw failed: {last_error}"))
+    return None
 
 
 def _flatten_records(parsed):
-    """
-    Normaliza lo que venga (list/dict/otros) a lista de dicts por empleado.
-    """
     if parsed is None:
         return []
-
     if isinstance(parsed, list):
         return [x for x in parsed if isinstance(x, dict)]
-
     if isinstance(parsed, dict):
         out = []
         for _, v in parsed.items():
@@ -157,19 +243,13 @@ def _flatten_records(parsed):
             elif isinstance(v, list):
                 out.extend([x for x in v if isinstance(x, dict)])
         return out
-
     return []
 
-
-def _guess_leave_keys(records: list[dict]) -> list[str]:
-    """
-    Devuelve candidatos de claves relacionadas con baja/ausencia.
-    """
+def _guess_leave_keys(records):
     if not records:
         return []
-
     candidates = set()
-    key_words = ["baja", "ausen", "it", "incap", "leave", "sick", "absence"]
+    key_words = ["baja", "ausen", "it", "incap", "leave", "sick", "absence", "horas"]
     for r in records:
         for k in r.keys():
             ks = str(k).lower()
@@ -177,21 +257,60 @@ def _guess_leave_keys(records: list[dict]) -> list[str]:
                 candidates.add(k)
     return sorted(candidates)
 
-
-def _safe_preview_records(records: list[dict], max_rows=3):
-    """
-    Muestra solo unas filas y recorta valores largos para no volcar PII en exceso.
-    """
+def _safe_preview_records(records, max_rows=3):
     def _short(v):
         s = str(v)
         if len(s) > 80:
             return s[:80] + "…"
         return s
+    return [{k: _short(v) for k, v in r.items()} for r in records[:max_rows]]
 
-    preview = []
-    for r in records[:max_rows]:
-        preview.append({k: _short(v) for k, v in r.items()})
-    return preview
+
+# ============================================================
+# UI: Panel de inspección (opcional)
+# ============================================================
+
+with st.expander("🧪 Inspeccionar /informes/empleados (descifrado)", expanded=False):
+    st.caption(
+        "Prueba JSON y form-data; y detecta si la respuesta viene cifrada base64 o como JSON plano. "
+        "No imprime tokens ni payloads sensibles."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        dbg_desde = st.text_input("fecha_desde (YYYY-MM-DD)", value="2026-01-01")
+    with c2:
+        dbg_hasta = st.text_input("fecha_hasta (YYYY-MM-DD)", value="2026-12-31")
+
+    show_preview = st.checkbox("Mostrar vista previa de 3 registros (recortada)", value=False)
+
+    if st.button("Ejecutar inspección /informes/empleados"):
+        parsed = api_informes_empleados_raw(dbg_desde, dbg_hasta)
+
+        if parsed is None:
+            st.error("No se pudo obtener/interpretar el informe. (Endpoint OK pero formato no reconocido o decrypt falló).")
+        else:
+            st.success(f"OK. Tipo descifrado/parseado: {type(parsed).__name__}")
+
+            records = _flatten_records(parsed)
+            st.write(f"Registros (dict por empleado) detectados: {len(records)}")
+
+            all_keys = set()
+            for r in records:
+                all_keys |= set(r.keys())
+            all_keys = sorted(all_keys)
+
+            st.write("Claves detectadas (unión):")
+            st.code("\n".join(all_keys) if all_keys else "(sin claves)")
+
+            leave_keys = _guess_leave_keys(records)
+            st.write("Candidatos de campos relacionados con baja/ausencia:")
+            st.code("\n".join(leave_keys) if leave_keys else "(no se detectaron por nombre)")
+
+            if show_preview:
+                st.write("Vista previa (recortada):")
+                st.json(_safe_preview_records(records, max_rows=3))
+
 
 
 # ============================================================
