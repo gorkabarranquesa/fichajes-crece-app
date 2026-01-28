@@ -259,8 +259,8 @@ def hhmm_to_min_clock(hhmm: str):
 N_DAVID = norm_name("David Rodriguez Vazquez")
 N_DEBORA = norm_name("Debora Luis Soto")
 N_ETOR = norm_name("Etor Alegria Reparaz")
-N_FRAN = norm_name("Fran Diaz Arozarena")
-N_MIRIAM = norm_name("Miriam Martín Muñoz")
+N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
+N_MIRIAM = norm_name("Miriam Martin Muñoz")
 N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
 
 SPECIAL_RULES_PREFIX = [
