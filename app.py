@@ -410,7 +410,7 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
 
     umbral_inferior = float(min_h) - TOLERANCIA_HORAS
     if horas_val < umbral_inferior:
-        motivos.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
+        motivos.append(f"Horas insuficientes (mín {min_h}h)")
 
     if num_fich < int(min_f):
         motivos.append(f"Fichajes insuficientes (mín {min_f})")
