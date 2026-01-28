@@ -892,7 +892,7 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
 # ============================================================
 
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
-st.title("📊 Fichajes CRECE Personas")
+# st.title("📊 Fichajes CRECE Personas")
 
 with st.spinner("Cargando catálogos…"):
     departamentos_df = api_exportar_departamentos()
@@ -949,7 +949,7 @@ with col2:
     fecha_fin = st.date_input("Fecha fin", value=hoy, max_value=hoy)
 
 st.write("---")
-st.subheader("🔎 Filtros")
+# st.subheader("🔎 Filtros")
 f1, f2 = st.columns(2)
 
 empresas_opts = [x for x in ALLOWED_EMPRESAS if _norm_key(x) in set(empleados_df["Empresa_norm"].unique())]
@@ -1292,7 +1292,7 @@ if st.session_state["last_sig"] != current_sig:
     st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs(["📌 Fichajes (Incidencias)", "🏥 Bajas", "⛔ Sin fichajes"])
+tab1, tab2, tab3 = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"])
 
 with tab1:
     incid = st.session_state.get("result_incidencias", {}) or {}
