@@ -1,18 +1,10 @@
-# app.py — Fichajes CRECE Personas (seguro + optimizado + tabs)
-# ✅ Fixes incluidos:
-#  - Exclusión de “Sin fichajes” por CÓDIGO DE EMPLEADO (num_empleado) y/o por nombre (no por NIF)
-#  - Redondeo consistente (a minuto) en Total trabajado / Tiempo Contabilizado + Diferencia con tolerancia 1 minuto (evita +00:01)
-#  - Limpieza de código “colado” al inicio (variables sueltas que podían romper la app)
-#  - Mantiene filtros por Empresa/Sede, tabs (Fichajes | Bajas | Sin fichajes), seguridad y rendimiento
-
 import base64
 import json
 import multiprocessing
 import random
-import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -32,63 +24,16 @@ CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
-# Tolerancia RRHH (±5 min) aplicada al mínimo de horas (para "insuficientes")
 TOLERANCIA_MINUTOS = 5
 TOLERANCIA_HORAS = TOLERANCIA_MINUTOS / 60.0
-
-# Margen horario SOLO para MOI y ESTRUCTURA (entrada temprana y salida temprana)
 MARGEN_HORARIO_MIN = 5
 
-# Identificación fija del cliente (trazabilidad)
 USER_AGENT = "RRHH-Fichajes-Crece/1.0 (Streamlit)"
 
-# Backoff/retry seguro
 RETRY_STATUS = {429, 502, 503, 504}
-MAX_RETRIES = 4  # total intentos = 1 + MAX_RETRIES
-BACKOFF_BASE_SECONDS = 0.6  # base
-BACKOFF_MAX_SECONDS = 6.0   # techo
-
-# Redondeo / tolerancias
-ROUND_TO_MINUTE = True
-DIF_TOL_MINUTES = 1  # si la diferencia absoluta es <= 1 min, mostramos "" (equivale a 0)
-
-# ============================================================
-# FILTROS NEGOCIO (empresas/sedes permitidas)
-# ============================================================
-
-EMPRESAS_PERMITIDAS = [
-    "Barranquesa Tower Flanges, S.L.",
-    "Barranquesa Anchor Cages, S.L.",
-    "Industrial Barranquesa S.A.",
-]
-
-SEDES_PERMITIDAS = [
-    "P0 IBSA",
-    "P1 LAKUNTZA",
-    "P2 COMARCA II",
-    "P3 UHARTE",
-]
-
-# ============================================================
-# EXCLUSIONES "SIN FICHAJES" (por CODIGO EMPLEADO y/o por NOMBRE)
-#  - OJO: los códigos (0000000139, etc.) NO son NIF, son num_empleado.
-# ============================================================
-
-EXCLUDE_SIN_FICHAJES_NUM_EMPLEADO = {
-    "0000000139",  # Mikel Arzallus Marco
-    "0000000012",  # Jose Angel Ochagavia Satrustegui
-    "0000000010",  # Benito Mendinueta Andueza
-}
-
-EXCLUDE_SIN_FICHAJES_NOMBRES = {
-    "MIKEL ARZALLUS MARCO",
-    "JOSE ANGEL OCHAGAVIA SATRUSTEGUI",
-    "BENITO MENDINUETA ANDUEZA",
-}
-
-# ============================================================
-# SESSION
-# ============================================================
+MAX_RETRIES = 4
+BACKOFF_BASE_SECONDS = 0.6
+BACKOFF_MAX_SECONDS = 6.0
 
 _SESSION = requests.Session()
 _SESSION.headers.update(
@@ -100,23 +45,26 @@ _SESSION.headers.update(
 )
 
 # ============================================================
-# SEGURIDAD: no loguear detalles (PII, tokens, payloads)
+# EXCLUSIONES RRHH (Sin fichajes)
 # ============================================================
+
+EXCLUDE_SIN_FICHAJES_NIFS = {
+    "0000000139",  # Mikel Arzallus Marco
+    "0000000012",  # Jose Angel Ochagavia Satrustegui
+    "0000000010",  # Benito Mendinueta Andueza
+}
+
 
 def _safe_fail(_exc: Exception) -> None:
     return None
 
-# ============================================================
-# SAFE REQUEST: centraliza peticiones + verify=True + retries
-# ============================================================
 
-def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_TIMEOUT):
+def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT):
     method = (method or "").upper().strip()
     if method not in {"GET", "POST"}:
         return None
 
     last_exc = None
-
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = _SESSION.request(
@@ -124,6 +72,7 @@ def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_
                 url,
                 data=data,
                 params=params,
+                json=json_body,
                 timeout=timeout,
                 verify=True,
             )
@@ -151,8 +100,9 @@ def safe_request(method: str, url: str, *, data=None, params=None, timeout=HTTP_
     _safe_fail(last_exc if last_exc else Exception("Unknown request error"))
     return None
 
+
 # ============================================================
-# NORMALIZACIÓN NOMBRES
+# NORMALIZACIÓN
 # ============================================================
 
 def norm_name(s: str) -> str:
@@ -160,8 +110,35 @@ def norm_name(s: str) -> str:
         return ""
     return " ".join(str(s).upper().strip().split())
 
+
 def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
     return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
+
+
+def _norm_key(s: str) -> str:
+    return " ".join((s or "").strip().upper().split())
+
+
+# ============================================================
+# RESTRICCIONES (solo estas empresas y sedes)
+# ============================================================
+
+ALLOWED_EMPRESAS = [
+    "Barranquesa Tower Flanges, S.L.",
+    "Barranquesa Anchor Cages, S.L.",
+    "Industrial Barranquesa S.A.",
+]
+
+ALLOWED_SEDES = [
+    "P0 IBSA",
+    "P1 LAKUNTZA",
+    "P2 COMARCA II",
+    "P3 UHARTE",
+]
+
+ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
+ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
+
 
 # ============================================================
 # DESCIFRADO CRECE (AES-CBC)
@@ -179,36 +156,83 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
     decrypted = unpad(cipher.decrypt(ct), AES.block_size)
     return decrypted.decode("utf-8")
 
-def _extract_payload_b64(resp: requests.Response) -> str:
-    return (resp.text or "").strip().strip('"').strip()
+
+def _try_parse_encrypted_response(resp: requests.Response):
+    if resp is None:
+        return None
+
+    raw_text = (resp.text or "").strip()
+    candidates = []
+
+    try:
+        candidates.append(resp.json())
+    except Exception:
+        pass
+
+    candidates.append(raw_text)
+
+    for c in candidates:
+        try:
+            if isinstance(c, dict) and "iv" in c and "value" in c:
+                payload_obj = {"iv": c["iv"], "value": c["value"]}
+                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
+                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                return json.loads(dec)
+
+            if isinstance(c, str):
+                s = c.strip().strip('"').strip()
+
+                if s.startswith("{") and s.endswith("}"):
+                    obj = json.loads(s)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
+                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                        return json.loads(dec)
+
+                try:
+                    dec_json_raw = base64.b64decode(s).decode("utf-8")
+                    obj = json.loads(dec_json_raw)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        dec = decrypt_crece_payload(s, APP_KEY_B64)
+                        return json.loads(dec)
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+    return None
+
 
 # ============================================================
-# TIEMPOS (redondeo consistente)
+# TIEMPOS (con redondeo consistente)
 # ============================================================
+
+def _round_seconds_to_minute(seg: float) -> int:
+    """
+    Redondeo consistente al minuto más cercano (para evitar +00:01 por desajustes).
+    """
+    if seg is None or (isinstance(seg, float) and pd.isna(seg)):
+        return 0
+    try:
+        s = float(seg)
+    except Exception:
+        return 0
+    if s < 0:
+        s = 0.0
+    return int(round(s / 60.0)) * 60
+
 
 def segundos_a_hhmm(seg: float) -> str:
     """
-    Redondeo consistente:
-      - Si ROUND_TO_MINUTE=True: redondea a minuto (>=30s sube)
-      - Si False: trunca a minuto (floor)
+    Convierte segundos a HH:MM usando el MISMO redondeo en toda la app.
     """
-    if seg is None or pd.isna(seg):
-        return ""
-    try:
-        seg_f = float(seg)
-    except Exception:
-        return ""
-    if seg_f < 0:
-        seg_f = 0.0
-
-    if ROUND_TO_MINUTE:
-        total_min = int((seg_f + 30) // 60)  # redondeo al minuto
-    else:
-        total_min = int(seg_f) // 60         # truncado al minuto
-
+    seg_i = _round_seconds_to_minute(seg)
+    total_min = seg_i // 60
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
+
 
 def hhmm_to_min(hhmm: str) -> int:
     if not isinstance(hhmm, str) or ":" not in hhmm:
@@ -219,14 +243,12 @@ def hhmm_to_min(hhmm: str) -> int:
     except Exception:
         return 0
 
+
 def hhmm_to_dec(hhmm: str) -> float:
     return hhmm_to_min(hhmm) / 60.0
 
+
 def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
-    """
-    Diferencia = Tiempo Contabilizado - Total trabajado (en minutos)
-    Si abs(diff) <= DIF_TOL_MINUTES, devuelve "" (evita +00:01 / -00:01).
-    """
     tc_hhmm = (tc_hhmm or "").strip()
     tt_hhmm = (tt_hhmm or "").strip()
     if not tc_hhmm or not tt_hhmm:
@@ -235,15 +257,17 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     tc_min = hhmm_to_min(tc_hhmm)
     tt_min = hhmm_to_min(tt_hhmm)
 
-    diff = tc_min - tt_min
-    if abs(diff) <= DIF_TOL_MINUTES:
+    if tc_min == tt_min:
         return ""
 
+    diff = tc_min - tt_min
     sign = "+" if diff > 0 else "-"
     diff = abs(diff)
+
     h = diff // 60
     m = diff % 60
     return f"{sign}{h:02d}:{m:02d}"
+
 
 def ts_to_hhmm(ts):
     if ts is None or pd.isna(ts):
@@ -252,6 +276,7 @@ def ts_to_hhmm(ts):
         return pd.to_datetime(ts).strftime("%H:%M")
     except Exception:
         return ""
+
 
 def hhmm_to_min_clock(hhmm: str):
     if not isinstance(hhmm, str) or ":" not in hhmm:
@@ -262,21 +287,17 @@ def hhmm_to_min_clock(hhmm: str):
     except Exception:
         return None
 
+
 # ============================================================
-# NOMBRES (tal cual CRECE)
+# REGLAS ESPECIALES (las tuyas)
 # ============================================================
 
 N_DAVID = norm_name("David Rodriguez Vazquez")
 N_DEBORA = norm_name("Debora Luis Soto")
 N_ETOR = norm_name("Etor Alegria Reparaz")
-N_FRAN = norm_name("Fran Diaz Arozarena")
-N_MIRIAM = norm_name("Miriam Martín Muñoz")
+N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
+N_MIRIAM = norm_name("Miriam Martin Muñoz")
 N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
-
-# ============================================================
-# REGLAS ESPECIALES RRHH (mínimos)
-# + Beatriz (ESTRUCTURA) con umbral excesivos especial
-# ============================================================
 
 SPECIAL_RULES_PREFIX = [
     ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
@@ -296,11 +317,13 @@ FLEX_BY_DEPTO = {
     "MOI": [N_DEBORA, N_ETOR],
 }
 
+
 def _lookup_special(depto_norm: str, nombre_norm: str):
     for d, pref, rules in SPECIAL_RULES_PREFIX:
         if depto_norm == d and name_startswith(nombre_norm, pref):
             return rules
     return None
+
 
 def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
     for d, pref in SCHEDULE_EXEMPT_PREFIX:
@@ -308,15 +331,13 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
             return True
     return False
 
+
 def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
     for pref in FLEX_BY_DEPTO.get(depto_norm, []):
         if name_startswith(nombre_norm, pref):
             return True
     return False
 
-# ============================================================
-# REGLAS BASE DE JORNADA
-# ============================================================
 
 def calcular_minimos(depto: str, dia: int, nombre: str):
     depto_norm = (depto or "").upper().strip()
@@ -325,15 +346,15 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     min_h, min_f = None, None
 
     if depto_norm in ["ESTRUCTURA", "MOI"]:
-        if dia in [0, 1, 2, 3]:       # L-J
+        if dia in [0, 1, 2, 3]:
             min_h, min_f = 8.5, 4
-        elif dia == 4:                # V
+        elif dia == 4:
             min_h, min_f = 6.5, 2
         else:
             min_h, min_f = None, None
 
     elif depto_norm == "MOD":
-        if dia in [0, 1, 2, 3, 4]:    # L-V
+        if dia in [0, 1, 2, 3, 4]:
             min_h, min_f = 8.0, 2
         else:
             min_h, min_f = None, None
@@ -347,9 +368,6 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
     return min_h, min_f
 
-# ============================================================
-# VALIDACIÓN HORARIA (MOI/ESTRUCTURA + MOD por turnos)
-# ============================================================
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
     depto_norm = (depto or "").upper().strip()
@@ -413,45 +431,50 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
     return incid
 
+
+def validar_incidencia_horas_fichajes(r) -> list[str]:
+    min_h = r.get("min_horas")
+    min_f = r.get("min_fichajes")
+    if pd.isna(min_h) or pd.isna(min_f):
+        return []
+
+    try:
+        num_fich = int(r.get("Numero de fichajes", 0) or 0)
+    except Exception:
+        num_fich = 0
+
+    try:
+        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
+    except Exception:
+        horas_val = 0.0
+
+    motivos = []
+
+    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
+    if horas_val < umbral_inferior:
+        motivos.append(f"Horas insuficientes (mín {min_h}h)")
+
+    if num_fich < int(min_f):
+        motivos.append(f"Fichajes insuficientes (mín {min_f})")
+
+    max_ok = r.get("max_fichajes_ok")
+    if pd.notna(max_ok):
+        try:
+            max_ok_i = int(max_ok)
+        except Exception:
+            max_ok_i = None
+        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
+            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
+    else:
+        if horas_val >= umbral_inferior and num_fich > int(min_f):
+            motivos.append(f"Fichajes excesivos (mín {min_f})")
+
+    return motivos
+
+
 # ============================================================
-# API EXPORTACIÓN (Empresas / Sedes / Departamentos / Empleados)
+# API EXPORTACIÓN / INFORMES
 # ============================================================
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def api_exportar_empresas() -> pd.DataFrame:
-    url = f"{API_URL_BASE}/exportacion/empresas"
-    resp = safe_request("GET", url)
-    if resp is None:
-        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
-    resp.raise_for_status()
-
-    payload_b64 = _extract_payload_b64(resp)
-    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-    data = json.loads(decrypted)
-
-    rows = []
-    for x in (data or []):
-        rows.append({"empresa_id": x.get("id"), "empresa_nombre": x.get("nombre")})
-    df = pd.DataFrame(rows)
-    return df
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def api_exportar_sedes() -> pd.DataFrame:
-    url = f"{API_URL_BASE}/exportacion/sedes"
-    resp = safe_request("GET", url)
-    if resp is None:
-        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
-    resp.raise_for_status()
-
-    payload_b64 = _extract_payload_b64(resp)
-    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-    data = json.loads(decrypted)
-
-    rows = []
-    for x in (data or []):
-        rows.append({"sede_id": x.get("id"), "sede_nombre": x.get("nombre")})
-    df = pd.DataFrame(rows)
-    return df
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_departamentos() -> pd.DataFrame:
@@ -460,27 +483,65 @@ def api_exportar_departamentos() -> pd.DataFrame:
     if resp is None:
         return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     resp.raise_for_status()
-
-    payload_b64 = _extract_payload_b64(resp)
-    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-    departamentos = json.loads(decrypted)
-
+    data = _try_parse_encrypted_response(resp)
+    if not isinstance(data, list):
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     return pd.DataFrame(
         [{"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")}
-         for d in (departamentos or [])]
+         for d in (data or [])]
     )
 
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_empresas() -> pd.DataFrame:
+    url = f"{API_URL_BASE}/exportacion/empresas"
+    resp = safe_request("GET", url)
+    if resp is None:
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    try:
+        resp.raise_for_status()
+    except Exception:
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    data = _try_parse_encrypted_response(resp)
+    if not isinstance(data, list):
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    return pd.DataFrame(
+        [{"empresa_id": e.get("id"), "empresa_nombre": e.get("nombre")}
+         for e in (data or [])]
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_sedes() -> pd.DataFrame:
+    url1 = f"{API_URL_BASE}/exportacion/sedes"
+    resp = safe_request("GET", url1)
+    if resp is not None and resp.status_code == 200:
+        data = _try_parse_encrypted_response(resp)
+        if isinstance(data, list):
+            return pd.DataFrame(
+                [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+                 for s in (data or [])]
+            )
+
+    url2 = f"{API_URL_BASE}/exportacion/centros"
+    resp2 = safe_request("GET", url2)
+    if resp2 is None:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+    try:
+        resp2.raise_for_status()
+    except Exception:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+
+    data2 = _try_parse_encrypted_response(resp2)
+    if not isinstance(data2, list):
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+    return pd.DataFrame(
+        [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+         for s in (data2 or [])]
+    )
+
+
 def api_exportar_empleados_completos() -> pd.DataFrame:
-    """
-    Incluye:
-      - nif
-      - nombre_completo
-      - departamento_id
-      - empresa_id
-      - sede_id
-      - num_empleado (código empleado)  ✅ necesario para exclusiones de sin fichajes
-      - estado/contrato (si existe)
-    """
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
@@ -489,11 +550,13 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
     resp.raise_for_status()
 
-    payload_b64 = _extract_payload_b64(resp)
-    decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-    empleados = json.loads(decrypted)
+    data_dec = _try_parse_encrypted_response(resp)
+    if not isinstance(data_dec, list):
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
 
+    empleados = data_dec
     lista = []
+
     for e in (empleados or []):
         nombre = e.get("name") or e.get("nombre") or ""
         primer_apellido = e.get("primer_apellido") or ""
@@ -506,25 +569,34 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
 
-        # num_empleado / codigo
-        num_emp = e.get("num_empleado") or e.get("numero_empleado") or e.get("codigo_empleado") or e.get("employee_number") or ""
+        empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa") or e.get("company_id")
+        sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
+        num_empleado = e.get("num_empleado") or e.get("employee_number") or e.get("id_empleado") or e.get("id")
 
-        lista.append(
-            {
-                "nif": e.get("nif"),
-                "nombre_completo": nombre_completo,
-                "departamento_id": e.get("departamento"),
-                "empresa_id": e.get("empresa") or e.get("empresa_id"),
-                "sede_id": e.get("sede") or e.get("sede_id"),
-                "num_empleado": str(num_emp).strip(),
-                # campos opcionales, por si CRECE los entrega
-                "estado": e.get("estado"),
-                "fecha_baja": e.get("fecha_baja"),
-                "motivo_baja": e.get("motivo_baja"),
-                "contrato": e.get("contrato"),
-                "fecha_alta": e.get("fecha_alta"),
-            }
-        )
+        row = {
+            "nif": e.get("nif"),
+            "nombre_completo": nombre_completo,
+            "departamento_id": e.get("departamento"),
+            "empresa_id": empresa_id,
+            "sede_id": sede_id,
+            "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
+        }
+
+        for k in [
+            "deleted_at",
+            "activo",
+            "estado",
+            "situacion",
+            "fecha_baja",
+            "fecha_fin_contrato",
+            "fin_contrato",
+            "contrato_activo",
+            "en_activo",
+        ]:
+            if k in e:
+                row[k] = e.get(k)
+
+        lista.append(row)
 
     df = pd.DataFrame(lista)
     if not df.empty:
@@ -532,9 +604,6 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
     return df
 
-# ============================================================
-# API: Tipos fichaje / Fichajes / Tiempo trabajado
-# ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_tipos_fichaje() -> dict:
@@ -545,24 +614,24 @@ def api_exportar_tipos_fichaje() -> dict:
             return {}
         resp.raise_for_status()
 
-        payload_b64 = _extract_payload_b64(resp)
-        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        tipos = json.loads(decrypted)
+        data_dec = _try_parse_encrypted_response(resp)
+        if not isinstance(data_dec, list):
+            return {}
 
         out = {}
-        if isinstance(tipos, list):
-            for t in tipos:
-                tid = t.get("id")
-                if tid is None:
-                    continue
-                out[int(tid)] = {
-                    "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
-                    "turno_nocturno": int(t.get("turno_nocturno") or 0),
-                }
+        for t in data_dec:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            out[int(tid)] = {
+                "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
+                "turno_nocturno": int(t.get("turno_nocturno") or 0),
+            }
         return out
     except Exception as e:
         _safe_fail(e)
         return {}
+
 
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
     url = f"{API_URL_BASE}/exportacion/fichajes"
@@ -574,16 +643,12 @@ def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
             return []
         resp.raise_for_status()
 
-        payload_b64 = _extract_payload_b64(resp)
-        if not payload_b64:
-            return []
-
-        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        out = json.loads(decrypted)
-        return out if isinstance(out, list) else []
+        data_dec = _try_parse_encrypted_response(resp)
+        return data_dec if isinstance(data_dec, list) else []
     except Exception as e:
         _safe_fail(e)
         return []
+
 
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     filas = []
@@ -621,6 +686,7 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     df["nif"] = df["nif"].astype(str).str.upper().str.strip()
     return df
 
+
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
@@ -637,71 +703,116 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
             return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
         resp.raise_for_status()
 
-        payload_b64 = _extract_payload_b64(resp)
-        if not payload_b64:
+        data_dec = _try_parse_encrypted_response(resp)
+        if data_dec is None:
             return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
-        decrypted = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-        parsed = json.loads(decrypted)
-        return _parse_tiempo_trabajado_payload(parsed)
+        return _parse_tiempo_trabajado_payload(data_dec)
 
     except Exception as e:
         _safe_fail(e)
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
-# ============================================================
-# API: Informes empleados (bajas) — /informes/empleados
-# ============================================================
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """
-    Endpoint: /informes/empleados
-    Devuelve (según entorno) un JSON plano o un base64 de un JSON con {iv,value}.
-    """
     url = f"{API_URL_BASE}/informes/empleados"
-    body_json = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-
-    # Intento 1: JSON body
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
     try:
-        resp = _SESSION.post(url, json=body_json, timeout=HTTP_TIMEOUT, verify=True)
-    except Exception:
-        resp = None
-
-    # Si falla, intento 2: form-data (data)
-    if resp is None or resp.status_code >= 400:
-        try:
-            resp = safe_request("POST", url, data=body_json)
-        except Exception:
-            resp = None
-
-    if resp is None:
-        return None
-
-    try:
+        resp = safe_request("POST", url, json_body=body)
+        if resp is None:
+            return None
         resp.raise_for_status()
-    except Exception:
+        return _try_parse_encrypted_response(resp)
+    except Exception as e:
+        _safe_fail(e)
         return None
 
-    raw = (resp.text or "").strip().strip('"').strip()
-    if not raw:
-        return None
-
-    # 1) Si es JSON plano
-    try:
-        parsed = resp.json()
-        return parsed
-    except Exception:
-        pass
-
-    # 2) Si es base64 con envolvente {iv,value}
-    try:
-        decrypted = decrypt_crece_payload(raw, APP_KEY_B64)
-        return json.loads(decrypted)
-    except Exception:
-        return None
 
 # ============================================================
-# DÍA (turno nocturno)
+# HELPERS BAJAS (ROBUSTO)
+# ============================================================
+
+def _to_float_any(x) -> float:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return 0.0
+    try:
+        if isinstance(x, str):
+            s = x.strip().replace(",", ".")
+            return float(s) if s else 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _extract_rows_from_informe(rep):
+    if rep is None:
+        return []
+
+    if isinstance(rep, list):
+        return [r for r in rep if isinstance(r, dict)]
+
+    if isinstance(rep, dict):
+        for k in ["data", "empleados", "results", "resultado", "items"]:
+            v = rep.get(k)
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+
+        vals = list(rep.values())
+        if vals and all(isinstance(v, dict) for v in vals):
+            return vals
+
+    return []
+
+
+def _get_horas_baja_from_row(row: dict) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+
+    candidates = [
+        "horas_baja",
+        "horasBaja",
+        "horas_de_baja",
+        "horas_baja_total",
+        "total_horas_baja",
+        "horas_baja_dia",
+        "horas_baja_diarias",
+        "horas_baja_hoy",
+        "horas_baja_parte",
+    ]
+    for c in candidates:
+        if c in row:
+            return _to_float_any(row.get(c))
+
+    for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
+        v = row.get(k)
+        if isinstance(v, dict):
+            for c in candidates:
+                if c in v:
+                    return _to_float_any(v.get(c))
+            if "horas" in v:
+                return _to_float_any(v.get("horas"))
+        elif isinstance(v, list):
+            best = 0.0
+            for it in v:
+                if isinstance(it, dict):
+                    h = _get_horas_baja_from_row(it)
+                    if h > best:
+                        best = h
+            if best > 0:
+                return best
+
+    return 0.0
+
+
+def _pick_key(df: pd.DataFrame, names: list[str]):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+# ============================================================
+# DÍA (turno nocturno) + tiempos netos
 # ============================================================
 
 def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
@@ -709,9 +820,6 @@ def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
         return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
     return fecha_dt.date().strftime("%Y-%m-%d")
 
-# ============================================================
-# TIEMPO POR FICHAJES (neto)
-# ============================================================
 
 def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
     rows_out = []
@@ -735,7 +843,8 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                 if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
-                        delta_i = int(delta)
+                        # Redondeo al segundo más cercano antes de acumular
+                        delta_i = int(round(delta))
                         props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
                             descontados += delta_i
@@ -749,6 +858,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
 
     return pd.DataFrame(rows_out)
 
+
 def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["nif", "Fecha", "primera_entrada_dt", "ultima_salida_dt"])
@@ -761,121 +871,126 @@ def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
 
     return entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
 
-# ============================================================
-# VALIDACIÓN HORAS/FICHAJES
-# - Beatriz: excesivos solo si > 4
-# ============================================================
-
-def validar_incidencia_horas_fichajes(r) -> list[str]:
-    min_h = r.get("min_horas")
-    min_f = r.get("min_fichajes")
-    if pd.isna(min_h) or pd.isna(min_f):
-        return []
-
-    try:
-        num_fich = int(r.get("Numero de fichajes", 0) or 0)
-    except Exception:
-        num_fich = 0
-
-    try:
-        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
-    except Exception:
-        horas_val = 0.0
-
-    motivos = []
-
-    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
-    if horas_val < umbral_inferior:
-        motivos.append(f"Horas insuficientes (mín {min_h}h, tol {TOLERANCIA_MINUTOS}m)")
-
-    if num_fich < int(min_f):
-        motivos.append(f"Fichajes insuficientes (mín {min_f})")
-
-    max_ok = r.get("max_fichajes_ok")
-    if pd.notna(max_ok):
-        try:
-            max_ok_i = int(max_ok)
-        except Exception:
-            max_ok_i = None
-        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
-            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
-    else:
-        if horas_val >= umbral_inferior and num_fich > int(min_f):
-            motivos.append(f"Fichajes excesivos (mín {min_f})")
-
-    return motivos
 
 # ============================================================
-# Helpers filtros Empresa/Sede (prioridad empresa)
+# FILTRO "ACTIVO / CONTRATO" (robusto)
 # ============================================================
 
-def _safe_str(x):
-    return "" if x is None else str(x)
-
-def _iter_days(d0: date, d1: date):
-    cur = d0
-    while cur <= d1:
-        yield cur
-        cur += timedelta(days=1)
-
-def _sig(fi: str, ff: str, empresas: list[str], sedes: list[str]) -> str:
-    e = ",".join(sorted(empresas or []))
-    s = ",".join(sorted(sedes or []))
-    return f"{fi}|{ff}|{e}|{s}"
-
-def _mask_digit_snippet(s: str) -> str:
+def _parse_date_any(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = str(x).strip()
     if not s:
-        return ""
-    # enmascara dígitos (no mostrar PII)
-    return re.sub(r"\d", "•", s)[:140]
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s, errors="coerce").date()
+    except Exception:
+        return None
 
-# ============================================================
-# Determinar empleado ACTIVO / CONTRATO (para "Sin fichajes")
-# ============================================================
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
-    """
-    Heurística defensiva:
-      - si existe columna 'estado' y contiene 'activo' => True
-      - si existe 'fecha_baja' no vacía => False
-      - si existe 'contrato' no vacío => True
-    En caso de duda => True (para no ocultar empleados por error)
-    """
-    if df_emp is None or df_emp.empty:
+    if df_emp.empty:
         return pd.Series([], dtype=bool)
 
-    out = pd.Series([True] * len(df_emp), index=df_emp.index, dtype=bool)
+    if "deleted_at" in df_emp.columns:
+        deleted = df_emp["deleted_at"].notna() & df_emp["deleted_at"].astype(str).str.strip().ne("") & df_emp["deleted_at"].astype(str).str.lower().ne("null")
+    else:
+        deleted = pd.Series([False] * len(df_emp))
+
+    flags_true = pd.Series([False] * len(df_emp))
+    for col in ["activo", "en_activo", "contrato_activo"]:
+        if col in df_emp.columns:
+            s = df_emp[col]
+            flags_true = flags_true | s.astype(str).str.strip().str.lower().isin(["1", "true", "t", "si", "sí", "yes", "y"])
+
+    estado_ok = pd.Series([False] * len(df_emp))
+    for col in ["estado", "situacion"]:
+        if col in df_emp.columns:
+            s = df_emp[col].astype(str).str.strip().str.upper()
+            estado_ok = estado_ok | s.isin(["ACTIVO", "ALTA", "EN ALTA", "EN_ALTA", "ACTIVE"])
 
     if "fecha_baja" in df_emp.columns:
-        fb = df_emp["fecha_baja"].astype(str).str.strip()
-        out = out & fb.isin(["", "None", "nan", "NaT", "NULL", "null"])
+        fb = df_emp["fecha_baja"].apply(_parse_date_any)
+        fb_has = fb.notna()
+        fb_past = fb_has & (fb <= date.today())
+        baja = fb_past
+    else:
+        baja = pd.Series([False] * len(df_emp))
 
-    if "estado" in df_emp.columns:
-        est = df_emp["estado"].astype(str).str.upper()
-        # si explícitamente dice BAJA, desactiva
-        out = out & (~est.str.contains("BAJA", na=False))
-        # si explícitamente dice ACTIVO, activa (no cambia a False)
-        # (ya está en True por defecto)
-    if "contrato" in df_emp.columns:
-        con = df_emp["contrato"].astype(str).str.strip()
-        out = out | con.ne("")
+    fin_ok = pd.Series([False] * len(df_emp))
+    for col in ["fecha_fin_contrato", "fin_contrato"]:
+        if col in df_emp.columns:
+            fc = df_emp[col].apply(_parse_date_any)
+            fin_ok = fin_ok | (fc.notna() & (fc >= date.today()))
 
-    return out.fillna(True)
+    any_signal_cols = any(c in df_emp.columns for c in ["activo", "en_activo", "contrato_activo", "estado", "situacion", "fecha_fin_contrato", "fin_contrato"])
+    if any_signal_cols:
+        active = (flags_true | estado_ok | fin_ok) & (~deleted) & (~baja)
+    else:
+        active = (~deleted) & (~baja)
+
+    return active.fillna(False)
+
 
 # ============================================================
 # UI
 # ============================================================
 
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
-st.title("📊 Fichajes CRECE Personas")
+# st.title("📊 Fichajes CRECE Personas")
 
-# Cargar catálogos (una vez)
 with st.spinner("Cargando catálogos…"):
+    departamentos_df = api_exportar_departamentos()
     empresas_df = api_exportar_empresas()
     sedes_df = api_exportar_sedes()
-    departamentos_df = api_exportar_departamentos()
+    empleados_df = api_exportar_empleados_completos()
 
-# Filtros de fechas
+if empleados_df.empty:
+    st.error("No hay empleados disponibles.")
+    st.stop()
+
+empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
+
+empleados_df["empresa_id"] = empleados_df.get("empresa_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
+empleados_df["sede_id"] = empleados_df.get("sede_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
+
+emp_map = {}
+if not empresas_df.empty and "empresa_id" in empresas_df.columns:
+    empresas_df["empresa_id"] = empresas_df["empresa_id"].astype(str).str.strip()
+    emp_map = dict(zip(empresas_df["empresa_id"], empresas_df["empresa_nombre"].fillna("").astype(str)))
+
+sede_map = {}
+if not sedes_df.empty and "sede_id" in sedes_df.columns:
+    sedes_df["sede_id"] = sedes_df["sede_id"].astype(str).str.strip()
+    sede_map = dict(zip(sedes_df["sede_id"], sedes_df["sede_nombre"].fillna("").astype(str)))
+
+empleados_df["Empresa"] = empleados_df["empresa_id"].map(emp_map).fillna("").astype(str)
+empleados_df["Sede"] = empleados_df["sede_id"].map(sede_map).fillna("").astype(str)
+
+# fallback mínimo (no debería usarse si catálogo ok)
+empleados_df.loc[empleados_df["Empresa"].str.strip().eq(""), "Empresa"] = empleados_df["empresa_id"]
+empleados_df.loc[empleados_df["Sede"].str.strip().eq(""), "Sede"] = empleados_df["sede_id"]
+
+empleados_df["Empresa_norm"] = empleados_df["Empresa"].apply(_norm_key)
+empleados_df["Sede_norm"] = empleados_df["Sede"].apply(_norm_key)
+
+empleados_df = empleados_df[
+    empleados_df["Empresa_norm"].isin(ALLOWED_EMPRESAS_N) &
+    empleados_df["Sede_norm"].isin(ALLOWED_SEDES_N)
+].copy()
+
+if empleados_df.empty:
+    st.error("Tras aplicar filtros de empresas/sedes permitidas, no quedan empleados. Revisa que los nombres coincidan en catálogo.")
+    st.stop()
+
+# ------------------------------------------------------------
+# Filtros UI
+# ------------------------------------------------------------
 hoy = date.today()
 col1, col2 = st.columns(2)
 with col1:
@@ -884,61 +999,58 @@ with col2:
     fecha_fin = st.date_input("Fecha fin", value=hoy, max_value=hoy)
 
 st.write("---")
+f1, f2 = st.columns(2)
 
-# Filtros Empresa/Sede PRE-consulta
-st.subheader("🔎 Filtros")
+empresas_opts = [x for x in ALLOWED_EMPRESAS if _norm_key(x) in set(empleados_df["Empresa_norm"].unique())]
+sedes_opts = [x for x in ALLOWED_SEDES if _norm_key(x) in set(empleados_df["Sede_norm"].unique())]
 
-# Empresas permitidas (por nombre)
-empresas_disponibles = []
-if not empresas_df.empty and "empresa_nombre" in empresas_df.columns:
-    empresas_disponibles = (
-        empresas_df["empresa_nombre"].dropna().astype(str).tolist()
-    )
-# aplicar whitelist
-empresas_disponibles = [e for e in empresas_disponibles if e in EMPRESAS_PERMITIDAS]
-empresas_disponibles = sorted(set(empresas_disponibles))
+with f1:
+    sel_empresas = st.multiselect("Empresa", options=empresas_opts, default=empresas_opts)
+with f2:
+    sel_sedes = st.multiselect("Sede", options=sedes_opts, default=sedes_opts)
 
-# Sedes permitidas (por nombre)
-sedes_disponibles = []
-if not sedes_df.empty and "sede_nombre" in sedes_df.columns:
-    sedes_disponibles = sedes_df["sede_nombre"].dropna().astype(str).tolist()
-sedes_disponibles = [s for s in sedes_disponibles if s in SEDES_PERMITIDAS]
-sedes_disponibles = sorted(set(sedes_disponibles))
+empleados_filtrados = empleados_df[
+    empleados_df["Empresa"].apply(_norm_key).isin({_norm_key(x) for x in sel_empresas}) &
+    empleados_df["Sede"].apply(_norm_key).isin({_norm_key(x) for x in sel_sedes})
+].copy()
 
-c1, c2 = st.columns(2)
-with c1:
-    sel_empresas = st.multiselect("Empresa", options=empresas_disponibles, default=empresas_disponibles)
-with c2:
-    sel_sedes = st.multiselect("Sede", options=sedes_disponibles, default=sedes_disponibles)
+st.write("---")
 
-# Si el usuario quita todas las empresas, no hay nada que consultar
-if not sel_empresas:
-    st.warning("Selecciona al menos una empresa.")
-    st.stop()
 
-# Botón
-btn = st.button("Consultar")
+def _iter_days(d0: date, d1: date):
+    cur = d0
+    while cur <= d1:
+        yield cur
+        cur += timedelta(days=1)
 
-# Estado
-if "last_sig" not in st.session_state:
-    st.session_state["last_sig"] = ""
-    st.session_state["result_incidencias"] = {}
-    st.session_state["result_bajas"] = {}
-    st.session_state["result_sin_fichajes"] = {}
-    st.session_state["result_csv_incidencias"] = b""
-    st.session_state["result_csv_bajas"] = b""
-    st.session_state["result_csv_sin"] = b""
 
-# ============================================================
-# CONSULTA
-# ============================================================
+def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list) -> str:
+    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}"
 
-if btn:
+
+for k, v in [
+    ("last_sig", ""),
+    ("result_incidencias", {}),
+    ("result_bajas", {}),
+    ("result_sin_fichajes", {}),
+    ("result_csv_incidencias", b""),
+    ("result_csv_bajas", b""),
+    ("result_csv_sin", b""),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+consultar = st.button("Consultar")
+
+if consultar:
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
     if fecha_fin > hoy:
         st.error("❌ La fecha fin no puede ser mayor que hoy.")
+        st.stop()
+    if empleados_filtrados.empty:
+        st.warning("No hay empleados con los filtros seleccionados.")
         st.stop()
 
     fi = fecha_inicio.strftime("%Y-%m-%d")
@@ -947,76 +1059,11 @@ if btn:
 
     with st.spinner("Procesando…"):
         tipos_map = api_exportar_tipos_fichaje()
-        empleados_df = api_exportar_empleados_completos()
-        if empleados_df.empty:
-            st.warning("No hay empleados disponibles.")
-            st.stop()
 
-        # --- Mapear IDs a nombres (Empresa/Sede/Departamento)
-        # empresa
-        if not empresas_df.empty:
-            empresas_df2 = empresas_df.rename(columns={"empresa_id": "empresa_id", "empresa_nombre": "Empresa"})
-            empleados_df = empleados_df.merge(
-                empresas_df2[["empresa_id", "Empresa"]],
-                on="empresa_id",
-                how="left",
-            )
-        else:
-            empleados_df["Empresa"] = ""
-
-        # sede
-        if not sedes_df.empty:
-            sedes_df2 = sedes_df.rename(columns={"sede_id": "sede_id", "sede_nombre": "Sede"})
-            empleados_df = empleados_df.merge(
-                sedes_df2[["sede_id", "Sede"]],
-                on="sede_id",
-                how="left",
-            )
-        else:
-            empleados_df["Sede"] = ""
-
-        # departamento
-        if not departamentos_df.empty:
-            empleados_df = empleados_df.merge(
-                departamentos_df.rename(columns={"departamento_id": "departamento_id", "departamento_nombre": "departamento_nombre"}),
-                on="departamento_id",
-                how="left",
-            )
-        else:
-            empleados_df["departamento_nombre"] = ""
-
-        empleados_df["nif"] = empleados_df["nif"].astype(str).str.upper().str.strip()
-        empleados_df["num_empleado"] = empleados_df.get("num_empleado", "").astype(str).str.strip()
-
-        # --- Aplicar filtros Empresa/Sede (empresa prioritaria)
-        # Primero filtramos por Empresa (siempre)
-        empleados_df = empleados_df[empleados_df["Empresa"].isin(sel_empresas)].copy()
-
-        # Luego por Sede (solo entre las empresas ya filtradas)
-        # Nota: si el usuario deja una sede asociada a empresa no seleccionada, no aparece nada (empresa manda).
-        if sel_sedes:
-            empleados_df = empleados_df[empleados_df["Sede"].isin(sel_sedes)].copy()
-
-        if empleados_df.empty:
-            st.info("No hay empleados que cumplan los filtros de Empresa/Sede.")
-            st.session_state["last_sig"] = signature
-            st.session_state["result_incidencias"] = {}
-            st.session_state["result_bajas"] = {}
-            st.session_state["result_sin_fichajes"] = {}
-            st.session_state["result_csv_incidencias"] = b""
-            st.session_state["result_csv_bajas"] = b""
-            st.session_state["result_csv_sin"] = b""
-            st.stop()
-
-        base_emp = empleados_df.copy()
-
-        # ============================================================
-        # FICHAJES: traer fichajes por empleado (filtrado ya por Empresa/Sede)
-        # ============================================================
-
+        # --------- FICHAJES ----------
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-            futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in base_emp.iterrows()}
+            futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
             for fut in as_completed(futures):
                 emp = futures[fut]
                 for x in (fut.result() or []):
@@ -1025,8 +1072,8 @@ if btn:
                             "nif": emp["nif"],
                             "Nombre": emp["nombre_completo"],
                             "Departamento": emp.get("departamento_nombre"),
-                            "Empresa": emp.get("Empresa", ""),
-                            "Sede": emp.get("Sede", ""),
+                            "Empresa": emp.get("Empresa"),
+                            "Sede": emp.get("Sede"),
                             "id": x.get("id"),
                             "tipo": x.get("tipo"),
                             "direccion": x.get("direccion"),
@@ -1035,7 +1082,6 @@ if btn:
                     )
 
         if not fichajes_rows:
-            # aun así, podemos mostrar SIN FICHAJES (y BAJAS) según filtros
             df_fich = pd.DataFrame(columns=["nif", "Nombre", "Departamento", "Empresa", "Sede", "id", "tipo", "direccion", "fecha", "fecha_dt", "fecha_dia"])
         else:
             df_fich = pd.DataFrame(fichajes_rows)
@@ -1049,12 +1095,14 @@ if btn:
 
             df_fich["fecha_dia"] = df_fich.apply(_dia_row, axis=1)
 
-        # ============================================================
-        # INCIDENCIAS (si hay fichajes)
-        # ============================================================
-
-        salida_incidencias = pd.DataFrame()
-        if not df_fich.empty:
+        # --------- INCIDENCIAS ----------
+        if df_fich.empty:
+            salida_incidencias = pd.DataFrame(columns=[
+                "Fecha", "Empresa", "Sede", "Nombre", "Departamento",
+                "Primera entrada", "Última salida", "Total trabajado",
+                "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
+            ])
+        else:
             df_fich["Numero"] = df_fich.groupby(["nif", "fecha_dia"])["id"].transform("count")
             conteo = (
                 df_fich.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede", "fecha_dia"], as_index=False)
@@ -1065,6 +1113,8 @@ if btn:
             neto = calcular_tiempos_neto(df_fich, tipos_map)
             resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
             resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
+
+            # Total trabajado con redondeo consistente (segundos_a_hhmm ya redondea)
             resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
             io = calcular_primera_ultima(df_fich)
@@ -1074,28 +1124,24 @@ if btn:
 
             nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
-            # Tiempo contabilizado día a día (robusto)
             tc_rows = []
             d0 = datetime.strptime(fi, "%Y-%m-%d").date()
             d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
-            cur = d0
-            while cur <= d1:
+            for cur in _iter_days(d0, d1):
                 desde = cur.strftime("%Y-%m-%d")
-
                 df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
                 if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
                     hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
                     df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
-
                 if not df_tc.empty:
                     df_tc["Fecha"] = desde
                     tc_rows.append(df_tc)
 
-                cur += timedelta(days=1)
-
             if tc_rows:
                 tc = pd.concat(tc_rows, ignore_index=True)
+
+                # Tiempo Contabilizado con el MISMO redondeo (segundos_a_hhmm ya redondea)
                 tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
                 tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
             else:
@@ -1104,7 +1150,6 @@ if btn:
             resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
             resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
 
-            # Diferencia (con tolerancia de 1 minuto)
             resumen["Diferencia"] = resumen.apply(
                 lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
                 axis=1
@@ -1151,12 +1196,12 @@ if btn:
                     r.get("Primera entrada", ""),
                     r.get("Última salida", ""),
                 )
-
                 return "; ".join(motivos)
 
             resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
 
             salida_incidencias = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
+
             if not salida_incidencias.empty:
                 salida_incidencias = salida_incidencias[
                     [
@@ -1174,147 +1219,75 @@ if btn:
                         "Incidencia",
                     ]
                 ].sort_values(["Fecha", "Nombre"], kind="mergesort")
+            else:
+                salida_incidencias = pd.DataFrame(columns=[
+                    "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
+                    "Total trabajado", "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
+                ])
 
-        # ============================================================
-        # BAJAS: día a día (para identificar día exacto con horas_baja > 0)
-        # ============================================================
-
+        # --------- BAJAS (día a día) - SIEMPRE filtrado por empleados_filtrados ----------
         bajas_por_dia = {}
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
+        base_emp = empleados_filtrados.copy()
+        base_emp["nif"] = base_emp["nif"].astype(str).str.upper().str.strip()
+        base_emp["num_empleado"] = base_emp.get("num_empleado", pd.Series([""] * len(base_emp))).astype(str).str.strip()
+
         for cur in _iter_days(d0, d1):
             day = cur.strftime("%Y-%m-%d")
-            info = api_informe_empleados(day, day)
-            if info is None:
-                continue
-
-            # info puede ser lista, dict, etc. Normalizamos a lista de registros.
-            if isinstance(info, dict):
-                # algunos formatos vienen como {"data":[...]} o similar
-                if "data" in info and isinstance(info["data"], list):
-                    rows = info["data"]
-                else:
-                    # dict con claves por empleado
-                    rows = []
-                    for _, v in info.items():
-                        if isinstance(v, dict):
-                            rows.append(v)
-            elif isinstance(info, list):
-                rows = info
-            else:
-                rows = []
-
+            rep = api_informe_empleados(day, day)
+            rows = _extract_rows_from_informe(rep)
             if not rows:
                 continue
 
-            out_rows = []
-            for r in rows:
-                try:
-                    hb = float(r.get("horas_baja") or 0)
-                except Exception:
-                    hb = 0.0
-                if hb <= 0:
-                    continue
-
-                # Identificación del empleado para enriquecer con base_emp (filtrada por empresa/sede)
-                nif = str(r.get("nif") or "").upper().strip()
-                num_emp = str(r.get("num_empleado") or r.get("numero_empleado") or "").strip()
-                nombre = str(r.get("nombre_completo") or r.get("nombre") or "").strip()
-
-                out_rows.append(
-                    {
-                        "Fecha": day,
-                        "nif": nif,
-                        "num_empleado": num_emp,
-                        "Nombre_raw": nombre,
-                        "Horas baja": hb,
-                    }
-                )
-
-            if not out_rows:
+            df_rep = pd.DataFrame(rows)
+            if df_rep.empty:
                 continue
 
-            df_b = pd.DataFrame(out_rows)
-
-            # Enriquecer con base_emp (ya filtrado por empresa/sede)
-            # Priorizamos match por nif; si no, por num_empleado; si no, por nombre normalizado
-            base_tmp = base_emp.copy()
-            base_tmp["nombre_norm"] = base_tmp["nombre_completo"].apply(norm_name)
-            df_b["nombre_norm"] = df_b["Nombre_raw"].apply(norm_name)
-
-            df_b["nif"] = df_b["nif"].astype(str).str.upper().str.strip()
-            df_b["num_empleado"] = df_b["num_empleado"].astype(str).str.strip()
-
-            merged = df_b.merge(
-                base_tmp[["nif", "num_empleado", "Empresa", "Sede", "nombre_completo", "departamento_nombre", "nombre_norm"]],
-                on="nif",
-                how="left",
-                suffixes=("", "_emp"),
-            )
-
-            # completar por num_empleado si falta
-            miss = merged["nombre_completo"].isna()
-            if miss.any():
-                m2 = merged[miss].merge(
-                    base_tmp[["num_empleado", "Empresa", "Sede", "nombre_completo", "departamento_nombre", "nombre_norm"]],
-                    on="num_empleado",
-                    how="left",
-                    suffixes=("", "_emp2"),
-                )
-                for col in ["Empresa", "Sede", "nombre_completo", "departamento_nombre", "nombre_norm"]:
-                    merged.loc[miss, col] = m2[col].values
-
-            # completar por nombre_norm si falta
-            miss = merged["nombre_completo"].isna()
-            if miss.any():
-                m3 = merged[miss].merge(
-                    base_tmp[["nombre_norm", "Empresa", "Sede", "nombre_completo", "departamento_nombre"]],
-                    on="nombre_norm",
-                    how="left",
-                    suffixes=("", "_emp3"),
-                )
-                for col in ["Empresa", "Sede", "nombre_completo", "departamento_nombre"]:
-                    merged.loc[miss, col] = m3[col].values
-
-            # quedarnos solo con empleados dentro del filtro empresa/sede (si no matchea => fuera)
-            merged = merged[merged["nombre_completo"].notna()].copy()
-            if merged.empty:
+            df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
+            df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
+            if df_rep.empty:
                 continue
 
-            out = merged.rename(
-                columns={
-                    "nombre_completo": "Nombre",
-                    "departamento_nombre": "Departamento",
-                }
-            )
-            out["Horas baja"] = out["Horas baja"].apply(lambda x: float(x) if pd.notna(x) else 0.0)
+            key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
+            key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
 
-            out = out[["Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Horas baja"]].copy()
+            merged = None
+            # OJO: INNER JOIN para que NO entren filas fuera del filtro de empresa/sede
+            if key_nif is not None:
+                df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
+                merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="inner")
+            elif key_num is not None:
+                df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
+                merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
+
+            if merged is None or merged.empty:
+                continue
+
+            out = pd.DataFrame({
+                "Fecha": day,
+                "Empresa": merged["Empresa"].fillna("").astype(str),
+                "Sede": merged["Sede"].fillna("").astype(str),
+                "Nombre": merged["nombre_completo"].fillna("").astype(str),
+                "Departamento": merged.get("departamento_nombre", "").fillna("").astype(str),
+                "Horas baja": merged["horas_baja"].round(2),
+            })
+
             out = out[out["Nombre"].astype(str).str.strip().ne("")]
             if not out.empty:
                 bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
 
-        # ============================================================
-        # SIN FICHAJES (solo ACTIVO / CONTRATO, + exclusiones)
-        # ============================================================
-
+        # --------- SIN FICHAJES (solo ACTIVO / CONTRATO + EXCLUSIONES RRHH) ----------
         sin_por_dia = {}
 
         base_emp_sin = base_emp.copy()
         mask_activo = empleado_activo_o_contrato(base_emp_sin)
         base_emp_sin = base_emp_sin[mask_activo].copy()
 
-        # Exclusiones (por num_empleado y por nombre)
-        base_emp_sin["num_empleado"] = base_emp_sin.get("num_empleado", "").astype(str).str.strip()
-        base_emp_sin["nombre_norm"] = base_emp_sin["nombre_completo"].apply(norm_name)
-
-        base_emp_sin = base_emp_sin[
-            ~base_emp_sin["num_empleado"].isin(EXCLUDE_SIN_FICHAJES_NUM_EMPLEADO)
-        ].copy()
-        base_emp_sin = base_emp_sin[
-            ~base_emp_sin["nombre_norm"].isin(EXCLUDE_SIN_FICHAJES_NOMBRES)
-        ].copy()
+        # Excluir NIFs indicados por RRHH
+        base_emp_sin["nif"] = base_emp_sin["nif"].astype(str).str.upper().str.strip()
+        base_emp_sin = base_emp_sin[~base_emp_sin["nif"].isin(EXCLUDE_SIN_FICHAJES_NIFS)].copy()
 
         empleados_nifs = base_emp_sin["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
@@ -1340,10 +1313,7 @@ if btn:
             out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
             sin_por_dia[day] = out
 
-        # ============================================================
-        # Guardar en estado + CSVs
-        # ============================================================
-
+        # --------- Guardar en estado + CSVs ----------
         incidencias_por_dia = {}
         if not salida_incidencias.empty:
             for day, sub in salida_incidencias.groupby("Fecha"):
