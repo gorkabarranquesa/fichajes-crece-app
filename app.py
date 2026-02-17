@@ -45,13 +45,13 @@ _SESSION.headers.update(
 )
 
 # ============================================================
-# EXCLUSIONES RRHH (Sin fichajes)
+# EXCLUSIONES RRHH (Sin fichajes) -> POR NOMBRE (NO POR NIF)
 # ============================================================
 
-EXCLUDE_SIN_FICHAJES_NIFS = {
-    "0000000139",  # Mikel Arzallus Marco
-    "0000000012",  # Jose Angel Ochagavia Satrustegui
-    "0000000010",  # Benito Mendinueta Andueza
+EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
+    "MIKEL ARZALLUS MARCO",
+    "JOSE ANGEL OCHAGAVIA SATRUSTEGUI",
+    "BENITO MENDINUETA ANDUEZA",
 }
 
 
@@ -257,7 +257,8 @@ def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
     tc_min = hhmm_to_min(tc_hhmm)
     tt_min = hhmm_to_min(tt_hhmm)
 
-    if tc_min == tt_min:
+    # ✅ Normalización anti-ruido: si difiere ±1 minuto, no mostrar diferencia
+    if abs(tc_min - tt_min) <= 1:
         return ""
 
     diff = tc_min - tt_min
@@ -1278,16 +1279,16 @@ if consultar:
             if not out.empty:
                 bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
 
-        # --------- SIN FICHAJES (solo ACTIVO / CONTRATO + EXCLUSIONES RRHH) ----------
+        # --------- SIN FICHAJES (solo ACTIVO / CONTRATO + EXCLUSIONES RRHH POR NOMBRE) ----------
         sin_por_dia = {}
 
         base_emp_sin = base_emp.copy()
         mask_activo = empleado_activo_o_contrato(base_emp_sin)
         base_emp_sin = base_emp_sin[mask_activo].copy()
 
-        # Excluir NIFs indicados por RRHH
-        base_emp_sin["nif"] = base_emp_sin["nif"].astype(str).str.upper().str.strip()
-        base_emp_sin = base_emp_sin[~base_emp_sin["nif"].isin(EXCLUDE_SIN_FICHAJES_NIFS)].copy()
+        # ✅ Excluir por NOMBRE COMPLETO (normalizado) SOLO en "Sin fichajes"
+        base_emp_sin["nombre_excl_norm"] = base_emp_sin["nombre_completo"].apply(norm_name)
+        base_emp_sin = base_emp_sin[~base_emp_sin["nombre_excl_norm"].isin(EXCLUDE_SIN_FICHAJES_NAMES_NORM)].copy()
 
         empleados_nifs = base_emp_sin["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
