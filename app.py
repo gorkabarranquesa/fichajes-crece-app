@@ -48,12 +48,37 @@ _SESSION.headers.update(
 # EXCLUSIONES RRHH (Sin fichajes)
 # ============================================================
 
-EXCLUDE_SIN_FICHAJES_NIFS = {
+EXCLUDE_SIN_FICHAJES_NUM_EMPLEADO = {
     "0000000139",  # Mikel Arzallus Marco
     "0000000012",  # Jose Angel Ochagavia Satrustegui
     "0000000010",  # Benito Mendinueta Andueza
 }
 
+# Fallback por nombre (por si algún backend no trae num_empleado)
+EXCLUDE_SIN_FICHAJES_NOMBRE_NORM = {
+    norm_name("Mikel Arzallus Marco"),
+    norm_name("Jose Angel Ochagavia Satrustegui"),
+    norm_name("Benito Mendinueta Andueza"),
+}
+
+base_emp_sin = base_emp.copy()
+mask_activo = empleado_activo_o_contrato(base_emp_sin)
+base_emp_sin = base_emp_sin[mask_activo].copy()
+
+# EXCLUSIONES RRHH (no deben aparecer como "Sin fichajes")
+if "num_empleado" in base_emp_sin.columns:
+    base_emp_sin["num_empleado"] = base_emp_sin["num_empleado"].astype(str).str.strip()
+    base_emp_sin = base_emp_sin[
+        ~base_emp_sin["num_empleado"].isin(EXCLUDE_SIN_FICHAJES_NUM_EMPLEADO)
+    ].copy()
+
+# Fallback por nombre (si falta num_empleado o viene vacío)
+if "nombre_completo" in base_emp_sin.columns:
+    base_emp_sin["_nombre_norm"] = base_emp_sin["nombre_completo"].apply(norm_name)
+    base_emp_sin = base_emp_sin[
+        ~base_emp_sin["_nombre_norm"].isin(EXCLUDE_SIN_FICHAJES_NOMBRE_NORM)
+    ].copy()
+    base_emp_sin = base_emp_sin.drop(columns=["_nombre_norm"], errors="ignore")
 
 def _safe_fail(_exc: Exception) -> None:
     return None
@@ -233,6 +258,21 @@ def segundos_a_hhmm(seg: float) -> str:
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
 
+def round_seconds_to_minute(seg):
+    """Redondea segundos al minuto más cercano (half-up).
+
+    Se usa para que 'Total trabajado' y 'Tiempo Contabilizado' apliquen el MISMO
+    redondeo y no aparezcan diferencias artificiales de +00:01.
+    """
+    if seg is None or pd.isna(seg):
+        return None
+    try:
+        s = float(seg)
+    except Exception:
+        return None
+    if s < 0:
+        s = 0.0
+    return int(((s + 30.0) // 60.0) * 60)
 
 def hhmm_to_min(hhmm: str) -> int:
     if not isinstance(hhmm, str) or ":" not in hhmm:
@@ -1113,9 +1153,11 @@ if consultar:
             neto = calcular_tiempos_neto(df_fich, tipos_map)
             resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
             resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
+            resumen["segundos_neto_round"] = (
+                resumen["segundos_neto"].apply(round_seconds_to_minute).fillna(0).astype(int)
+            )
+            resumen["Total trabajado"] = resumen["segundos_neto_round"].apply(segundos_a_hhmm)
 
-            # Total trabajado con redondeo consistente (segundos_a_hhmm ya redondea)
-            resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
             io = calcular_primera_ultima(df_fich)
             resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
@@ -1142,7 +1184,8 @@ if consultar:
                 tc = pd.concat(tc_rows, ignore_index=True)
 
                 # Tiempo Contabilizado con el MISMO redondeo (segundos_a_hhmm ya redondea)
-                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+                tc["tiempoContabilizado_round"] = tc["tiempoContabilizado_seg"].apply(round_seconds_to_minute)
+                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_round"].apply(segundos_a_hhmm)
                 tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
             else:
                 tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
