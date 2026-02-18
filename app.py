@@ -1772,8 +1772,7 @@ if consultar:
                         if day_str in fest_dates:
                             label = get_festivo_label_for_sede_date(sede, day_str, festivos_labels_by_sede)
                             return True, (label or "Festivo")
-                        return False, 
-    
+                        return False, ""    
             def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
                 # Fin de semana o festivo => jornada esperada 0
                 is_fest, _ = _is_festivo_day(sede, day)
