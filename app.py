@@ -127,6 +127,22 @@ def _norm_key(s: str) -> str:
     return " ".join((s or "").strip().upper().split())
 
 
+
+# --- sede code helper (needed for festivos) ---
+def _sede_code(sede: str) -> str:
+    """Devuelve el código P0/P1/P2/P3 a partir del nombre de sede normalizado."""
+    s = _norm_key(sede)
+    if not s:
+        return ""
+    tok = s.split()[0]
+    if tok in {"P0", "P1", "P2", "P3"}:
+        return tok
+    for c in ["P0", "P1", "P2", "P3"]:
+        if s.startswith(c):
+            return c
+    return ""
+
+
 # ============================================================
 # FESTIVOS CSV -> {SEDE_NORM: set(YYYY-MM-DD)}
 # ============================================================
