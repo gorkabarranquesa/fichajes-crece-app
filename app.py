@@ -215,6 +215,54 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     return out
 
 
+# ============================================================
+# FESTIVOS: lookup robusto por sede (exacto + por código P0/P1/P2/P3)
+# ============================================================
+
+def _sede_code(sede: str) -> str:
+    s = _norm_key(sede)
+    if not s:
+        return ""
+    tok = s.split()[0]
+    if tok in {"P0", "P1", "P2", "P3"}:
+        return tok
+    for c in ["P0", "P1", "P2", "P3"]:
+        if s.startswith(c):
+            return c
+    return ""
+
+
+def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
+    """
+    Devuelve set de fechas 'YYYY-MM-DD' festivas para esa sede,
+    con matching robusto (exacto + por código P0/P1/P2/P3).
+    """
+    if not festivos_by_sede:
+        return set()
+
+    sede_norm = _norm_key(sede)
+    if sede_norm in festivos_by_sede:
+        return festivos_by_sede.get(sede_norm, set()) or set()
+
+    code = _sede_code(sede_norm)
+    if not code:
+        return set()
+
+    out = set()
+
+    # Caso: CSV con clave "P1"
+    if code in festivos_by_sede:
+        out |= (festivos_by_sede.get(code, set()) or set())
+
+    # Caso: CSV con clave "P1 LAKUNTZA" (o variante) y aquí llega distinto
+    for k, v in festivos_by_sede.items():
+        k_norm = _norm_key(k)
+        if k_norm.startswith(code):
+            out |= (v or set())
+
+    return out
+
+
 def _iter_days(d0: date, d1: date):
     cur = d0
     while cur <= d1:
@@ -514,8 +562,7 @@ def expected_week_minutes_for_employee(depto: str, nombre: str, sede: str, week_
     - si un día es festivo en ESA sede -> no suma jornada ese día
     - así los de jornada especial quedan automáticamente bien
     """
-    sede_norm = _norm_key(sede)
-    festivos = festivos_by_sede.get(sede_norm, set())
+    festivos = get_festivos_for_sede(sede, festivos_by_sede)
 
     total = 0
     cur = week_mon
@@ -1480,6 +1527,7 @@ if consultar:
             sin_por_dia[day] = out
 
         # --------- EXCESO SEMANAL (MOI + ESTRUCTURA) — usando Tiempo Contabilizado ----------
+        # ✅ Mejora: el trabajo en festivo SIEMPRE cuenta como exceso (no se compensa con faltas de otros días)
         excesos_por_semana = {}
         csv_excesos = b""
 
@@ -1502,42 +1550,42 @@ if consultar:
                     mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end)
                     w = sub[mask_week].copy()
 
-                    grp = w.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede"], as_index=False).agg(
-                        mins_trab=("mins_tc", "sum")
-                    )
-
+                    # a nivel empleado necesitamos el detalle por día para separar festivos/no festivos
                     rows = []
-                    for _, r in grp.iterrows():
-                        mins_trab = int(r.get("mins_trab", 0) or 0)
-                        depto = str(r.get("Departamento", "") or "").strip()
-                        nombre = str(r.get("Nombre", "") or "").strip()
-                        sede = str(r.get("Sede", "") or "").strip()
+                    for (nif, nombre, depto, empresa, sede), wemp in w.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede"]):
+                        depto_s = str(depto or "").strip()
+                        nombre_s = str(nombre or "").strip()
+                        sede_s = str(sede or "").strip()
 
-                        exp_min = expected_week_minutes_for_employee(depto, nombre, sede, wk_start, wk_end, festivos_by_sede)
-                        extra = mins_trab - exp_min
+                        # festivos de esa sede (robusto)
+                        fest_set_str = get_festivos_for_sede(sede_s, festivos_by_sede)
+                        fest_set_date = set()
+                        for ds in fest_set_str:
+                            try:
+                                fest_set_date.add(datetime.strptime(ds, "%Y-%m-%d").date())
+                            except Exception:
+                                pass
 
-                        exceso_min = floor_to_30(extra) if extra >= 30 else 0
+                        mins_fest = int(wemp[wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else 0
+                        mins_nonfest = int(wemp[~wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else int(wemp["mins_tc"].sum())
+
+                        exp_min = expected_week_minutes_for_employee(depto_s, nombre_s, sede_s, wk_start, wk_end, festivos_by_sede)
+
+                        # Exceso = trabajo en festivo (siempre) + exceso sobre jornada en no festivos
+                        extra_nonfest = max(mins_nonfest - exp_min, 0)
+                        exceso_total = mins_fest + extra_nonfest
+
+                        exceso_min = floor_to_30(exceso_total) if exceso_total >= 30 else 0
                         if exceso_min <= 0:
                             continue
 
-                        fest_set = festivos_by_sede.get(_norm_key(sede), set())
-                        festivos_sem = []
-                        cur2 = wk_start
-                        while cur2 <= wk_end:
-                            ds = cur2.strftime("%Y-%m-%d")
-                            if ds in fest_set:
-                                festivos_sem.append(ds)
-                            cur2 += timedelta(days=1)
-                        festivos_txt = ", ".join(festivos_sem) if festivos_sem else ""
-
                         row = {
-                            "Empresa": r.get("Empresa", ""),
-                            "Sede": r.get("Sede", ""),
-                            "Nombre": r.get("Nombre", ""),
-                            "Departamento": depto,
-                            "Trabajado semanal": segundos_a_hhmm(mins_trab * 60),
+                            "Empresa": str(empresa or ""),
+                            "Sede": sede_s,
+                            "Nombre": nombre_s,
+                            "Departamento": depto_s,
+                            "Trabajado semanal": segundos_a_hhmm((mins_fest + mins_nonfest) * 60),
                             "Jornada semanal": segundos_a_hhmm(exp_min * 60),
-                            #"Festivos": festivos_txt,
                             "Exceso": mins_to_hhmm_signed(exceso_min),
                         }
                         rows.append(row)
@@ -1550,7 +1598,7 @@ if consultar:
                     if rows:
                         dfw = pd.DataFrame(rows).sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort").reset_index(drop=True)
                     else:
-                        dfw = pd.DataFrame(columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Festivos", "Exceso"])
+                        dfw = pd.DataFrame(columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"])
                     excesos_por_semana[label] = dfw
 
                 if all_rows:
