@@ -26,7 +26,8 @@ from Crypto.Util.Padding import unpad
 # NUNCA imprimir/mostrar: API_TOKEN, APP_KEY_B64, payloads cifrados/descifrados, PII sensible
 # verify=True, retries/backoff y timeouts
 
-API_BASE = "https://sincronizaciones.crecepersonas.es/api"
+API_ROOT = "https://sincronizaciones.crecepersonas.es"
+API_BASE = f"{API_ROOT}/api"
 API_TOKEN = os.getenv("CRECE_API_TOKEN", "").strip()
 APP_KEY_B64 = os.getenv("CRECE_APP_KEY_B64", "").strip()
 
@@ -163,18 +164,54 @@ def _build_session() -> requests.Session:
     })
     return s
 
+def _compose_urls(endpoint: str):
+    """
+    Construye URLs posibles para un endpoint, con fallback automático.
+    Algunos entornos exponen rutas bajo /api y otros no.
+    """
+    ep = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+
+    # Preferente: API_BASE (normalmente https://.../api) + /exportaciones/...
+    urls = [f"{API_BASE}{ep}"]
+
+    # Fallback: quitar /api del base (https://...) manteniendo endpoint
+    if API_BASE.endswith("/api"):
+        urls.append(f"{API_ROOT}{ep}")
+
+    # Fallback alternativo: si el endpoint NO empieza por /api, probar con /api delante (por si el base NO lo tuviera)
+    if not ep.startswith("/api/"):
+        urls.append(f"{API_ROOT}/api{ep}")
+
+    # Deduplicar manteniendo orden
+    out = []
+    for u in urls:
+        if u not in out:
+            out.append(u)
+    return out
+
 def _post_json(session: requests.Session, endpoint: str, payload: dict, retries: int = 3, backoff: float = 0.75):
-    url = f"{API_BASE}{endpoint}"
+    urls = _compose_urls(endpoint)
     last_err = None
+
     for i in range(retries):
-        try:
-            r = session.post(url, json=payload, timeout=TIMEOUT, verify=VERIFY_SSL)
-            if r.status_code >= 400:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff * (2 ** i))
+        for url in urls:
+            try:
+                r = session.post(url, json=payload, timeout=TIMEOUT, verify=VERIFY_SSL)
+                if r.status_code >= 400:
+                    # Si es 404, probamos el siguiente URL candidato
+                    if r.status_code == 404:
+                        raise FileNotFoundError(f"HTTP 404 on {endpoint}")
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                return r.json()
+            except FileNotFoundError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                # para errores no-404 no probamos otros urls en el mismo intento; reintento con backoff
+                break
+        time.sleep(backoff * (2 ** i))
+
     raise RuntimeError(_safe_err(f"POST failed {endpoint}: {last_err}"))
 
 def _decrypt_payload(payload: dict) -> bytes:
@@ -379,11 +416,31 @@ def load_festivos_labels_from_csv_bytes(csv_bytes: bytes):
     if not csv_bytes:
         return festivos_by_sede, festivos_labels_by_sede
 
-    try:
-        df = pd.read_csv(pd.io.common.BytesIO(csv_bytes))
-    except Exception:
-        # intentar con separador ;
-        df = pd.read_csv(pd.io.common.BytesIO(csv_bytes), sep=";")
+    # Lectura robusta (encoding/separador) para evitar UnicodeDecodeError
+    bio = pd.io.common.BytesIO(csv_bytes)
+
+    last_exc = None
+    df = None
+
+    # Intentos: UTF-8 (con BOM), UTF-8, latin1; separadores: , y ;
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
+        for sep in (",", ";"):
+            try:
+                bio.seek(0)
+                df = pd.read_csv(bio, sep=sep, encoding=enc)
+                last_exc = None
+                break
+            except UnicodeDecodeError as e:
+                last_exc = e
+                continue
+            except Exception as e:
+                last_exc = e
+                continue
+        if df is not None:
+            break
+
+    if df is None:
+        raise RuntimeError(f"No se pudo leer el CSV de festivos (encoding/separador). {last_exc}")
 
     # Columnas esperadas: Fecha, Festivo, Sede(s) (o similares)
     cols = {c.lower().strip(): c for c in df.columns}
