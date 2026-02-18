@@ -1537,7 +1537,7 @@ if consultar:
                             "Departamento": depto,
                             "Trabajado semanal": segundos_a_hhmm(mins_trab * 60),
                             "Jornada semanal": segundos_a_hhmm(exp_min * 60),
-                            "Festivos": festivos_txt,
+                            #"Festivos": festivos_txt,
                             "Exceso": mins_to_hhmm_signed(exceso_min),
                         }
                         rows.append(row)
