@@ -135,14 +135,10 @@ def _norm_key(s: str) -> str:
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
-
     CSV esperado: separador ';' con columnas tipo:
       - "Próxima ocurrencia" (dd/mm/yyyy)
       - "Sede(s)" (con sedes separadas por '|')
-      - "Tipo" (p.ej. Nacional/Local). Si es NACIONAL => se aplica a TODAS las sedes (P0/P1/P2/P3)
-        aunque el CSV no liste alguna sede (esto evita fallos como 06/01 no marcado en P0).
-      - Nota opcional (a veces viene como "Repetición", "Notas" o una columna "Unnamed: x") con textos:
-        "En P3 no será festivo", etc.
+      - opcional "Repetición" / nota (p.ej. "En P3 no será festivo")
     """
     if not file_bytes:
         return {}
@@ -172,13 +168,100 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
             col_sedes = c
             break
 
+    col_nota = None
+    for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
+        if c in df.columns:
+            col_nota = c
+            break
+
+    if not col_fecha or not col_sedes:
+        return {}
+
+    def parse_ddmmyyyy(s: str):
+        if not isinstance(s, str):
+            return None
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.date().strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    out = {}
+    for _, r in df.iterrows():
+        fecha_raw = str(r.get(col_fecha, "") or "").strip()
+        sede_raw = str(r.get(col_sedes, "") or "").strip()
+        if not fecha_raw or not sede_raw:
+            continue
+
+        fecha = parse_ddmmyyyy(fecha_raw)
+        if not fecha:
+            continue
+
+        nota = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
+        exclude_p3 = ("P3" in nota and "NO" in nota and "FESTIV" in nota)
+
+        sedes = [x.strip() for x in sede_raw.split("|") if x.strip()]
+        for s in sedes:
+            s_norm = _norm_key(s)
+            if exclude_p3 and s_norm.startswith("P3"):
+                continue
+            out.setdefault(s_norm, set()).add(fecha)
+
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_festivos_labels_from_csv_bytes(file_bytes: bytes) -> dict:
+    """
+    Devuelve {SEDE_NORM: {YYYY-MM-DD: 'Nombre del festivo'}} usando el mismo CSV.
+
+    - Para festivos tipo NACIONAL: se aplica a todas las sedes (salvo exclusión explícita en notas).
+    - Si falta el nombre, se devuelve 'Festivo'.
+    """
+    if not file_bytes:
+        return {}
+
+    import io
+
+    buf = io.BytesIO(file_bytes)
+    try:
+        df = pd.read_csv(buf, sep=";", dtype=str, encoding="utf-8")
+    except Exception:
+        buf.seek(0)
+        df = pd.read_csv(buf, sep=";", dtype=str, encoding="latin-1")
+
+    if df.empty:
+        return {}
+
+    col_fecha = None
+    for c in ["Próxima ocurrencia", "Proxima ocurrencia", "PROXIMA OCURRENCIA", "Fecha", "FECHA"]:
+        if c in df.columns:
+            col_fecha = c
+            break
+
+    col_sedes = None
+    for c in ["Sede(s)", "Sedes", "Sede", "SEDE(S)", "SEDE"]:
+        if c in df.columns:
+            col_sedes = c
+            break
+
     col_tipo = None
     for c in ["Tipo", "TIPO"]:
         if c in df.columns:
             col_tipo = c
             break
 
-    # Nota: a veces es "Unnamed: x"
+    col_nombre = None
+    for c in ["Nombre del festivo", "NOMBRE DEL FESTIVO", "Nombre", "FESTIVO", "Descripcion", "Descripción"]:
+        if c in df.columns:
+            col_nombre = c
+            break
+
     col_nota = None
     for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
         if c in df.columns:
@@ -208,11 +291,6 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
             return None
 
     def excluded_codes_from_note(note_u: str) -> set:
-        """
-        Detecta exclusiones estilo:
-          - 'En P3 no será festivo'
-          - 'En P0 NO sera festivo'
-        """
         if not note_u:
             return set()
         out = set()
@@ -221,7 +299,6 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
                 out.add(code)
         return out
 
-    # sedes permitidas (constante local para no depender del orden de definición en el archivo)
     allowed_sedes_local = ["P0 IBSA", "P1 LAKUNTZA", "P2 COMARCA II", "P3 UHARTE"]
 
     out = {}
@@ -239,7 +316,10 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
         nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
         excluded = excluded_codes_from_note(nota_u)
 
-        # Heurística: festivo nacional => todas las sedes (salvo exclusión explícita)
+        nombre = str(r.get(col_nombre, "") or "").strip() if col_nombre else ""
+        if not nombre:
+            nombre = "Festivo"
+
         if "NACIONAL" in tipo_u:
             sedes_list = allowed_sedes_local
         else:
@@ -252,58 +332,34 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
             code = _sede_code(s_norm)
             if code in excluded:
                 continue
-            out.setdefault(s_norm, set()).add(fecha)
+            out.setdefault(s_norm, {})[fecha] = nombre
 
     return out
 
 
-# ============================================================
-# FESTIVOS: lookup robusto por sede (exacto + por código P0/P1/P2/P3)
-# ============================================================
-
-def _sede_code(sede: str) -> str:
-    s = _norm_key(sede)
-    if not s:
+def get_festivo_label_for_sede_date(sede: str, day_yyyy_mm_dd: str, festivos_labels_by_sede: dict) -> str:
+    """Devuelve el nombre del festivo (si lo hay) para esa sede y fecha (matching robusto)."""
+    if not festivos_labels_by_sede:
         return ""
-    tok = s.split()[0]
-    if tok in {"P0", "P1", "P2", "P3"}:
-        return tok
-    for c in ["P0", "P1", "P2", "P3"]:
-        if s.startswith(c):
-            return c
-    return ""
-
-
-def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
-    """
-    Devuelve set de fechas 'YYYY-MM-DD' festivas para esa sede,
-    con matching robusto (exacto + por código P0/P1/P2/P3).
-    """
-    if not festivos_by_sede:
-        return set()
-
     sede_norm = _norm_key(sede)
-    if sede_norm in festivos_by_sede:
-        return festivos_by_sede.get(sede_norm, set()) or set()
+    if sede_norm in festivos_labels_by_sede:
+        return str((festivos_labels_by_sede.get(sede_norm, {}) or {}).get(day_yyyy_mm_dd, "") or "")
 
     code = _sede_code(sede_norm)
     if not code:
-        return set()
+        return ""
 
-    out = set()
+    if code in festivos_labels_by_sede:
+        return str((festivos_labels_by_sede.get(code, {}) or {}).get(day_yyyy_mm_dd, "") or "")
 
-    # Caso: CSV con clave "P1"
-    if code in festivos_by_sede:
-        out |= (festivos_by_sede.get(code, set()) or set())
-
-    # Caso: CSV con clave "P1 LAKUNTZA" (o variante) y aquí llega distinto
-    for k, v in festivos_by_sede.items():
+    for k, v in festivos_labels_by_sede.items():
         k_norm = _norm_key(k)
         if k_norm.startswith(code):
-            out |= (v or set())
+            val = (v or {}).get(day_yyyy_mm_dd)
+            if val:
+                return str(val)
 
-    return out
-
+    return ""
 
 def _iter_days(d0: date, d1: date):
     cur = d0
@@ -314,28 +370,36 @@ def _iter_days(d0: date, d1: date):
 
 def list_full_workweeks_in_range(fi: date, ff: date):
     """
-    Semanas completas L-V contenidas dentro del rango.
-    (Si el rango no cubre al menos L-V de una semana, NO se muestra la pestaña)
+    Semanas completas contenidas dentro del rango.
+
+    - Si el rango cubre L-V (lunes a viernes) -> se incluye semana L-V
+    - Si además cubre sábado+domingo -> se devuelve esa semana como L-D
+
+    Devuelve lista de tuplas: (week_start_monday, week_end_inclusive, include_weekend_bool)
     """
+
     def monday_of(d: date) -> date:
         return d - timedelta(days=d.weekday())
-
-    def contains_full_workweek(fi: date, ff: date, week_start: date):
-        mon = week_start
-        fri = week_start + timedelta(days=4)
-        if (fi <= mon) and (ff >= fri):
-            return (mon, fri)
-        return None
 
     weeks = []
     cur = monday_of(fi)
     end_limit = monday_of(ff)
+
     while cur <= end_limit:
-        wk = contains_full_workweek(fi, ff, cur)
-        if wk is not None:
-            weeks.append(wk)
+        mon = cur
+        fri = cur + timedelta(days=4)
+        sat = cur + timedelta(days=5)
+        sun = cur + timedelta(days=6)
+
+        if (fi <= mon) and (ff >= fri):
+            include_weekend = (fi <= sat) and (ff >= sun)
+            end_incl = sun if include_weekend else fri
+            weeks.append((mon, end_incl, include_weekend))
+
         cur += timedelta(days=7)
+
     return weeks
+
 
 
 def floor_to_30(mins: int) -> int:
@@ -604,7 +668,8 @@ def expected_week_minutes_for_employee(depto: str, nombre: str, sede: str, week_
     - si un día es festivo en ESA sede -> no suma jornada ese día
     - así los de jornada especial quedan automáticamente bien
     """
-    festivos = get_festivos_for_sede(sede, festivos_by_sede)
+    sede_norm = _norm_key(sede)
+    festivos = festivos_by_sede.get(sede_norm, set())
 
     total = 0
     cur = week_mon
@@ -1250,16 +1315,24 @@ with st.expander("Festivos (CSV) — por sede", expanded=False):
     st.caption("Si no subes nada, la app intenta usar un CSV local llamado: " + DEFAULT_FESTIVOS_CSV_PATH)
 
 festivos_by_sede = {}
+festivos_labels_by_sede = {}
+
 if fest_file is not None:
-    festivos_by_sede = load_festivos_from_csv_bytes(fest_file.getvalue())
+    fb = fest_file.getvalue()
+    festivos_by_sede = load_festivos_from_csv_bytes(fb)
+    festivos_labels_by_sede = load_festivos_labels_from_csv_bytes(fb)
 else:
     try:
         import os
         if os.path.exists(DEFAULT_FESTIVOS_CSV_PATH):
             with open(DEFAULT_FESTIVOS_CSV_PATH, "rb") as f:
-                festivos_by_sede = load_festivos_from_csv_bytes(f.read())
+                fb = f.read()
+                festivos_by_sede = load_festivos_from_csv_bytes(fb)
+                festivos_labels_by_sede = load_festivos_labels_from_csv_bytes(fb)
     except Exception:
         festivos_by_sede = {}
+        festivos_labels_by_sede = {}
+
 
 st.write("---")
 f1, f2 = st.columns(2)
@@ -1436,6 +1509,17 @@ if consultar:
             def build_incidencia(r) -> str:
                 motivos = []
 
+                # ✅ Festivo: si hay trabajo, se marca como "Trabajado en festivo" y NO se aplican incidencias habituales
+                day_str = str(r.get("Fecha", "") or "")
+                sede_str = str(r.get("Sede", "") or "")
+                fest_set = get_festivos_for_sede(sede_str, festivos_by_sede)
+                if day_str and (day_str in fest_set):
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                        int(r.get("Numero de fichajes", 0) or 0) > 0
+                    )
+                    if worked:
+                        return "Trabajado en festivo"
+
                 if int(r.get("dia", 0)) in [5, 6]:
                     worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
                         int(r.get("Numero de fichajes", 0) or 0) > 0
@@ -1568,10 +1652,20 @@ if consultar:
             out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
             sin_por_dia[day] = out
 
-        # --------- EXCESO SEMANAL (MOI + ESTRUCTURA) — usando Tiempo Contabilizado ----------
-        # ✅ Mejora:
-        #   - Trabajo en festivo SIEMPRE cuenta como exceso
-        #   - Si el rango incluye semana completa con fin de semana (L-D), sábado/domingo también suman como exceso
+        # --------- EXCESO SEMANAL (MOI + ESTRUCTURA + MOD) — usando Tiempo Contabilizado ----------
+        # ✅ Reglas:
+        #   - Se calcula por semanas completas dentro del rango:
+        #       * si el rango cubre L-V => semana L-V
+        #       * si además cubre S-D => semana L-D (y esas horas también suman)
+        #   - Festivos (por sede): si alguien trabaja en festivo, ESAS horas cuentan como exceso.
+        #   - MOI/ESTRUCTURA:
+        #       * Jornada semanal esperada = suma de min_horas diarios (L-V) excluyendo festivos.
+        #       * Exceso = (mins en festivo + mins en finde si aplica) + max(mins L-V no festivo - jornada, 0)
+        #   - MOD:
+        #       * Jornada base 8h/día (L-V), excluyendo festivos.
+        #       * Exceso por turno (8h):
+        #           - NO cuenta el adelanto antes del inicio del turno (p.ej. 05:30 no suma hasta 06:00).
+        #           - El exceso se mide por día: max((TC - adelanto) - 480, 0).
         excesos_por_semana = {}
         csv_excesos = b""
 
@@ -1580,7 +1674,7 @@ if consultar:
         if (not resumen.empty) and full_weeks:
             sub = resumen.copy()
             sub["Departamento_norm"] = sub["Departamento"].astype(str).str.upper().str.strip()
-            sub = sub[sub["Departamento_norm"].isin(["MOI", "ESTRUCTURA"])].copy()
+            sub = sub[sub["Departamento_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])].copy()
 
             if not sub.empty:
                 sub["Fecha_dt"] = pd.to_datetime(sub["Fecha"], errors="coerce").dt.date
@@ -1590,13 +1684,12 @@ if consultar:
 
                 all_rows = []
 
-                for wk_start, wk_end in full_weeks:
-                    # ¿El rango cubre también sábado+domingo de esa semana?
+                for wk_start, wk_end_incl, include_weekend in full_weeks:
+                    wk_fri = wk_start + timedelta(days=4)
                     wk_sat = wk_start + timedelta(days=5)
                     wk_sun = wk_start + timedelta(days=6)
-                    include_weekend = (d0 <= wk_sat) and (d1 >= wk_sun)
 
-                    wk_end_incl = wk_sun if include_weekend else wk_end
+                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if include_weekend else "L-V") + ")"
 
                     mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
                     w = sub[mask_week].copy()
@@ -1607,7 +1700,7 @@ if consultar:
                         nombre_s = str(nombre or "").strip()
                         sede_s = str(sede or "").strip()
 
-                        # festivos de esa sede (robusto)
+                        # festivos sede (robusto)
                         fest_set_str = get_festivos_for_sede(sede_s, festivos_by_sede)
                         fest_set_date = set()
                         for ds in fest_set_str:
@@ -1618,27 +1711,56 @@ if consultar:
 
                         weekend_set = {wk_sat, wk_sun} if include_weekend else set()
 
-                        # minutos trabajados:
+                        # minutos trabajados en festivo / fin de semana
                         mins_fest = int(wemp[wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else 0
                         mins_weekend = int(wemp[wemp["Fecha_dt"].isin(weekend_set)]["mins_tc"].sum()) if weekend_set else 0
 
-                        # Mon-Fri no festivo (para comparar vs jornada)
-                        mask_monfri = (wemp["Fecha_dt"] >= wk_start) & (wemp["Fecha_dt"] <= wk_end)
+                        # Mon-Fri no festivo (base para comparar)
+                        mask_monfri = (wemp["Fecha_dt"] >= wk_start) & (wemp["Fecha_dt"] <= wk_fri)
                         if fest_set_date:
                             mask_monfri = mask_monfri & (~wemp["Fecha_dt"].isin(fest_set_date))
+
                         mins_nonfest_monfri = int(wemp[mask_monfri]["mins_tc"].sum())
 
-                        exp_min = expected_week_minutes_for_employee(depto_s, nombre_s, sede_s, wk_start, wk_end, festivos_by_sede)
+                        exp_min = expected_week_minutes_for_employee(depto_s, nombre_s, sede_s, wk_start, wk_fri, festivos_by_sede)
 
-                        # Exceso = (festivo + fin de semana) siempre + exceso sobre jornada en Mon-Fri no festivo
-                        extra_nonfest = max(mins_nonfest_monfri - exp_min, 0)
+                        # Exceso Mon-Fri no festivo
+                        if str(depto_s or "").upper().strip() == "MOD":
+                            # Por día: no cuenta adelanto antes del inicio de turno
+                            daily_excess = 0
+                            w_mod = wemp[mask_monfri].copy()
+                            for _, rr in w_mod.iterrows():
+                                mins_tc_day = int(rr.get("mins_tc", 0) or 0)
+                                e_hhmm = str(rr.get("Primera entrada", "") or "")
+                                e_min = hhmm_to_min_clock(e_hhmm)
+
+                                # Heurística de turno según hora de entrada
+                                if e_min is None:
+                                    shift_start = 6 * 60
+                                elif e_min < 12 * 60:
+                                    shift_start = 6 * 60
+                                elif e_min < 21 * 60:
+                                    shift_start = 14 * 60
+                                else:
+                                    shift_start = 22 * 60
+
+                                early = max(0, shift_start - (e_min or shift_start))
+                                eff = max(0, mins_tc_day - early)
+                                daily_excess += max(eff - 480, 0)
+
+                            extra_nonfest = daily_excess
+                        else:
+                            extra_nonfest = max(mins_nonfest_monfri - exp_min, 0)
+
+                        # Exceso total
                         exceso_total = mins_fest + mins_weekend + extra_nonfest
-
                         exceso_min = floor_to_30(exceso_total) if exceso_total >= 30 else 0
                         if exceso_min <= 0:
                             continue
 
-                        trabajado_total = mins_fest + mins_weekend + int(wemp[~wemp["Fecha_dt"].isin(fest_set_date | weekend_set)]["mins_tc"].sum())
+                        # Trabajado semanal mostrado (TC total en el tramo)
+                        trabajado_total = int(wemp["mins_tc"].sum())
+
                         row = {
                             "Empresa": str(empresa or ""),
                             "Sede": sede_s,
@@ -1649,12 +1771,8 @@ if consultar:
                             "Exceso": mins_to_hhmm_signed(exceso_min),
                         }
                         rows.append(row)
-                        all_rows.append({
-                            "Semana": f"{wk_start:%Y-%m-%d} → {wk_end:%Y-%m-%d} (L-V)" + (" + finde" if include_weekend else ""),
-                            **row
-                        })
+                        all_rows.append({"Semana": label, **row})
 
-                    label = f"{wk_start:%Y-%m-%d} → {wk_end:%Y-%m-%d} (L-V)"
                     if rows:
                         dfw = pd.DataFrame(rows).sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort").reset_index(drop=True)
                     else:
@@ -1664,8 +1782,7 @@ if consultar:
                 if all_rows:
                     df_all = pd.DataFrame(all_rows).sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort").reset_index(drop=True)
                     csv_excesos = df_all.to_csv(index=False).encode("utf-8")
-
-        # --------- Guardar en estado + CSVs ----------
+# --------- Guardar en estado + CSVs ----------
         incidencias_por_dia = {}
         if not salida_incidencias.empty:
             for day, subd in salida_incidencias.groupby("Fecha"):
@@ -1720,7 +1837,26 @@ with tab1:
         st.success("🎉 No hay incidencias en el rango seleccionado.")
     else:
         for day in sorted(incid.keys()):
-            st.markdown(f"### 📅 {day}")
+            # Etiqueta de festivo (si aplica a alguna fila del día)
+            fest_names = set()
+            try:
+                df_day = incid[day]
+                if isinstance(df_day, pd.DataFrame) and (not df_day.empty):
+                    for _, rr in df_day.iterrows():
+                        sede_rr = str(rr.get("Sede", "") or "")
+                        if str(day) in get_festivos_for_sede(sede_rr, festivos_by_sede):
+                            nm = get_festivo_label_for_sede_date(sede_rr, str(day), festivos_labels_by_sede)
+                            fest_names.add(nm or "Festivo")
+            except Exception:
+                fest_names = set()
+
+            if len(fest_names) == 1:
+                fest_label = next(iter(fest_names))
+                st.markdown(f"### 📅 {day} ({fest_label})")
+            elif len(fest_names) > 1:
+                st.markdown(f"### 📅 {day} (Festivo)")
+            else:
+                st.markdown(f"### 📅 {day}")
             st.data_editor(incid[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
         csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
         if csv_i:
@@ -1754,12 +1890,12 @@ if show_week_tab:
     with tab4:
         excesos = st.session_state.get("result_excesos_semana", {}) or {}
 
-        for wk_start, wk_end in weeks_ui:
-            label = f"{wk_start:%Y-%m-%d} → {wk_end:%Y-%m-%d} (L-V)"
+        for wk_start, wk_end_incl, include_weekend in weeks_ui:
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if include_weekend else "L-V") + ")"
             st.markdown(f"### 🗓 {label}")
             dfw = excesos.get(label)
             if dfw is None or dfw.empty:
-                st.info("No hay excesos (MOI/ESTRUCTURA) en esta semana completa (o no hay datos).")
+                st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
             else:
                 st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
