@@ -148,6 +148,34 @@ def _sede_code(sede: str) -> str:
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
+
+
+def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
+    """Devuelve set de fechas 'YYYY-MM-DD' festivas para esa sede, con matching robusto."""
+    if not festivos_by_sede:
+        return set()
+
+    sede_norm = _norm_key(sede)
+    if sede_norm in festivos_by_sede:
+        return set(festivos_by_sede.get(sede_norm, set()) or set())
+
+    code = _sede_code(sede_norm)
+    if not code:
+        return set()
+
+    out = set()
+
+    # Caso: CSV con clave "P1"
+    if code in festivos_by_sede:
+        out |= set(festivos_by_sede.get(code, set()) or set())
+
+    # Caso: CSV con clave "P1 LAKUNTZA" (o variantes)
+    for k, v in festivos_by_sede.items():
+        k_norm = _norm_key(k)
+        if k_norm.startswith(code):
+            out |= set(v or set())
+
+    return out
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
