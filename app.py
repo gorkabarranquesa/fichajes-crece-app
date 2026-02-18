@@ -1745,9 +1745,10 @@ if consultar:
 #   - Festivos y fin de semana: se tratan como día con jornada esperada 0 (cuenta si se trabaja >= 30 min).
 excesos_por_semana = {}
 csv_excesos = b""
-
-full_weeks = list_full_workweeks_in_range(d0, d1)
-
+        try:
+            full_weeks = list_full_workweeks_in_range(d0, d1)
+        except Exception:
+            full_weeks = []
 if (not resumen.empty) and full_weeks:
     sub = resumen.copy()
     sub["Departamento_norm"] = sub["Departamento"].astype(str).str.upper().str.strip()
@@ -1905,7 +1906,10 @@ if st.session_state["last_sig"] != current_sig:
     st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
     st.stop()
 
-weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
+try:
+    weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
+except Exception:
+    weeks_ui = []
 show_week_tab = bool(weeks_ui)
 
 if show_week_tab:
