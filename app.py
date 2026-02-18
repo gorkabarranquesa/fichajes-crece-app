@@ -1739,16 +1739,17 @@ if consultar:
 
         # --------- EXCESO SEMANAL (MOI + ESTRUCTURA + MOD) — usando Tiempo Contabilizado ----------
 # ✅ Criterio (RRHH):
-#   - El exceso se calcula POR DÍA: solo cuenta si ese día hay al menos +30 min sobre su jornada diaria.
-#   - El exceso diario se redondea a tramos de 30 min (floor): 30–59 => 00:30, 60–89 => 01:00, etc.
-#   - El exceso semanal mostrado es la SUMA de excesos diarios (ya cuantizados).
-#   - Festivos y fin de semana: se tratan como día con jornada esperada 0 (cuenta si se trabaja >= 30 min).
+#   - El exceso se calcula POR DÍA (tramos de 30 min, floor). Luego se suma en la semana.
+#   - Festivos y fin de semana NO son “siempre exceso”: se tratan como jornada esperada 0 ese día.
+#     -> cuentan solo si ese día se trabaja >= 30 min (y se cuantiza a 30/60/90...).
 excesos_por_semana = {}
 csv_excesos = b""
-        try:
-            full_weeks = list_full_workweeks_in_range(d0, d1)
-        except Exception:
-            full_weeks = []
+
+try:
+    full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+except Exception:
+    full_weeks = []
+
 if (not resumen.empty) and full_weeks:
     sub = resumen.copy()
     sub["Departamento_norm"] = sub["Departamento"].astype(str).str.upper().str.strip()
@@ -1761,108 +1762,136 @@ if (not resumen.empty) and full_weeks:
         # minutos por día desde Tiempo Contabilizado
         sub["mins_tc"] = sub["Tiempo Contabilizado"].apply(hhmm_to_min).astype(int)
 
-        def expected_day_minutes(depto: str, nombre: str, wd: int, is_festivo: bool) -> int:
-            # sáb/dom o festivo => 0
-            if wd > 4:
+        # Para MOD necesitamos aproximar el turno por la primera entrada del día
+        sub["primera_min"] = sub["Primera entrada"].apply(hhmm_to_min_clock)
+
+        def _is_festivo_day(sede: str, day: date) -> tuple[bool, str]:
+                    # retorna (is_festivo, label)
+                    day_str = day.strftime("%Y-%m-%d")
+                    fest_dates = get_festivos_for_sede(sede, festivos_by_sede)
+                    if day_str in fest_dates:
+                        label = get_festivo_label_for_sede_date(sede, day_str, festivos_labels_by_sede)
+                        return True, (label or "Festivo")
+                    return False, 
+
+        def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
+            # Fin de semana o festivo => jornada esperada 0
+            is_fest, _ = _is_festivo_day(sede, day)
+            if wd >= 5 or is_fest:
                 return 0
-            if is_festivo:
-                return 0
-            min_h, _ = calcular_minimos(depto, wd, nombre)
-            if min_h is None:
-                return 0
-            return int(round(float(min_h) * 60))
+
+            if depto_norm in ["MOI", "ESTRUCTURA"]:
+                min_h, _ = calcular_minimos(depto_norm, wd, nombre)
+                return int(round(float(min_h) * 60)) if min_h is not None else 0
+
+            if depto_norm == "MOD":
+                # jornada estándar MOD: 8h/día L-V (salvo festivo)
+                return 8 * 60
+
+            return 0
+
+        def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
+            # MOD: no cuenta lo trabajado ANTES del inicio del turno.
+            # Turno mañana: 06:00–14:00  | Turno tarde: 14:00–22:00
+            # (Noche no se fuerza aquí; con datos actuales es lo más estable)
+            if primera_min is None:
+                return max(0, int(mins_tc))
+
+            # Heurística de turno por primera entrada
+            if primera_min < 12 * 60:
+                shift_start = 6 * 60
+            else:
+                shift_start = 14 * 60
+
+            early = max(0, shift_start - primera_min)  # minutos antes del inicio
+            return max(0, int(mins_tc) - int(early))
 
         all_rows = []
 
-        for wk_start, wk_end_incl, wk_mode in full_weeks:
-            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
+        for wk_start, wk_end_incl, mode in full_weeks:
+            # Etiqueta (L-V / L-S / L-D)
+            if mode == "LD":
+                label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-D)"
+            elif mode == "LS":
+                label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-S)"
+            else:
+                label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-V)"
 
             mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
             w = sub[mask_week].copy()
 
             rows = []
             if not w.empty:
-                for (nif, nombre, depto, empresa, sede), wemp in w.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede"]):
-                    depto_s = str(depto or "").strip()
+                for (nif, nombre, depto, empresa, sede), wemp in w.groupby(
+                    ["nif", "Nombre", "Departamento", "Empresa", "Sede"]
+                ):
+                    depto_norm = str(depto or "").upper().strip()
                     nombre_s = str(nombre or "").strip()
                     sede_s = str(sede or "").strip()
 
-                    fest_set_str = get_festivos_for_sede(sede_s, festivos_by_sede)
-                    fest_set_date = set()
-                    for ds in (fest_set_str or set()):
-                        try:
-                            fest_set_date.add(datetime.strptime(ds, "%Y-%m-%d").date())
-                        except Exception:
-                            pass
+                    # exceso semanal = suma de excesos diarios cuantizados
+                    exceso_sem_min = 0
+                    trabajado_sem_min = 0
+                    jornada_sem_min = 0
 
-                    # Jornada semanal esperada (para mostrar)
-                    exp_week_mins = 0
-                    cur_d = wk_start
-                    while cur_d <= wk_end_incl:
-                        wd = cur_d.weekday()
-                        exp_week_mins += expected_day_minutes(depto_s, nombre_s, wd, (cur_d in fest_set_date))
-                        cur_d += timedelta(days=1)
+                    for _, rday in wemp.iterrows():
+                        day = rday["Fecha_dt"]
+                        wd = int(day.weekday())
+                        mins_tc = int(rday.get("mins_tc") or 0)
+                        primera_min = rday.get("primera_min")
+                        trabajado_sem_min += mins_tc
 
-                    exceso_week_mins = 0
+                        exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, day, wd)
+                        jornada_sem_min += exp_day
 
-                    for _, rr in wemp.iterrows():
-                        day_dt = rr.get("Fecha_dt")
-                        if day_dt is None:
-                            continue
-                        mins_tc_day = int(rr.get("mins_tc", 0) or 0)
-                        if mins_tc_day <= 0:
-                            continue
-
-                        wd = int(day_dt.weekday())
-                        is_festivo = day_dt in fest_set_date
-                        exp_day = expected_day_minutes(depto_s, nombre_s, wd, is_festivo)
-
-                        # MOD: no cuenta adelanto antes del inicio del turno
-                        if depto_s.upper().strip() == "MOD":
-                            e_min = hhmm_to_min_clock(str(rr.get("Primera entrada", "") or ""))
-                            if e_min is None:
-                                shift_start = 6 * 60
-                            elif e_min < 12 * 60:
-                                shift_start = 6 * 60
-                            elif e_min < 21 * 60:
-                                shift_start = 14 * 60
-                            else:
-                                shift_start = 22 * 60
-
-                            early = max(0, shift_start - (e_min or shift_start))
-                            worked_eff = max(0, mins_tc_day - early)
+                        # trabajado efectivo para MOD (no cuenta minutos antes del inicio de turno)
+                        if depto_norm == "MOD" and exp_day > 0:
+                            mins_eff = effective_worked_minutes_for_mod(mins_tc, primera_min)
                         else:
-                            worked_eff = mins_tc_day
+                            mins_eff = mins_tc
 
-                        extra_raw = max(0, worked_eff - exp_day)
-                        extra_block = floor_to_30(extra_raw) if extra_raw >= 30 else 0
-                        exceso_week_mins += extra_block
+                        # exceso diario bruto
+                        exceso_day = max(mins_eff - exp_day, 0)
 
-                    if exceso_week_mins <= 0:
+                        # cuantizar a tramos de 30 (floor) y sumar solo si >=30
+                        exceso_day_q = floor_to_30(exceso_day) if exceso_day >= 30 else 0
+                        exceso_sem_min += exceso_day_q
+
+                    # mostrar solo si hay exceso cuantizado
+                    if exceso_sem_min <= 0:
                         continue
-
-                    trabajado_total = int(wemp["mins_tc"].sum())
 
                     row = {
                         "Empresa": str(empresa or ""),
                         "Sede": sede_s,
                         "Nombre": nombre_s,
-                        "Departamento": depto_s,
-                        "Trabajado semanal": segundos_a_hhmm(trabajado_total * 60),
-                        "Jornada semanal": segundos_a_hhmm(exp_week_mins * 60),
-                        "Exceso": mins_to_hhmm_signed(exceso_week_mins),
+                        "Departamento": str(depto or ""),
+                        "Trabajado semanal": segundos_a_hhmm(trabajado_sem_min * 60),
+                        "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
+                        "Exceso": mins_to_hhmm_signed(exceso_sem_min),
                     }
                     rows.append(row)
                     all_rows.append({"Semana": label, **row})
 
             if rows:
-                dfw = pd.DataFrame(rows).sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort").reset_index(drop=True)
+                dfw = (
+                    pd.DataFrame(rows)
+                    .sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                    .reset_index(drop=True)
+                )
             else:
-                dfw = pd.DataFrame(columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"])
+                dfw = pd.DataFrame(
+                    columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"]
+                )
+
             excesos_por_semana[label] = dfw
 
         if all_rows:
-            df_all = pd.DataFrame(all_rows).sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort").reset_index(drop=True)
+            df_all = (
+                pd.DataFrame(all_rows)
+                .sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                .reset_index(drop=True)
+            )
             csv_excesos = df_all.to_csv(index=False).encode("utf-8")
 
 # --------- Guardar en estado + CSVs ----------
