@@ -470,6 +470,26 @@ def floor_to_30(mins: int) -> int:
     return (mins // 30) * 30
 
 
+def ceil_to_30(mins: int) -> int:
+    if mins <= 0:
+        return 0
+    return ((mins + 29) // 30) * 30
+
+
+def quantize_daily_balance_30(diff_mins: int, tol: int = 5) -> int:
+    """Cuantiza un balance diario en tramos de 30 min con tolerancia.
+    - |diff| <= tol => 0
+    - diff > tol: no suma nada si diff < 30; si diff >= 30 => floor a múltiplos de 30
+    - diff < -tol: resta hacia 'más falta' => -ceil(|diff|/30)*30
+    """
+    d = int(diff_mins)
+    if abs(d) <= int(tol):
+        return 0
+    if d > 0:
+        return floor_to_30(d) if d >= 30 else 0
+    return -ceil_to_30(abs(d))
+
+
 def mins_to_hhmm_signed(mins: int) -> str:
     sign = "+" if mins >= 0 else "-"
     a = abs(int(mins))
@@ -1849,15 +1869,13 @@ if consultar:
                             else:
                                 mins_eff = mins_tc
     
-                            # exceso diario bruto
-                            exceso_day = max(mins_eff - exp_day, 0)
-    
-                            # cuantizar a tramos de 30 (floor) y sumar solo si >=30
-                            exceso_day_q = floor_to_30(exceso_day) if exceso_day >= 30 else 0
-                            exceso_sem_min += exceso_day_q
-    
-                        # mostrar solo si hay exceso cuantizado
-                        if exceso_sem_min <= 0:
+                            # balance diario (mins_eff - jornada esperada) con tolerancia ±5 min
+                            diff_day = int(mins_eff) - int(exp_day)
+                            bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
+                            exceso_sem_min += int(bal_day_q)
+
+                        # mostrar solo si el balance semanal no es 0 (puede ser + o -)
+                        if exceso_sem_min == 0:
                             continue
     
                         row = {
