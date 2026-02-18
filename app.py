@@ -179,10 +179,16 @@ def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
+
     CSV esperado: separador ';' con columnas tipo:
       - "Próxima ocurrencia" (dd/mm/yyyy)
       - "Sede(s)" (con sedes separadas por '|')
-      - opcional "Repetición" / nota (p.ej. "En P3 no será festivo")
+      - opcional "Tipo" (p.ej. NACIONAL)
+      - opcional "Repetición" / notas (p.ej. "En P3 no será festivo")
+
+    Comportamiento:
+      - Si Tipo contiene "NACIONAL": aplica a TODAS las sedes permitidas (salvo exclusiones explícitas en notas).
+      - Si no es NACIONAL: aplica a las sedes listadas en "Sede(s)".
     """
     if not file_bytes:
         return {}
@@ -199,7 +205,6 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     if df.empty:
         return {}
 
-    # columnas
     col_fecha = None
     for c in ["Próxima ocurrencia", "Proxima ocurrencia", "PROXIMA OCURRENCIA", "Fecha", "FECHA"]:
         if c in df.columns:
@@ -212,14 +217,28 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
             col_sedes = c
             break
 
+    col_tipo = None
+    for c in ["Tipo", "TIPO"]:
+        if c in df.columns:
+            col_tipo = c
+            break
+
     col_nota = None
     for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
         if c in df.columns:
             col_nota = c
             break
+    if col_nota is None:
+        # a veces las notas vienen como columna sin nombre
+        for c in df.columns:
+            if str(c).startswith("Unnamed:"):
+                col_nota = c
+                break
 
     if not col_fecha or not col_sedes:
         return {}
+
+    allowed_sedes_local = ["P0 IBSA", "P1 LAKUNTZA", "P2 COMARCA II", "P3 UHARTE"]
 
     def parse_ddmmyyyy(s: str):
         if not isinstance(s, str):
@@ -235,24 +254,43 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
         except Exception:
             return None
 
-    out = {}
+    def excluded_codes_from_note(note_u: str) -> set:
+        if not note_u:
+            return set()
+        out = set()
+        for code in ["P0", "P1", "P2", "P3"]:
+            if (f"EN {code}" in note_u) and ("NO" in note_u) and ("FESTIV" in note_u):
+                out.add(code)
+        return out
+
+    out: dict[str, set] = {}
+
     for _, r in df.iterrows():
         fecha_raw = str(r.get(col_fecha, "") or "").strip()
-        sede_raw = str(r.get(col_sedes, "") or "").strip()
-        if not fecha_raw or not sede_raw:
+        if not fecha_raw:
             continue
 
         fecha = parse_ddmmyyyy(fecha_raw)
         if not fecha:
             continue
 
-        nota = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
-        exclude_p3 = ("P3" in nota and "NO" in nota and "FESTIV" in nota)
+        tipo_u = str(r.get(col_tipo, "") or "").strip().upper() if col_tipo else ""
+        nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
+        excluded = excluded_codes_from_note(nota_u)
 
-        sedes = [x.strip() for x in sede_raw.split("|") if x.strip()]
-        for s in sedes:
+        sede_raw = str(r.get(col_sedes, "") or "").strip()
+
+        if "NACIONAL" in tipo_u:
+            sedes_list = allowed_sedes_local
+        else:
+            if not sede_raw:
+                continue
+            sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
+
+        for s in sedes_list:
             s_norm = _norm_key(s)
-            if exclude_p3 and s_norm.startswith("P3"):
+            code = _sede_code(s_norm)
+            if code and (code in excluded):
                 continue
             out.setdefault(s_norm, set()).add(fecha)
 
@@ -412,14 +450,18 @@ def _iter_days(d0: date, d1: date):
         cur += timedelta(days=1)
 
 
+
 def list_full_workweeks_in_range(fi: date, ff: date):
     """
     Semanas completas contenidas dentro del rango.
 
-    - Si el rango cubre L-V (lunes a viernes) -> se incluye semana L-V
-    - Si además cubre sábado+domingo -> se devuelve esa semana como L-D
+    Reglas:
+    - Para incluir una semana, el rango debe cubrir como mínimo L-V.
+    - Si además cubre sábado -> se devuelve como L-S.
+    - Si además cubre sábado+domingo -> se devuelve como L-D.
 
-    Devuelve lista de tuplas: (week_start_monday, week_end_inclusive, include_weekend_bool)
+    Devuelve lista de tuplas: (week_start_monday, week_end_inclusive, weekend_mode)
+      weekend_mode: "LV" | "LS" | "LD"
     """
 
     def monday_of(d: date) -> date:
@@ -435,10 +477,22 @@ def list_full_workweeks_in_range(fi: date, ff: date):
         sat = cur + timedelta(days=5)
         sun = cur + timedelta(days=6)
 
+        # Semana base L-V completa
         if (fi <= mon) and (ff >= fri):
-            include_weekend = (fi <= sat) and (ff >= sun)
-            end_incl = sun if include_weekend else fri
-            weeks.append((mon, end_incl, include_weekend))
+            include_sat = (fi <= sat) and (ff >= sat)
+            include_sun = (fi <= sun) and (ff >= sun)
+
+            if include_sun and include_sat:
+                end_incl = sun
+                mode = "LD"
+            elif include_sat:
+                end_incl = sat
+                mode = "LS"
+            else:
+                end_incl = fri
+                mode = "LV"
+
+            weeks.append((mon, end_incl, mode))
 
         cur += timedelta(days=7)
 
@@ -705,15 +759,21 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     return min_h, min_f
 
 
-def expected_week_minutes_for_employee(depto: str, nombre: str, sede: str, week_mon: date, week_fri: date, festivos_by_sede: dict) -> int:
+def expected_week_minutes_for_employee(
+    depto: str,
+    nombre: str,
+    sede: str,
+    week_mon: date,
+    week_fri: date,
+    festivos_by_sede: dict
+) -> int:
     """
     Jornada esperada semanal por empleado:
     - suma jornada diaria esperada (calcular_minimos) de L-V
     - si un día es festivo en ESA sede -> no suma jornada ese día
     - así los de jornada especial quedan automáticamente bien
     """
-    sede_norm = _norm_key(sede)
-    festivos = festivos_by_sede.get(sede_norm, set())
+    festivos = get_festivos_for_sede(sede, festivos_by_sede)
 
     total = 0
     cur = week_mon
@@ -1728,12 +1788,12 @@ if consultar:
 
                 all_rows = []
 
-                for wk_start, wk_end_incl, include_weekend in full_weeks:
+                for wk_start, wk_end_incl, wk_mode in full_weeks:
                     wk_fri = wk_start + timedelta(days=4)
                     wk_sat = wk_start + timedelta(days=5)
                     wk_sun = wk_start + timedelta(days=6)
 
-                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if include_weekend else "L-V") + ")"
+                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
 
                     mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
                     w = sub[mask_week].copy()
@@ -1753,7 +1813,7 @@ if consultar:
                             except Exception:
                                 pass
 
-                        weekend_set = {wk_sat, wk_sun} if include_weekend else set()
+                        weekend_set = ({wk_sat, wk_sun} if wk_mode=="LD" else ({wk_sat} if wk_mode=="LS" else set()))
 
                         # minutos trabajados en festivo / fin de semana
                         mins_fest = int(wemp[wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else 0
@@ -1934,8 +1994,8 @@ if show_week_tab:
     with tab4:
         excesos = st.session_state.get("result_excesos_semana", {}) or {}
 
-        for wk_start, wk_end_incl, include_weekend in weeks_ui:
-            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if include_weekend else "L-V") + ")"
+        for wk_start, wk_end_incl, wk_mode in weeks_ui:
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
             st.markdown(f"### 🗓 {label}")
             dfw = excesos.get(label)
             if dfw is None or dfw.empty:
