@@ -135,10 +135,14 @@ def _norm_key(s: str) -> str:
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
+
     CSV esperado: separador ';' con columnas tipo:
       - "Próxima ocurrencia" (dd/mm/yyyy)
       - "Sede(s)" (con sedes separadas por '|')
-      - opcional "Repetición" / nota (p.ej. "En P3 no será festivo")
+      - "Tipo" (p.ej. Nacional/Local). Si es NACIONAL => se aplica a TODAS las sedes (P0/P1/P2/P3)
+        aunque el CSV no liste alguna sede (esto evita fallos como 06/01 no marcado en P0).
+      - Nota opcional (a veces viene como "Repetición", "Notas" o una columna "Unnamed: x") con textos:
+        "En P3 no será festivo", etc.
     """
     if not file_bytes:
         return {}
@@ -168,11 +172,23 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
             col_sedes = c
             break
 
+    col_tipo = None
+    for c in ["Tipo", "TIPO"]:
+        if c in df.columns:
+            col_tipo = c
+            break
+
+    # Nota: a veces es "Unnamed: x"
     col_nota = None
     for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
         if c in df.columns:
             col_nota = c
             break
+    if col_nota is None:
+        for c in df.columns:
+            if str(c).startswith("Unnamed:"):
+                col_nota = c
+                break
 
     if not col_fecha or not col_sedes:
         return {}
@@ -191,24 +207,50 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
         except Exception:
             return None
 
+    def excluded_codes_from_note(note_u: str) -> set:
+        """
+        Detecta exclusiones estilo:
+          - 'En P3 no será festivo'
+          - 'En P0 NO sera festivo'
+        """
+        if not note_u:
+            return set()
+        out = set()
+        for code in ["P0", "P1", "P2", "P3"]:
+            if (f"EN {code}" in note_u) and ("NO" in note_u) and ("FESTIV" in note_u):
+                out.add(code)
+        return out
+
+    # sedes permitidas (constante local para no depender del orden de definición en el archivo)
+    allowed_sedes_local = ["P0 IBSA", "P1 LAKUNTZA", "P2 COMARCA II", "P3 UHARTE"]
+
     out = {}
     for _, r in df.iterrows():
         fecha_raw = str(r.get(col_fecha, "") or "").strip()
         sede_raw = str(r.get(col_sedes, "") or "").strip()
-        if not fecha_raw or not sede_raw:
+        if not fecha_raw:
             continue
 
         fecha = parse_ddmmyyyy(fecha_raw)
         if not fecha:
             continue
 
-        nota = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
-        exclude_p3 = ("P3" in nota and "NO" in nota and "FESTIV" in nota)
+        tipo_u = str(r.get(col_tipo, "") or "").strip().upper() if col_tipo else ""
+        nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
+        excluded = excluded_codes_from_note(nota_u)
 
-        sedes = [x.strip() for x in sede_raw.split("|") if x.strip()]
-        for s in sedes:
+        # Heurística: festivo nacional => todas las sedes (salvo exclusión explícita)
+        if "NACIONAL" in tipo_u:
+            sedes_list = allowed_sedes_local
+        else:
+            if not sede_raw:
+                continue
+            sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
+
+        for s in sedes_list:
             s_norm = _norm_key(s)
-            if exclude_p3 and s_norm.startswith("P3"):
+            code = _sede_code(s_norm)
+            if code in excluded:
                 continue
             out.setdefault(s_norm, set()).add(fecha)
 
@@ -1527,7 +1569,9 @@ if consultar:
             sin_por_dia[day] = out
 
         # --------- EXCESO SEMANAL (MOI + ESTRUCTURA) — usando Tiempo Contabilizado ----------
-        # ✅ Mejora: el trabajo en festivo SIEMPRE cuenta como exceso (no se compensa con faltas de otros días)
+        # ✅ Mejora:
+        #   - Trabajo en festivo SIEMPRE cuenta como exceso
+        #   - Si el rango incluye semana completa con fin de semana (L-D), sábado/domingo también suman como exceso
         excesos_por_semana = {}
         csv_excesos = b""
 
@@ -1547,10 +1591,16 @@ if consultar:
                 all_rows = []
 
                 for wk_start, wk_end in full_weeks:
-                    mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end)
+                    # ¿El rango cubre también sábado+domingo de esa semana?
+                    wk_sat = wk_start + timedelta(days=5)
+                    wk_sun = wk_start + timedelta(days=6)
+                    include_weekend = (d0 <= wk_sat) and (d1 >= wk_sun)
+
+                    wk_end_incl = wk_sun if include_weekend else wk_end
+
+                    mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
                     w = sub[mask_week].copy()
 
-                    # a nivel empleado necesitamos el detalle por día para separar festivos/no festivos
                     rows = []
                     for (nif, nombre, depto, empresa, sede), wemp in w.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede"]):
                         depto_s = str(depto or "").strip()
@@ -1566,31 +1616,41 @@ if consultar:
                             except Exception:
                                 pass
 
+                        weekend_set = {wk_sat, wk_sun} if include_weekend else set()
+
+                        # minutos trabajados:
                         mins_fest = int(wemp[wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else 0
-                        mins_nonfest = int(wemp[~wemp["Fecha_dt"].isin(fest_set_date)]["mins_tc"].sum()) if fest_set_date else int(wemp["mins_tc"].sum())
+                        mins_weekend = int(wemp[wemp["Fecha_dt"].isin(weekend_set)]["mins_tc"].sum()) if weekend_set else 0
+
+                        # Mon-Fri no festivo (para comparar vs jornada)
+                        mask_monfri = (wemp["Fecha_dt"] >= wk_start) & (wemp["Fecha_dt"] <= wk_end)
+                        if fest_set_date:
+                            mask_monfri = mask_monfri & (~wemp["Fecha_dt"].isin(fest_set_date))
+                        mins_nonfest_monfri = int(wemp[mask_monfri]["mins_tc"].sum())
 
                         exp_min = expected_week_minutes_for_employee(depto_s, nombre_s, sede_s, wk_start, wk_end, festivos_by_sede)
 
-                        # Exceso = trabajo en festivo (siempre) + exceso sobre jornada en no festivos
-                        extra_nonfest = max(mins_nonfest - exp_min, 0)
-                        exceso_total = mins_fest + extra_nonfest
+                        # Exceso = (festivo + fin de semana) siempre + exceso sobre jornada en Mon-Fri no festivo
+                        extra_nonfest = max(mins_nonfest_monfri - exp_min, 0)
+                        exceso_total = mins_fest + mins_weekend + extra_nonfest
 
                         exceso_min = floor_to_30(exceso_total) if exceso_total >= 30 else 0
                         if exceso_min <= 0:
                             continue
 
+                        trabajado_total = mins_fest + mins_weekend + int(wemp[~wemp["Fecha_dt"].isin(fest_set_date | weekend_set)]["mins_tc"].sum())
                         row = {
                             "Empresa": str(empresa or ""),
                             "Sede": sede_s,
                             "Nombre": nombre_s,
                             "Departamento": depto_s,
-                            "Trabajado semanal": segundos_a_hhmm((mins_fest + mins_nonfest) * 60),
+                            "Trabajado semanal": segundos_a_hhmm(trabajado_total * 60),
                             "Jornada semanal": segundos_a_hhmm(exp_min * 60),
                             "Exceso": mins_to_hhmm_signed(exceso_min),
                         }
                         rows.append(row)
                         all_rows.append({
-                            "Semana": f"{wk_start:%Y-%m-%d} → {wk_end:%Y-%m-%d} (L-V)",
+                            "Semana": f"{wk_start:%Y-%m-%d} → {wk_end:%Y-%m-%d} (L-V)" + (" + finde" if include_weekend else ""),
                             **row
                         })
 
