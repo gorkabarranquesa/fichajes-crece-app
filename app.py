@@ -2010,35 +2010,37 @@ if consultar:
                 csv_excesos = df_all.to_csv(index=False).encode("utf-8")
     
     
-# --------- Guardar en estado + CSVs ----------
-incidencias_por_dia = {}
-if not salida_incidencias.empty:
-    for day, subd in salida_incidencias.groupby("Fecha"):
-        incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
+if consultar:
+    # --------- Guardar en estado + CSVs ----------
+    incidencias_por_dia = {}
+    if not salida_incidencias.empty:
+        for day, subd in salida_incidencias.groupby("Fecha"):
+            incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
 
-st.session_state["last_sig"] = signature
-st.session_state["result_incidencias"] = incidencias_por_dia
-st.session_state["result_bajas"] = bajas_por_dia
-st.session_state["result_sin_fichajes"] = sin_por_dia
-st.session_state["result_excesos_semana"] = excesos_por_semana
+    st.session_state["last_sig"] = signature
+    st.session_state["result_incidencias"] = incidencias_por_dia
+    st.session_state["result_bajas"] = bajas_por_dia
+    st.session_state["result_sin_fichajes"] = sin_por_dia
+    st.session_state["result_excesos_semana"] = excesos_por_semana
 
-st.session_state["result_csv_incidencias"] = (
-    salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
-)
+    st.session_state["result_csv_incidencias"] = (
+        salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+    )
 
-if bajas_por_dia:
-    df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
-    st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
-else:
-    st.session_state["result_csv_bajas"] = b""
+    if bajas_por_dia:
+        df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_bajas"] = b""
 
-if sin_por_dia:
-    df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
-    st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
-else:
-    st.session_state["result_csv_sin"] = b""
+    if sin_por_dia:
+        df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_sin"] = b""
 
-st.session_state["result_csv_excesos"] = csv_excesos
+    st.session_state["result_csv_excesos"] = csv_excesos
+
 
 # ------------------------------------------------------------
 # Render: Tabs
