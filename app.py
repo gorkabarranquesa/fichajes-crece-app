@@ -2067,6 +2067,14 @@ res_exc = st.session_state.get("result_excesos_semana", {}) or {}
 
 _tab_fich, _tab_bajas, _tab_sin, _tab_exc = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
 
+tab_map = {
+    "tab_fich": _tab_fich,
+    "tab_bajas": _tab_bajas,
+    "tab_sin": _tab_sin,
+    "tab_exc": _tab_exc,
+}
+
+
 if "tab_fich" in tab_map:
     with tab_map["tab_fich"]:
         incid = st.session_state.get("result_incidencias", {}) or {}
