@@ -2052,7 +2052,7 @@ current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
 results_ready = (st.session_state.get("last_sig", "") == current_sig)
 if not results_ready:
     st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
-    st.stop()
+
 
 try:
     weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
@@ -2060,10 +2060,11 @@ except Exception:
     weeks_ui = []
 
 # Pestañas (siempre visibles)
-res_incid = st.session_state.get("result_incidencias", {}) or {}
-res_bajas = st.session_state.get("result_bajas", {}) or {}
-res_sin = st.session_state.get("result_sin_fichajes", {}) or {}
-res_exc = st.session_state.get("result_excesos_semana", {}) or {}
+# Solo mostramos resultados si corresponden a los filtros actuales (firma coincide)
+res_incid = (st.session_state.get("result_incidencias", {}) or {}) if results_ready else {}
+res_bajas = (st.session_state.get("result_bajas", {}) or {}) if results_ready else {}
+res_sin = (st.session_state.get("result_sin_fichajes", {}) or {}) if results_ready else {}
+res_exc = (st.session_state.get("result_excesos_semana", {}) or {}) if results_ready else {}
 
 _tab_fich, _tab_bajas, _tab_sin, _tab_exc = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
 
@@ -2077,7 +2078,7 @@ tab_map = {
 
 if "tab_fich" in tab_map:
     with tab_map["tab_fich"]:
-        incid = st.session_state.get("result_incidencias", {}) or {}
+        incid = res_incid
         if not incid:
             st.success("🎉 No hay incidencias en el rango seleccionado.")
         else:
@@ -2109,7 +2110,7 @@ if "tab_fich" in tab_map:
 
 if "tab_bajas" in tab_map:
     with tab_map["tab_bajas"]:
-        bajas = st.session_state.get("result_bajas", {}) or {}
+        bajas = res_bajas
         if not bajas:
             st.info("No hay empleados de baja en el rango seleccionado.")
         else:
