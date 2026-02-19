@@ -61,6 +61,7 @@ EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
 # ============================================================
 
 DEFAULT_FESTIVOS_CSV_PATH = "Listado Festivos.csv"
+FESTIVOS_PERSIST_PATH = "festivos_saved.csv"  # persistente entre recargas (si el FS lo permite)
 
 
 def _safe_fail(_exc: Exception) -> None:
@@ -176,6 +177,45 @@ def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
             out |= set(v or set())
 
     return out
+
+def _read_festivos_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    """Lee CSV de festivos de forma robusta (encoding/sep) y devuelve DataFrame."""
+    if not file_bytes:
+        return pd.DataFrame()
+    import io
+
+    # Intentos de decodificación
+    raw = None
+    for enc in ["utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            raw = file_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    if raw is None:
+        raw = file_bytes.decode("latin-1", errors="ignore")
+
+    best_df = pd.DataFrame()
+    best_cols = 0
+    for sep in [";", ",", "\t", "|"]:
+        try:
+            df_try = pd.read_csv(io.StringIO(raw), sep=sep, dtype=str)
+            if df_try.shape[1] > best_cols:
+                best_df = df_try
+                best_cols = df_try.shape[1]
+        except Exception:
+            continue
+
+    if best_cols < 2:
+        try:
+            best_df = pd.read_csv(io.StringIO(raw), sep=None, engine="python", dtype=str)
+        except Exception:
+            return pd.DataFrame()
+
+    if not best_df.empty:
+        best_df = best_df.dropna(axis=1, how="all")
+    return best_df
+
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
@@ -192,13 +232,7 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     if not file_bytes:
         return {}
 
-    import io
-    buf = io.BytesIO(file_bytes)
-    try:
-        df = pd.read_csv(buf, sep=";", dtype=str, encoding="utf-8")
-    except Exception:
-        buf.seek(0)
-        df = pd.read_csv(buf, sep=";", dtype=str, encoding="latin-1")
+    df = _read_festivos_csv_bytes(file_bytes)
 
     if df.empty:
         return {}
@@ -290,13 +324,7 @@ def load_festivos_labels_from_csv_bytes(file_bytes: bytes) -> dict:
     if not file_bytes:
         return {}
 
-    import io
-    buf = io.BytesIO(file_bytes)
-    try:
-        df = pd.read_csv(buf, sep=";", dtype=str, encoding="utf-8")
-    except Exception:
-        buf.seek(0)
-        df = pd.read_csv(buf, sep=";", dtype=str, encoding="latin-1")
+    df = _read_festivos_csv_bytes(file_bytes)
 
     if df.empty:
         return {}
@@ -1414,9 +1442,17 @@ if "festivos_csv_bytes" not in st.session_state:
 if "festivos_csv_name" not in st.session_state:
     st.session_state["festivos_csv_name"] = ""
 
+
 if clear_festivos:
     st.session_state["festivos_csv_bytes"] = b""
     st.session_state["festivos_csv_name"] = ""
+    # borrar persistencia en disco (si existe)
+    try:
+        import os
+        if os.path.exists(FESTIVOS_PERSIST_PATH):
+            os.remove(FESTIVOS_PERSIST_PATH)
+    except Exception:
+        pass
 
 # Fuente preferente: upload actual
 fb = b""
@@ -1425,8 +1461,29 @@ if fest_file is not None:
     if save_festivos and fb:
         st.session_state["festivos_csv_bytes"] = fb
         st.session_state["festivos_csv_name"] = getattr(fest_file, "name", "") or ""
+        # persistir también en disco para sobrevivir recargas
+        try:
+            with open(FESTIVOS_PERSIST_PATH, "wb") as f:
+                f.write(fb)
+        except Exception:
+            pass
 else:
+    # 1) sesión
     fb = st.session_state.get("festivos_csv_bytes", b"") or b""
+
+    # 2) persistido en disco
+    if not fb:
+        try:
+            import os
+            if os.path.exists(FESTIVOS_PERSIST_PATH):
+                with open(FESTIVOS_PERSIST_PATH, "rb") as f:
+                    fb = f.read()
+                    if fb:
+                        st.session_state["festivos_csv_bytes"] = fb
+        except Exception:
+            fb = b""
+
+    # 3) fallback a CSV local por defecto
     if not fb:
         try:
             import os
@@ -1435,7 +1492,6 @@ else:
                     fb = f.read()
         except Exception:
             fb = b""
-
 festivos_by_sede = load_festivos_from_csv_bytes(fb) if fb else {}
 festivos_labels_by_sede = load_festivos_labels_from_csv_bytes(fb) if fb else {}
 
@@ -1804,8 +1860,9 @@ if consultar:
                     return int(round(float(min_h) * 60)) if min_h is not None else 0
     
                 if depto_norm == "MOD":
-                    # jornada estándar MOD: 8h/día L-V (salvo festivo)
-                    return 8 * 60
+                    # MOD: la jornada diaria se calcula igual que el resto (respeta jornadas especiales por persona)
+                    min_h, _ = calcular_minimos(depto_norm, wd, nombre)
+                    return int(round(float(min_h) * 60)) if min_h is not None else 0
     
                 return 0
     
@@ -1852,27 +1909,46 @@ if consultar:
                         exceso_sem_min = 0
                         trabajado_sem_min = 0
                         jornada_sem_min = 0
-    
-                        for _, rday in wemp.iterrows():
-                            day = rday["Fecha_dt"]
-                            wd = int(day.weekday())
-                            mins_tc = int(rday.get("mins_tc") or 0)
-                            primera_min = rday.get("primera_min")
-                            trabajado_sem_min += mins_tc
-    
-                            exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, day, wd)
+
+                        # Mapa día -> (mins_tc, primera_min) (por si hubiera duplicados)
+                        day_map: dict[date, dict] = {}
+                        for _, rr in wemp.iterrows():
+                            d = rr["Fecha_dt"]
+                            mins = int(rr.get("mins_tc") or 0)
+                            pm = rr.get("primera_min")
+                            if d not in day_map:
+                                day_map[d] = {"mins_tc": mins, "primera_min": pm}
+                            else:
+                                day_map[d]["mins_tc"] += mins
+                                if pm is not None:
+                                    cur = day_map[d].get("primera_min")
+                                    if cur is None or (isinstance(cur, (int, float)) and pm < cur):
+                                        day_map[d]["primera_min"] = pm
+
+                        # Recorremos TODOS los días de la semana (incluidos días sin fichajes)
+                        cur_day = wk_start
+                        while cur_day <= wk_end_incl:
+                            wd = int(cur_day.weekday())
+                            rec = day_map.get(cur_day)
+                            mins_tc = int(rec["mins_tc"]) if rec else 0
+                            primera_min = rec.get("primera_min") if rec else None
+
+                            exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, cur_day, wd)
                             jornada_sem_min += exp_day
-    
-                            # trabajado efectivo para MOD (no cuenta minutos antes del inicio de turno)
+
+                            # trabajado efectivo para MOD (solo si es día laborable y hay jornada esperada)
                             if depto_norm == "MOD" and exp_day > 0:
                                 mins_eff = effective_worked_minutes_for_mod(mins_tc, primera_min)
                             else:
                                 mins_eff = mins_tc
-    
-                            # balance diario (mins_eff - jornada esperada) con tolerancia ±5 min
+
+                            trabajado_sem_min += int(mins_eff)
+
                             diff_day = int(mins_eff) - int(exp_day)
                             bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
                             exceso_sem_min += int(bal_day_q)
+
+                            cur_day += timedelta(days=1)
 
                         # mostrar solo si el balance semanal no es 0 (puede ser + o -)
                         if exceso_sem_min == 0:
@@ -1956,81 +2032,100 @@ try:
     weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
 except Exception:
     weeks_ui = []
-show_week_tab = bool(weeks_ui)
+# Pestañas dinámicas: cada pestaña aparece SOLO si tiene datos
+res_incid = st.session_state.get("result_incidencias", {}) or {}
+res_bajas = st.session_state.get("result_bajas", {}) or {}
+res_sin = st.session_state.get("result_sin_fichajes", {}) or {}
+res_exc = st.session_state.get("result_excesos_semana", {}) or {}
 
-if show_week_tab:
-    tab1, tab2, tab3, tab4 = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
-else:
-    tab1, tab2, tab3 = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"])
+tabs_spec = []
+if res_incid:
+    tabs_spec.append(("📌 Fichajes", "tab_fich"))
+if res_bajas:
+    tabs_spec.append(("🏥 Bajas", "tab_bajas"))
+if res_sin:
+    tabs_spec.append(("⛔ Sin fichajes", "tab_sin"))
+if res_exc:
+    tabs_spec.append(("🕒 Exceso de jornada", "tab_exc"))
 
-with tab1:
-    incid = st.session_state.get("result_incidencias", {}) or {}
-    if not incid:
-        st.success("🎉 No hay incidencias en el rango seleccionado.")
-    else:
-        for day in sorted(incid.keys()):
-            # Etiqueta de festivo (si aplica a alguna fila del día)
-            fest_names = set()
-            try:
-                df_day = incid[day]
-                if isinstance(df_day, pd.DataFrame) and (not df_day.empty):
-                    for _, rr in df_day.iterrows():
-                        sede_rr = str(rr.get("Sede", "") or "")
-                        if str(day) in get_festivos_for_sede(sede_rr, festivos_by_sede):
-                            nm = get_festivo_label_for_sede_date(sede_rr, str(day), festivos_labels_by_sede)
-                            fest_names.add(nm or "Festivo")
-            except Exception:
+if not tabs_spec:
+    st.info("No hay resultados para los filtros seleccionados (todavía).")
+    st.stop()
+
+_tabs = st.tabs([t[0] for t in tabs_spec])
+tab_map = {key: _tabs[i] for i, (_, key) in enumerate(tabs_spec)}
+
+if "tab_fich" in tab_map:
+    with tab_map["tab_fich"]:
+        incid = st.session_state.get("result_incidencias", {}) or {}
+        if not incid:
+            st.success("🎉 No hay incidencias en el rango seleccionado.")
+        else:
+            for day in sorted(incid.keys()):
+                # Etiqueta de festivo (si aplica a alguna fila del día)
                 fest_names = set()
+                try:
+                    df_day = incid[day]
+                    if isinstance(df_day, pd.DataFrame) and (not df_day.empty):
+                        for _, rr in df_day.iterrows():
+                            sede_rr = str(rr.get("Sede", "") or "")
+                            if str(day) in get_festivos_for_sede(sede_rr, festivos_by_sede):
+                                nm = get_festivo_label_for_sede_date(sede_rr, str(day), festivos_labels_by_sede)
+                                fest_names.add(nm or "Festivo")
+                except Exception:
+                    fest_names = set()
 
-            if len(fest_names) == 1:
-                fest_label = next(iter(fest_names))
-                st.markdown(f"### 📅 {day} ({fest_label})")
-            elif len(fest_names) > 1:
-                st.markdown(f"### 📅 {day} (Festivo)")
-            else:
-                st.markdown(f"### 📅 {day}")
-            st.data_editor(incid[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
-        csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
-        if csv_i:
-            st.download_button("⬇ Descargar CSV incidencias", csv_i, "fichajes_incidencias.csv", "text/csv")
+                if len(fest_names) == 1:
+                    fest_label = next(iter(fest_names))
+                    st.markdown(f"### 📅 {day} ({fest_label})")
+                elif len(fest_names) > 1:
+                    st.markdown(f"### 📅 {day} (Festivo)")
+                else:
+                    st.markdown(f"### 📅 {day}")
+                st.data_editor(incid[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+            csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
+            if csv_i:
+                st.download_button("⬇ Descargar CSV incidencias", csv_i, "fichajes_incidencias.csv", "text/csv")
 
-with tab2:
-    bajas = st.session_state.get("result_bajas", {}) or {}
-    if not bajas:
-        st.info("No hay empleados de baja en el rango seleccionado.")
-    else:
-        for day in sorted(bajas.keys()):
-            st.markdown(f"### 🏥 Empleados de baja — {day}")
-            st.data_editor(bajas[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
-        csv_b = st.session_state.get("result_csv_bajas", b"") or b""
-        if csv_b:
-            st.download_button("⬇ Descargar CSV bajas", csv_b, "empleados_baja.csv", "text/csv")
+if "tab_bajas" in tab_map:
+    with tab_map["tab_bajas"]:
+        bajas = st.session_state.get("result_bajas", {}) or {}
+        if not bajas:
+            st.info("No hay empleados de baja en el rango seleccionado.")
+        else:
+            for day in sorted(bajas.keys()):
+                st.markdown(f"### 🏥 Empleados de baja — {day}")
+                st.data_editor(bajas[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+            csv_b = st.session_state.get("result_csv_bajas", b"") or b""
+            if csv_b:
+                st.download_button("⬇ Descargar CSV bajas", csv_b, "empleados_baja.csv", "text/csv")
 
-with tab3:
-    sinf = st.session_state.get("result_sin_fichajes", {}) or {}
-    if not sinf:
-        st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
-    else:
-        for day in sorted(sinf.keys()):
-            st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
-            st.data_editor(sinf[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
-        csv_s = st.session_state.get("result_csv_sin", b"") or b""
-        if csv_s:
-            st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
+if "tab_sin" in tab_map:
+    with tab_map["tab_sin"]:
+        sinf = st.session_state.get("result_sin_fichajes", {}) or {}
+        if not sinf:
+            st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
+        else:
+            for day in sorted(sinf.keys()):
+                st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
+                st.data_editor(sinf[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+            csv_s = st.session_state.get("result_csv_sin", b"") or b""
+            if csv_s:
+                st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
 
-if show_week_tab:
-    with tab4:
-        excesos = st.session_state.get("result_excesos_semana", {}) or {}
+    if "tab_exc" in tab_map:
+        with tab_map["tab_exc"]:
+            excesos = st.session_state.get("result_excesos_semana", {}) or {}
 
-        for wk_start, wk_end_incl, wk_mode in weeks_ui:
-            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
-            st.markdown(f"### 🗓 {label}")
-            dfw = excesos.get(label)
-            if dfw is None or dfw.empty:
-                st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
-            else:
-                st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+            for wk_start, wk_end_incl, wk_mode in weeks_ui:
+                label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
+                st.markdown(f"### 🗓 {label}")
+                dfw = excesos.get(label)
+                if dfw is None or dfw.empty:
+                    st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
+                else:
+                    st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
-        csv_w = st.session_state.get("result_csv_excesos", b"") or b""
-        if csv_w:
-            st.download_button("⬇ Descargar CSV excesos (todas las semanas)", csv_w, "excesos_jornada_semanal.csv", "text/csv")
+            csv_w = st.session_state.get("result_csv_excesos", b"") or b""
+            if csv_w:
+                st.download_button("⬇ Descargar CSV excesos (todas las semanas)", csv_w, "excesos_jornada_semanal.csv", "text/csv")
