@@ -1,13 +1,8 @@
-# ===========================
-# app.py (FIXED USER 3)
-# ===========================
-
 import base64
 import json
 import multiprocessing
 import random
 import time
-import os
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -63,59 +58,55 @@ EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
 # FESTIVOS por sede (CSV)
 # - Upload en la app (prioridad)
 # - Si no se sube, intenta usar un CSV local llamado así (junto a app.py)
-# - Si se pulsa "Guardar CSV en memoria", además lo persistimos a disco
-#   para que sobreviva a recargas del navegador.
 # ============================================================
 
-DEFAULT_FESTIVOS_CSV_PATH = os.path.join("/tmp", "festivos_por_sede.csv") if os.name != "nt" else "Listado Festivos.csv"
+DEFAULT_FESTIVOS_CSV_PATH = "Listado Festivos.csv"
 
 
-# ============================================================
-# CATÁLOGOS LIMITADOS (RRHH)
-# ============================================================
-
-ALLOWED_EMPRESAS = [
-    "Barranquesa Tower Flanges, S.L.",
-    "Barranquesa Anchor Cages, S.L.",
-    "Industrial Barranquesa S.A.",
-]
-
-ALLOWED_SEDES = [
-    "P0 IBSA",
-    "P1 LAKUNTZA",
-    "P2 COMARCA II",
-    "P3 UHARTE",
-]
+def _safe_fail(_exc: Exception) -> None:
+    return None
 
 
-# ============================================================
-# UTILIDADES DE SEGURIDAD / HTTP
-# ============================================================
+def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT):
+    method = (method or "").upper().strip()
+    if method not in {"GET", "POST"}:
+        return None
 
-def _safe_fail(msg: str):
-    st.error(msg)
-    st.stop()
-
-
-def safe_request(method: str, url: str, **kwargs):
-    verify = kwargs.pop("verify", True)
-    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
-
-    for attempt in range(1, MAX_RETRIES + 1):
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            resp = _SESSION.request(method, url, timeout=timeout, verify=verify, **kwargs)
-            if resp.status_code in RETRY_STATUS:
-                sleep_s = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))) + random.random() * 0.25
-                time.sleep(sleep_s)
-                continue
-            return resp
-        except requests.RequestException:
-            if attempt == MAX_RETRIES:
-                raise
-            sleep_s = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))) + random.random() * 0.25
-            time.sleep(sleep_s)
+            resp = _SESSION.request(
+                method,
+                url,
+                data=data,
+                params=params,
+                json=json_body,
+                timeout=timeout,
+                verify=True,
+            )
 
-    raise RuntimeError("HTTP retries exhausted")
+            if resp.status_code in RETRY_STATUS:
+                if attempt < MAX_RETRIES:
+                    wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    wait += random.uniform(0, 0.25)
+                    time.sleep(wait)
+                    continue
+                return resp
+
+            return resp
+
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < MAX_RETRIES:
+                wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                wait += random.uniform(0, 0.25)
+                time.sleep(wait)
+                continue
+            _safe_fail(last_exc)
+            return None
+
+    _safe_fail(last_exc if last_exc else Exception("Unknown request error"))
+    return None
 
 
 # ============================================================
@@ -123,69 +114,76 @@ def safe_request(method: str, url: str, **kwargs):
 # ============================================================
 
 def norm_name(s: str) -> str:
-    if not isinstance(s, str):
+    if s is None:
         return ""
-    s = s.strip().upper()
-    repl = str.maketrans(
-        {
-            "Á": "A",
-            "À": "A",
-            "Ä": "A",
-            "Â": "A",
-            "É": "E",
-            "È": "E",
-            "Ë": "E",
-            "Ê": "E",
-            "Í": "I",
-            "Ì": "I",
-            "Ï": "I",
-            "Î": "I",
-            "Ó": "O",
-            "Ò": "O",
-            "Ö": "O",
-            "Ô": "O",
-            "Ú": "U",
-            "Ù": "U",
-            "Ü": "U",
-            "Û": "U",
-            "Ñ": "N",
-        }
-    )
-    s = s.translate(repl)
-    s = " ".join(s.split())
-    return s
+    return " ".join(str(s).upper().strip().split())
 
 
-def name_startswith(nombre: str, prefix: str) -> bool:
-    return norm_name(nombre).startswith(norm_name(prefix))
+def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
+    return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
 
 
-def _norm_key(x: str) -> str:
-    return norm_name(x)
+def _norm_key(s: str) -> str:
+    return " ".join((s or "").strip().upper().split())
 
 
+
+# --- sede code helper (needed for festivos) ---
 def _sede_code(sede: str) -> str:
-    s = norm_name(sede)
-    for code in ["P0", "P1", "P2", "P3"]:
-        if code in s:
-            return code
+    """Devuelve el código P0/P1/P2/P3 a partir del nombre de sede normalizado."""
+    s = _norm_key(sede)
+    if not s:
+        return ""
+    tok = s.split()[0]
+    if tok in {"P0", "P1", "P2", "P3"}:
+        return tok
+    for c in ["P0", "P1", "P2", "P3"]:
+        if s.startswith(c):
+            return c
     return ""
 
 
 # ============================================================
-# FESTIVOS (CSV) — {SEDE_NORM: set(YYYY-MM-DD)}
-# + etiquetas: {SEDE_NORM: {YYYY-MM-DD: "Nombre"}}
+# FESTIVOS CSV -> {SEDE_NORM: set(YYYY-MM-DD)}
 # ============================================================
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
+
+
 def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
-    return festivos_by_sede.get(_norm_key(sede), set()) if festivos_by_sede else set()
+    """Devuelve set de fechas 'YYYY-MM-DD' festivas para esa sede, con matching robusto."""
+    if not festivos_by_sede:
+        return set()
 
+    sede_norm = _norm_key(sede)
+    if sede_norm in festivos_by_sede:
+        return set(festivos_by_sede.get(sede_norm, set()) or set())
 
-@st.cache_data(show_spinner=False)
+    code = _sede_code(sede_norm)
+    if not code:
+        return set()
+
+    out = set()
+
+    # Caso: CSV con clave "P1"
+    if code in festivos_by_sede:
+        out |= set(festivos_by_sede.get(code, set()) or set())
+
+    # Caso: CSV con clave "P1 LAKUNTZA" (o variantes)
+    for k, v in festivos_by_sede.items():
+        k_norm = _norm_key(k)
+        if k_norm.startswith(code):
+            out |= set(v or set())
+
+    return out
 def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
     """
-    Devuelve {SEDE_NORM: set(YYYY-MM-DD)}.
+    Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
+
+    CSV esperado (separador ';') con columnas tipo:
+      - "Próxima ocurrencia" (dd/mm/yyyy)
+      - "Sede(s)" (con sedes separadas por '|')
+      - opcional "Repetición"/"Notas" con exclusiones tipo: "En P3 no será festivo"
 
     Regla (según RRHH):
       - NO se infiere 'NACIONAL' como "para todas las sedes".
@@ -246,6 +244,7 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
         if not note_u:
             return set()
         out = set()
+        # patrón típico: "En P3 no será festivo"
         for code_ in ["P0", "P1", "P2", "P3"]:
             if (f"EN {code_}" in note_u) and ("NO" in note_u) and ("FESTIV" in note_u):
                 out.add(code_)
@@ -255,32 +254,31 @@ def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
 
     for _, r in df.iterrows():
         fecha_raw = str(r.get(col_fecha, "") or "").strip()
-        sede_raw = str(r.get(col_sedes, "") or "").strip()
-        if not fecha_raw or not sede_raw:
+        if not fecha_raw:
             continue
-
         fecha = parse_ddmmyyyy(fecha_raw)
         if not fecha:
+            continue
+
+        sede_raw = str(r.get(col_sedes, "") or "").strip()
+        if not sede_raw:
             continue
 
         nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
         excluded = excluded_codes_from_note(nota_u)
 
-        sedes_list = [x.strip() for x in sede_raw.split("|") if x and str(x).strip()]
-        for sede_item in sedes_list:
-            sede_item = sede_item.strip()
-            if not sede_item:
+        sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
+        for s in sedes_list:
+            s_norm = _norm_key(s)
+            code_ = _sede_code(s_norm)
+            if code_ and (code_ in excluded):
                 continue
-            code = _sede_code(sede_item)
-            if code and code in excluded:
-                continue
-            sede_norm = _norm_key(sede_item)
-            out.setdefault(sede_norm, set()).add(fecha)
+            out.setdefault(s_norm, set()).add(fecha)
 
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_festivos_labels_from_csv_bytes(file_bytes: bytes) -> dict:
     """
     Devuelve {SEDE_NORM: {YYYY-MM-DD: 'Nombre del festivo'}}.
@@ -374,32 +372,40 @@ def load_festivos_labels_from_csv_bytes(file_bytes: bytes) -> dict:
         if not nombre:
             nombre = "Festivo"
 
-        sedes_list = [x.strip() for x in sede_raw.split("|") if x and str(x).strip()]
-        for sede_item in sedes_list:
-            sede_item = sede_item.strip()
-            if not sede_item:
+        sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
+        for s in sedes_list:
+            s_norm = _norm_key(s)
+            code_ = _sede_code(s_norm)
+            if code_ in excluded:
                 continue
-            code = _sede_code(sede_item)
-            if code and code in excluded:
-                continue
-            sede_norm = _norm_key(sede_item)
-            out.setdefault(sede_norm, {})
-            out[sede_norm][fecha] = nombre
+            out.setdefault(s_norm, {})[fecha] = nombre
 
     return out
 
 
-def get_festivo_label_for_sede_date(sede: str, day: date, festivos_labels_by_sede: dict) -> str:
+def get_festivo_label_for_sede_date(sede: str, day_yyyy_mm_dd: str, festivos_labels_by_sede: dict) -> str:
+    """Devuelve el nombre del festivo (si lo hay) para esa sede y fecha (matching robusto)."""
     if not festivos_labels_by_sede:
         return ""
     sede_norm = _norm_key(sede)
-    dd = day.strftime("%Y-%m-%d")
-    return (festivos_labels_by_sede.get(sede_norm, {}) or {}).get(dd, "")
+    if sede_norm in festivos_labels_by_sede:
+        return str((festivos_labels_by_sede.get(sede_norm, {}) or {}).get(day_yyyy_mm_dd, "") or "")
 
+    code = _sede_code(sede_norm)
+    if not code:
+        return ""
 
-# ============================================================
-# FECHAS / SEMANAS COMPLETAS
-# ============================================================
+    if code in festivos_labels_by_sede:
+        return str((festivos_labels_by_sede.get(code, {}) or {}).get(day_yyyy_mm_dd, "") or "")
+
+    for k, v in festivos_labels_by_sede.items():
+        k_norm = _norm_key(k)
+        if k_norm.startswith(code):
+            val = (v or {}).get(day_yyyy_mm_dd)
+            if val:
+                return str(val)
+
+    return ""
 
 def _iter_days(d0: date, d1: date):
     cur = d0
@@ -408,226 +414,304 @@ def _iter_days(d0: date, d1: date):
         cur += timedelta(days=1)
 
 
-def list_full_workweeks_in_range(d0: date, d1: date):
+
+def list_full_workweeks_in_range(fi: date, ff: date):
     """
-    Devuelve lista de tuplas (week_start, week_end_incl, range_type)
-    range_type: "L-V", "L-S", "L-D"
-    Solo devuelve semanas "completas" dentro del rango:
-      - L-V: lunes..viernes
-      - L-S: lunes..sábado
-      - L-D: lunes..domingo
+    Semanas completas contenidas dentro del rango.
+
+    Reglas:
+    - Para incluir una semana, el rango debe cubrir como mínimo L-V.
+    - Si además cubre sábado -> se devuelve como L-S.
+    - Si además cubre sábado+domingo -> se devuelve como L-D.
+
+    Devuelve lista de tuplas: (week_start_monday, week_end_inclusive, weekend_mode)
+      weekend_mode: "LV" | "LS" | "LD"
     """
+
+    def monday_of(d: date) -> date:
+        return d - timedelta(days=d.weekday())
+
     weeks = []
-    cur = d0
+    cur = monday_of(fi)
+    end_limit = monday_of(ff)
 
-    # normalizamos a lunes de la semana de d0
-    cur = cur - timedelta(days=cur.weekday())
-
-    while cur <= d1:
+    while cur <= end_limit:
         mon = cur
         fri = cur + timedelta(days=4)
         sat = cur + timedelta(days=5)
         sun = cur + timedelta(days=6)
 
-        # Check L-V
-        if mon >= d0 and fri <= d1:
-            weeks.append((mon, fri, "L-V"))
+        # Semana base L-V completa
+        if (fi <= mon) and (ff >= fri):
+            include_sat = (fi <= sat) and (ff >= sat)
+            include_sun = (fi <= sun) and (ff >= sun)
 
-        # Check L-S
-        if mon >= d0 and sat <= d1:
-            weeks.append((mon, sat, "L-S"))
+            if include_sun and include_sat:
+                end_incl = sun
+                mode = "LD"
+            elif include_sat:
+                end_incl = sat
+                mode = "LS"
+            else:
+                end_incl = fri
+                mode = "LV"
 
-        # Check L-D
-        if mon >= d0 and sun <= d1:
-            weeks.append((mon, sun, "L-D"))
+            weeks.append((mon, end_incl, mode))
 
         cur += timedelta(days=7)
 
-    # preferir el rango más largo si hay coincidencias
-    # Ej: si está L-D, también cumple L-V y L-S; nos quedamos con L-D
-    unique = {}
-    for mon, end_, typ in weeks:
-        key = mon
-        if key not in unique:
-            unique[key] = (mon, end_, typ)
-        else:
-            # elegir el de mayor longitud
-            old = unique[key]
-            if (end_ - mon).days > (old[1] - old[0]).days:
-                unique[key] = (mon, end_, typ)
-
-    return list(unique.values())
+    return weeks
 
 
-# ============================================================
-# TIEMPO / FORMATEO
-# ============================================================
 
-def floor_to_30(x: int) -> int:
-    return (x // 30) * 30
-
-
-def ceil_to_30(x: int) -> int:
-    return ((x + 29) // 30) * 30
-
-
-def quantize_daily_balance_30(delta_min: int) -> int:
-    """
-    Reglas RRHH:
-    - Tolerancia ±5 min -> 0
-    - Positivo: de +6 a +29 -> 0 (no suma), empieza a sumar desde +30 en tramos de 30 hacia abajo
-    - Negativo: desde -6 ya resta (tras tolerancia), cuantiza hacia "más falta" en tramos de 30
-    """
-    if -TOLERANCIA_MINUTOS <= delta_min <= TOLERANCIA_MINUTOS:
+def floor_to_30(mins: int) -> int:
+    if mins <= 0:
         return 0
+    return (mins // 30) * 30
 
-    if delta_min > TOLERANCIA_MINUTOS:
-        # +6..+29 => 0
-        if delta_min < 30:
-            return 0
-        return floor_to_30(delta_min)
 
-    # delta_min < -5: penaliza y cuantiza hacia más falta
-    return -ceil_to_30(abs(delta_min))
+def ceil_to_30(mins: int) -> int:
+    if mins <= 0:
+        return 0
+    return ((mins + 29) // 30) * 30
+
+
+def quantize_daily_balance_30(diff_mins: int, tol: int = 5) -> int:
+    """Cuantiza un balance diario en tramos de 30 min con tolerancia.
+    - |diff| <= tol => 0
+    - diff > tol: no suma nada si diff < 30; si diff >= 30 => floor a múltiplos de 30
+    - diff < -tol: resta hacia 'más falta' => -ceil(|diff|/30)*30
+    """
+    d = int(diff_mins)
+    if abs(d) <= int(tol):
+        return 0
+    if d > 0:
+        return floor_to_30(d) if d >= 30 else 0
+    return -ceil_to_30(abs(d))
 
 
 def mins_to_hhmm_signed(mins: int) -> str:
-    sign = "+" if mins > 0 else "-" if mins < 0 else ""
-    mm = abs(int(mins))
-    h = mm // 60
-    m = mm % 60
+    sign = "+" if mins >= 0 else "-"
+    a = abs(int(mins))
+    h = a // 60
+    m = a % 60
     return f"{sign}{h:02d}:{m:02d}"
 
 
-def decrypt_crece_payload(enc: dict) -> dict:
-    iv_b64 = enc.get("iv")
-    val_b64 = enc.get("value")
-    if not iv_b64 or not val_b64:
-        return {}
-    iv = base64.b64decode(iv_b64)
-    data = base64.b64decode(val_b64)
+# ============================================================
+# RESTRICCIONES (solo estas empresas y sedes)
+# ============================================================
 
-    key = base64.b64decode(APP_KEY_B64)
+ALLOWED_EMPRESAS = [
+    "Barranquesa Tower Flanges, S.L.",
+    "Barranquesa Anchor Cages, S.L.",
+    "Industrial Barranquesa S.A.",
+]
+
+ALLOWED_SEDES = [
+    "P0 IBSA",
+    "P1 LAKUNTZA",
+    "P2 COMARCA II",
+    "P3 UHARTE",
+]
+
+ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
+ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
+
+
+# ============================================================
+# DESCIFRADO CRECE (AES-CBC)
+# ============================================================
+
+def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
+    json_raw = base64.b64decode(payload_b64).decode("utf-8")
+    payload = json.loads(json_raw)
+
+    iv = base64.b64decode(payload["iv"])
+    ct = base64.b64decode(payload["value"])
+    key = base64.b64decode(app_key_b64)
+
     cipher = AES.new(key, AES.MODE_CBC, iv)
-    dec = unpad(cipher.decrypt(data), AES.block_size)
-    return json.loads(dec.decode("utf-8", errors="ignore"))
+    decrypted = unpad(cipher.decrypt(ct), AES.block_size)
+    return decrypted.decode("utf-8")
 
 
 def _try_parse_encrypted_response(resp: requests.Response):
-    try:
-        payload = resp.json()
-    except Exception:
+    if resp is None:
         return None
-    if isinstance(payload, dict) and "iv" in payload and "value" in payload:
+
+    raw_text = (resp.text or "").strip()
+    candidates = []
+
+    try:
+        candidates.append(resp.json())
+    except Exception:
+        pass
+
+    candidates.append(raw_text)
+
+    for c in candidates:
         try:
-            return decrypt_crece_payload(payload)
+            if isinstance(c, dict) and "iv" in c and "value" in c:
+                payload_obj = {"iv": c["iv"], "value": c["value"]}
+                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
+                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                return json.loads(dec)
+
+            if isinstance(c, str):
+                s = c.strip().strip('"').strip()
+
+                if s.startswith("{") and s.endswith("}"):
+                    obj = json.loads(s)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
+                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                        return json.loads(dec)
+
+                try:
+                    dec_json_raw = base64.b64decode(s).decode("utf-8")
+                    obj = json.loads(dec_json_raw)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        dec = decrypt_crece_payload(s, APP_KEY_B64)
+                        return json.loads(dec)
+                except Exception:
+                    pass
+
         except Exception:
-            return None
-    return payload
+            continue
+
+    return None
 
 
-def _round_seconds_to_minute(seconds: int) -> int:
-    return int(round(seconds / 60.0)) * 60
+# ============================================================
+# TIEMPOS (con redondeo consistente)
+# ============================================================
+
+def _round_seconds_to_minute(seg: float) -> int:
+    if seg is None or (isinstance(seg, float) and pd.isna(seg)):
+        return 0
+    try:
+        s = float(seg)
+    except Exception:
+        return 0
+    if s < 0:
+        s = 0.0
+    return int(round(s / 60.0)) * 60
 
 
-def segundos_a_hhmm(segundos: int) -> str:
-    if segundos is None:
-        return ""
-    segundos = int(segundos)
-    if segundos < 0:
-        segundos = 0
-    minutos = int(round(segundos / 60.0))
-    h = minutos // 60
-    m = minutos % 60
+def segundos_a_hhmm(seg: float) -> str:
+    seg_i = _round_seconds_to_minute(seg)
+    total_min = seg_i // 60
+    h = total_min // 60
+    m = total_min % 60
     return f"{h:02d}:{m:02d}"
 
 
 def hhmm_to_min(hhmm: str) -> int:
     if not isinstance(hhmm, str) or ":" not in hhmm:
         return 0
-    parts = hhmm.strip().split(":")
     try:
-        h = int(parts[0])
-        m = int(parts[1])
+        h, m = map(int, hhmm.split(":"))
+        return max(0, h * 60 + m)
     except Exception:
         return 0
-    return h * 60 + m
 
 
 def hhmm_to_dec(hhmm: str) -> float:
     return hhmm_to_min(hhmm) / 60.0
 
 
-def diferencia_hhmm(hhmm_a: str, hhmm_b: str) -> str:
-    a = hhmm_to_min(hhmm_a)
-    b = hhmm_to_min(hhmm_b)
-    d = a - b
-    sign = "+" if d > 0 else "-" if d < 0 else ""
-    mm = abs(d)
-    return f"{sign}{mm // 60:02d}:{mm % 60:02d}"
+def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
+    tc_hhmm = (tc_hhmm or "").strip()
+    tt_hhmm = (tt_hhmm or "").strip()
+    if not tc_hhmm or not tt_hhmm:
+        return ""
+
+    tc_min = hhmm_to_min(tc_hhmm)
+    tt_min = hhmm_to_min(tt_hhmm)
+
+    # ✅ tolerancia de 1 minuto para eliminar +00:01 / -00:01 por redondeos
+    if abs(tc_min - tt_min) <= 1:
+        return ""
+
+    diff = tc_min - tt_min
+    sign = "+" if diff > 0 else "-"
+    diff = abs(diff)
+
+    h = diff // 60
+    m = diff % 60
+    return f"{sign}{h:02d}:{m:02d}"
 
 
-def ts_to_hhmm(ts: str) -> str:
-    if not ts:
+def ts_to_hhmm(ts):
+    if ts is None or pd.isna(ts):
         return ""
     try:
-        dt = pd.to_datetime(ts, errors="coerce")
-        if pd.isna(dt):
-            return ""
-        return dt.strftime("%H:%M")
+        return pd.to_datetime(ts).strftime("%H:%M")
     except Exception:
         return ""
 
 
-def hhmm_to_min_clock(hhmm: str) -> int:
+def hhmm_to_min_clock(hhmm: str):
     if not isinstance(hhmm, str) or ":" not in hhmm:
         return None
     try:
-        h, m = hhmm.split(":")
-        return int(h) * 60 + int(m)
+        h, m = map(int, hhmm.split(":"))
+        return h * 60 + m
     except Exception:
         return None
 
 
 # ============================================================
-# REGLAS RRHH: EXCEPCIONES / FLEX / EXENTOS
+# REGLAS ESPECIALES (las tuyas)
 # ============================================================
 
-SPECIALS = [
-    # MOD
-    {"depto": "MOD", "name_prefix": "DAVID", "min_horas": 4.5, "min_fichajes": 2},
-    # MOI
-    {"depto": "MOI", "name_prefix": "DEBORA", "min_fichajes": 2},
-    {"depto": "MOI", "name_prefix": "ETOR", "min_fichajes": 2},
-    {"depto": "MOI", "name_prefix": "MIRIAM", "min_horas": 5.5, "min_fichajes": 2, "exento_horario": True},
-    # ESTRUCTURA
-    {"depto": "ESTRUCTURA", "name_prefix": "FRAN", "flex": True},
-    {"depto": "ESTRUCTURA", "name_prefix": "BEATRIZ", "min_horas": 6.5, "min_fichajes": 2, "max_fichajes": 4},
+N_DAVID = norm_name("David Rodriguez Vazquez")
+N_DEBORA = norm_name("Debora Luis Soto")
+N_ETOR = norm_name("Etor Alegria Reparaz")
+N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
+N_MIRIAM = norm_name("Miriam Martin Muñoz")
+N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
+
+SPECIAL_RULES_PREFIX = [
+    ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
+    ("MOI", N_DEBORA, {"min_fichajes": 2}),
+    ("MOI", N_ETOR, {"min_fichajes": 2}),
+    ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
+    ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2, "max_fichajes_ok": 4}),
 ]
+
+SCHEDULE_EXEMPT_PREFIX = [
+    ("MOD", N_DAVID),
+    ("MOI", N_MIRIAM),
+]
+
+FLEX_BY_DEPTO = {
+    "ESTRUCTURA": [N_FRAN],
+    "MOI": [N_DEBORA, N_ETOR],
+}
 
 
 def _lookup_special(depto_norm: str, nombre_norm: str):
-    for rule in SPECIALS:
-        if norm_name(rule.get("depto", "")) != norm_name(depto_norm):
-            continue
-        if name_startswith(nombre_norm, rule.get("name_prefix", "")):
-            return rule
+    for d, pref, rules in SPECIAL_RULES_PREFIX:
+        if depto_norm == d and name_startswith(nombre_norm, pref):
+            return rules
     return None
 
 
-def _is_schedule_exempt(depto_norm: str, nombre: str) -> bool:
-    sp = _lookup_special(depto_norm, norm_name(nombre))
-    return bool(sp and sp.get("exento_horario"))
+def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
+    for d, pref in SCHEDULE_EXEMPT_PREFIX:
+        if depto_norm == d and name_startswith(nombre_norm, pref):
+            return True
+    return False
 
 
-def _is_flex(depto_norm: str, nombre: str) -> bool:
-    sp = _lookup_special(depto_norm, norm_name(nombre))
-    return bool(sp and sp.get("flex"))
+def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
+    for pref in FLEX_BY_DEPTO.get(depto_norm, []):
+        if name_startswith(nombre_norm, pref):
+            return True
+    return False
 
-
-# ============================================================
-# MÍNIMOS POR DEPTO/DÍA + EXCEPCIONES
-# ============================================================
 
 def calcular_minimos(depto: str, dia: int, nombre: str):
     depto_norm = (depto or "").upper().strip()
@@ -659,210 +743,649 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     return min_h, min_f
 
 
-# ============================================================
-# VALIDACIONES HORARIAS / INCIDENCIAS (respetando reglas existentes)
-# ============================================================
+def expected_week_minutes_for_employee(
+    depto: str,
+    nombre: str,
+    sede: str,
+    week_mon: date,
+    week_fri: date,
+    festivos_by_sede: dict
+) -> int:
+    """
+    Jornada esperada semanal por empleado:
+    - suma jornada diaria esperada (calcular_minimos) de L-V
+    - si un día es festivo en ESA sede -> no suma jornada ese día
+    - así los de jornada especial quedan automáticamente bien
+    """
+    festivos = get_festivos_for_sede(sede, festivos_by_sede)
 
-def validar_horario(depto_norm: str, nombre: str, dia: int, primera: str, ultima: str):
-    if _is_schedule_exempt(depto_norm, nombre) or _is_flex(depto_norm, nombre):
+    total = 0
+    cur = week_mon
+    while cur <= week_fri:
+        wd = cur.weekday()
+        if wd <= 4:
+            day_str = cur.strftime("%Y-%m-%d")
+            if day_str not in festivos:
+                min_h, _ = calcular_minimos(depto, wd, nombre)
+                if min_h is not None:
+                    total += int(round(float(min_h) * 60))
+        cur += timedelta(days=1)
+
+    return max(0, total)
+
+
+def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
+    depto_norm = (depto or "").upper().strip()
+    nombre_norm = norm_name(nombre)
+
+    if dia not in [0, 1, 2, 3, 4]:
         return []
 
-    issues = []
+    if _is_schedule_exempt(depto_norm, nombre_norm):
+        return []
 
-    # MOI/ESTRUCTURA
-    if depto_norm in ["MOI", "ESTRUCTURA"]:
-        # Entrada aceptable 07:00–09:00 (margen) y salida mínima 16:30 (L-J) / 13:30 (V)
-        p = hhmm_to_min_clock(primera) if primera else None
-        u = hhmm_to_min_clock(ultima) if ultima else None
+    incid = []
+    e_min = hhmm_to_min_clock(primera_entrada_hhmm)
+    s_min = hhmm_to_min_clock(ultima_salida_hhmm)
 
-        if p is not None:
-            min_in = 7 * 60 - MARGEN_HORARIO_MIN
-            max_in = 9 * 60 + MARGEN_HORARIO_MIN
-            if p < min_in:
-                issues.append(f"Entrada temprana ({primera})")
-            elif p > max_in:
-                issues.append(f"Entrada tarde ({primera})")
+    if e_min is None:
+        return incid
 
-        if u is not None:
-            if dia in [0, 1, 2, 3]:
-                min_out = 16 * 60 + 30 - MARGEN_HORARIO_MIN
-            elif dia == 4:
-                min_out = 13 * 60 + 30 - MARGEN_HORARIO_MIN
+    if depto_norm == "MOD":
+        turno = "manana" if e_min < (12 * 60) else "tarde"
+
+        if turno == "manana":
+            ini_ok, fin_ok = 5 * 60 + 30, 6 * 60
+            fin_turno = 14 * 60
+            if e_min < ini_ok:
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif ini_ok <= e_min <= fin_ok:
+                pass
+            elif e_min <= fin_turno:
+                incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
             else:
-                min_out = None
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+        else:
+            ini_ok, fin_ok = 13 * 60, 14 * 60
+            fin_turno = 22 * 60
+            if e_min < ini_ok:
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif ini_ok <= e_min <= fin_ok:
+                pass
+            elif e_min <= fin_turno:
+                incid.append(f"Entrada fuera de rango ({primera_entrada_hhmm})")
+            else:
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+        return incid
 
-            if min_out is not None and u < min_out:
-                issues.append(f"Salida temprana ({ultima})")
+    if depto_norm in ["MOI", "ESTRUCTURA"]:
+        flex = _is_flex(depto_norm, nombre_norm)
 
-    # MOD: reglas turnos mañana/tarde (se mantienen como estaban en tu base)
-    # (en esta plantilla dejamos solo el placeholder sin cambiar tu lógica base)
-    return issues
+        if not flex:
+            ini, fin = 7 * 60, 9 * 60
+            salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
+
+            if e_min < (ini - MARGEN_HORARIO_MIN):
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+            elif e_min > fin:
+                incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
+
+            if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
+                incid.append(f"Salida temprana ({ultima_salida_hhmm})")
+        return incid
+
+    return incid
 
 
-def validar_incidencia_horas_fichajes(depto_norm: str, nombre: str, dia: int, total_hhmm: str, fichajes: int):
-    min_h, min_f = calcular_minimos(depto_norm, dia, nombre)
-    issues = []
+def validar_incidencia_horas_fichajes(r) -> list[str]:
+    min_h = r.get("min_horas")
+    min_f = r.get("min_fichajes")
+    if pd.isna(min_h) or pd.isna(min_f):
+        return []
 
-    if min_h is not None:
-        total_h = hhmm_to_dec(total_hhmm)
-        if total_h + 1e-9 < float(min_h):
-            issues.append(f"Horas insuficientes (mín {min_h}h)")
+    try:
+        num_fich = int(r.get("Numero de fichajes", 0) or 0)
+    except Exception:
+        num_fich = 0
 
-    if min_f is not None:
-        if fichajes < int(min_f):
-            issues.append(f"Fichajes insuficientes (mín {min_f}.0)")
+    try:
+        horas_val = float(r.get("horas_dec_validacion", 0.0) or 0.0)
+    except Exception:
+        horas_val = 0.0
 
-    # máximos especiales
-    sp = _lookup_special(depto_norm, norm_name(nombre))
-    if sp and "max_fichajes" in sp:
-        if fichajes > int(sp["max_fichajes"]):
-            issues.append(f"Fichajes excesivos (máx {int(sp['max_fichajes'])})")
+    motivos = []
+
+    umbral_inferior = float(min_h) - TOLERANCIA_HORAS
+    if horas_val < umbral_inferior:
+        motivos.append(f"Horas insuficientes (mín {min_h}h)")
+
+    if num_fich < int(min_f):
+        motivos.append(f"Fichajes insuficientes (mín {min_f})")
+
+    max_ok = r.get("max_fichajes_ok")
+    if pd.notna(max_ok):
+        try:
+            max_ok_i = int(max_ok)
+        except Exception:
+            max_ok_i = None
+        if max_ok_i is not None and horas_val >= umbral_inferior and num_fich > max_ok_i:
+            motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
     else:
-        # regla general: exceso si >4 (según tu implementación previa)
-        if fichajes > 4:
-            issues.append("Fichajes excesivos (máx 4)")
+        if horas_val >= umbral_inferior and num_fich > int(min_f):
+            motivos.append(f"Fichajes excesivos (mín {min_f})")
 
-    return issues
-
-
-# ============================================================
-# API: exportaciones
-# ============================================================
-
-def api_exportar_departamentos():
-    url = f"{API_URL_BASE}/exportaciones/departamentos"
-    resp = safe_request("GET", url)
-    if resp.status_code != 200:
-        _safe_fail("No se pudieron cargar departamentos.")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def api_exportar_empresas():
-    url = f"{API_URL_BASE}/exportaciones/empresas"
-    resp = safe_request("GET", url)
-    if resp.status_code != 200:
-        _safe_fail("No se pudieron cargar empresas.")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def api_exportar_sedes():
-    url = f"{API_URL_BASE}/exportaciones/sedes"
-    resp = safe_request("GET", url)
-    if resp.status_code != 200:
-        _safe_fail("No se pudieron cargar sedes.")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def api_exportar_empleados_completos():
-    url = f"{API_URL_BASE}/exportaciones/empleados"
-    resp = safe_request("GET", url)
-    if resp.status_code != 200:
-        _safe_fail("No se pudieron cargar empleados.")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def api_exportar_tipos_fichaje():
-    url = f"{API_URL_BASE}/exportaciones/tipos-fichaje"
-    resp = safe_request("GET", url)
-    if resp.status_code != 200:
-        _safe_fail("No se pudieron cargar tipos de fichaje.")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def api_exportar_fichajes(fecha_inicio: date, fecha_fin: date):
-    url = f"{API_URL_BASE}/exportaciones/fichajes"
-    payload = {
-        "fecha_inicio": fecha_inicio.strftime("%Y-%m-%d"),
-        "fecha_fin": fecha_fin.strftime("%Y-%m-%d"),
-    }
-    resp = safe_request("POST", url, json=payload)
-    if resp.status_code != 200:
-        _safe_fail("Error consultando fichajes (API).")
-    data = _try_parse_encrypted_response(resp)
-    return pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
-
-
-def _parse_tiempo_trabajado_payload(payload):
-    if not payload:
-        return pd.DataFrame()
-    if isinstance(payload, list):
-        return pd.DataFrame(payload)
-    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], list):
-        return pd.DataFrame(payload["data"])
-    return pd.DataFrame()
-
-
-def api_exportar_tiempo_trabajado(fecha_inicio: date, fecha_fin: date):
-    url = f"{API_URL_BASE}/exportaciones/tiempo-trabajado"
-    payload = {
-        "fecha_inicio": fecha_inicio.strftime("%Y-%m-%d"),
-        "fecha_fin": fecha_fin.strftime("%Y-%m-%d"),
-    }
-    resp = safe_request("POST", url, json=payload)
-    if resp.status_code != 200:
-        _safe_fail("Error consultando tiempo trabajado (API).")
-    data = _try_parse_encrypted_response(resp)
-    return _parse_tiempo_trabajado_payload(data)
+    return motivos
 
 
 # ============================================================
-# APP UI
+# API EXPORTACIÓN / INFORMES
 # ============================================================
 
-st.set_page_config(page_title="Fichajes — Crece Personas", layout="wide")
-st.title("Fichajes CRECE Personas — RRHH")
-
-@st.cache_data(show_spinner=False)
-def load_catalogos():
-    empresas = api_exportar_empresas()
-    sedes = api_exportar_sedes()
-    empleados = api_exportar_empleados_completos()
-
-    # Normaliza y filtra catálogo permitido
-    if not empleados.empty:
-        # Intenta mapear campos habituales
-        # Ajusta a tu estructura base si fuera necesario
-        for c in ["Empresa", "empresa", "empresa_nombre"]:
-            if c in empleados.columns:
-                empleados["Empresa"] = empleados[c]
-                break
-        for c in ["Sede", "sede", "sede_nombre"]:
-            if c in empleados.columns:
-                empleados["Sede"] = empleados[c]
-                break
-        for c in ["Nombre", "nombre", "empleado"]:
-            if c in empleados.columns:
-                empleados["Nombre"] = empleados[c]
-                break
-        for c in ["Departamento", "departamento", "dpto"]:
-            if c in empleados.columns:
-                empleados["Departamento"] = empleados[c]
-                break
-        for c in ["nif", "NIF", "num_empleado", "codigo", "codigo_empleado"]:
-            if c in empleados.columns:
-                empleados["nif"] = empleados[c]
-                break
-
-        empleados["Empresa_norm"] = empleados["Empresa"].apply(_norm_key)
-        empleados["Sede_norm"] = empleados["Sede"].apply(_norm_key)
-
-        allowed_emp_norm = {_norm_key(x) for x in ALLOWED_EMPRESAS}
-        allowed_sede_norm = {_norm_key(x) for x in ALLOWED_SEDES}
-
-        empleados = empleados[
-            empleados["Empresa_norm"].isin(allowed_emp_norm) &
-            empleados["Sede_norm"].isin(allowed_sede_norm)
-        ].copy()
-
-    return empresas, sedes, empleados
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_departamentos() -> pd.DataFrame:
+    url = f"{API_URL_BASE}/exportacion/departamentos"
+    resp = safe_request("GET", url)
+    if resp is None:
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
+    resp.raise_for_status()
+    data = _try_parse_encrypted_response(resp)
+    if not isinstance(data, list):
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
+    return pd.DataFrame(
+        [{"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")}
+         for d in (data or [])]
+    )
 
 
-empresas_df, sedes_df, empleados_df = load_catalogos()
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_empresas() -> pd.DataFrame:
+    url = f"{API_URL_BASE}/exportacion/empresas"
+    resp = safe_request("GET", url)
+    if resp is None:
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    try:
+        resp.raise_for_status()
+    except Exception:
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    data = _try_parse_encrypted_response(resp)
+    if not isinstance(data, list):
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
+    return pd.DataFrame(
+        [{"empresa_id": e.get("id"), "empresa_nombre": e.get("nombre")}
+         for e in (data or [])]
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_sedes() -> pd.DataFrame:
+    url1 = f"{API_URL_BASE}/exportacion/sedes"
+    resp = safe_request("GET", url1)
+    if resp is not None and resp.status_code == 200:
+        data = _try_parse_encrypted_response(resp)
+        if isinstance(data, list):
+            return pd.DataFrame(
+                [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+                 for s in (data or [])]
+            )
+
+    url2 = f"{API_URL_BASE}/exportacion/centros"
+    resp2 = safe_request("GET", url2)
+    if resp2 is None:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+    try:
+        resp2.raise_for_status()
+    except Exception:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+
+    data2 = _try_parse_encrypted_response(resp2)
+    if not isinstance(data2, list):
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+    return pd.DataFrame(
+        [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+         for s in (data2 or [])]
+    )
+
+
+def api_exportar_empleados_completos() -> pd.DataFrame:
+    url = f"{API_URL_BASE}/exportacion/empleados"
+    data = {"solo_nif": 0}
+
+    resp = safe_request("POST", url, data=data)
+    if resp is None:
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+    resp.raise_for_status()
+
+    data_dec = _try_parse_encrypted_response(resp)
+    if not isinstance(data_dec, list):
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+
+    empleados = data_dec
+    lista = []
+
+    for e in (empleados or []):
+        nombre = e.get("name") or e.get("nombre") or ""
+        primer_apellido = e.get("primer_apellido") or ""
+        segundo_apellido = e.get("segundo_apellido") or ""
+
+        if not (primer_apellido or segundo_apellido) and e.get("apellidos"):
+            partes = str(e["apellidos"]).split()
+            primer_apellido = partes[0] if len(partes) > 0 else ""
+            segundo_apellido = " ".join(partes[1:]) if len(partes) > 1 else ""
+
+        nombre_completo = f"{nombre} {primer_apellido} {segundo_apellido}".strip()
+
+        empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa") or e.get("company_id")
+        sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
+        num_empleado = e.get("num_empleado") or e.get("employee_number") or e.get("id_empleado") or e.get("id")
+
+        row = {
+            "nif": e.get("nif"),
+            "nombre_completo": nombre_completo,
+            "departamento_id": e.get("departamento"),
+            "empresa_id": empresa_id,
+            "sede_id": sede_id,
+            "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
+        }
+
+        for k in [
+            "deleted_at",
+            "activo",
+            "estado",
+            "situacion",
+            "fecha_baja",
+            "fecha_fin_contrato",
+            "fin_contrato",
+            "contrato_activo",
+            "en_activo",
+        ]:
+            if k in e:
+                row[k] = e.get(k)
+
+        lista.append(row)
+
+    df = pd.DataFrame(lista)
+    if not df.empty:
+        df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+        df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_tipos_fichaje() -> dict:
+    url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
+    try:
+        resp = safe_request("POST", url)
+        if resp is None:
+            return {}
+        resp.raise_for_status()
+
+        data_dec = _try_parse_encrypted_response(resp)
+        if not isinstance(data_dec, list):
+            return {}
+
+        out = {}
+        for t in data_dec:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            out[int(tid)] = {
+                "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
+                "turno_nocturno": int(t.get("turno_nocturno") or 0),
+            }
+        return out
+    except Exception as e:
+        _safe_fail(e)
+        return {}
+
+
+def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
+    url = f"{API_URL_BASE}/exportacion/fichajes"
+    data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "asc"}
+
+    try:
+        resp = safe_request("POST", url, data=data)
+        if resp is None:
+            return []
+        resp.raise_for_status()
+
+        data_dec = _try_parse_encrypted_response(resp)
+        return data_dec if isinstance(data_dec, list) else []
+    except Exception as e:
+        _safe_fail(e)
+        return []
+
+
+def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
+    filas = []
+
+    def add_row(key: str, val):
+        k = (str(key) or "").upper().strip()
+        if not k:
+            return
+
+        if isinstance(val, dict):
+            filas.append(
+                {
+                    "nif": str(val.get("nif") or k).upper().strip(),
+                    "tiempoEfectivo_seg": val.get("tiempoEfectivo"),
+                    "tiempoContabilizado_seg": val.get("tiempoContabilizado"),
+                }
+            )
+            return
+
+        if isinstance(val, list) and len(val) >= 4:
+            filas.append(
+                {"nif": k, "tiempoEfectivo_seg": val[-2], "tiempoContabilizado_seg": val[-1]}
+            )
+            return
+
+        filas.append({"nif": k, "tiempoEfectivo_seg": None, "tiempoContabilizado_seg": None})
+
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            add_row(k, v)
+
+    df = pd.DataFrame(filas)
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+    df["nif"] = df["nif"].astype(str).str.upper().str.strip()
+    return df
+
+
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
+    url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
+    payload = [("desde", desde), ("hasta", hasta)]
+
+    if nifs:
+        for v in nifs:
+            s = str(v).strip() if v is not None else ""
+            if s:
+                payload.append(("nif[]", s))
+
+    try:
+        resp = safe_request("POST", url, data=payload)
+        if resp is None:
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+        resp.raise_for_status()
+
+        data_dec = _try_parse_encrypted_response(resp)
+        if data_dec is None:
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
+        return _parse_tiempo_trabajado_payload(data_dec)
+
+    except Exception as e:
+        _safe_fail(e)
+        return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
+
+def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
+    url = f"{API_URL_BASE}/informes/empleados"
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+    try:
+        resp = safe_request("POST", url, json_body=body)
+        if resp is None:
+            return None
+        resp.raise_for_status()
+        return _try_parse_encrypted_response(resp)
+    except Exception as e:
+        _safe_fail(e)
+        return None
+
+
+# ============================================================
+# HELPERS BAJAS (ROBUSTO)
+# ============================================================
+
+def _to_float_any(x) -> float:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return 0.0
+    try:
+        if isinstance(x, str):
+            s = x.strip().replace(",", ".")
+            return float(s) if s else 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _extract_rows_from_informe(rep):
+    if rep is None:
+        return []
+
+    if isinstance(rep, list):
+        return [r for r in rep if isinstance(r, dict)]
+
+    if isinstance(rep, dict):
+        for k in ["data", "empleados", "results", "resultado", "items"]:
+            v = rep.get(k)
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+
+        vals = list(rep.values())
+        if vals and all(isinstance(v, dict) for v in vals):
+            return vals
+
+    return []
+
+
+def _get_horas_baja_from_row(row: dict) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+
+    candidates = [
+        "horas_baja",
+        "horasBaja",
+        "horas_de_baja",
+        "horas_baja_total",
+        "total_horas_baja",
+        "horas_baja_dia",
+        "horas_baja_diarias",
+        "horas_baja_hoy",
+        "horas_baja_parte",
+    ]
+    for c in candidates:
+        if c in row:
+            return _to_float_any(row.get(c))
+
+    for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
+        v = row.get(k)
+        if isinstance(v, dict):
+            for c in candidates:
+                if c in v:
+                    return _to_float_any(v.get(c))
+            if "horas" in v:
+                return _to_float_any(v.get("horas"))
+        elif isinstance(v, list):
+            best = 0.0
+            for it in v:
+                if isinstance(it, dict):
+                    h = _get_horas_baja_from_row(it)
+                    if h > best:
+                        best = h
+            if best > 0:
+                return best
+
+    return 0.0
+
+
+def _pick_key(df: pd.DataFrame, names: list[str]):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+# ============================================================
+# DÍA (turno nocturno) + tiempos netos
+# ============================================================
+
+def ajustar_fecha_dia(fecha_dt: pd.Timestamp, turno_nocturno: int) -> str:
+    if turno_nocturno == 1 and fecha_dt.hour < 6:
+        return (fecha_dt.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return fecha_dt.date().strftime("%Y-%m-%d")
+
+
+def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
+    rows_out = []
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "Fecha", "segundos_neto"])
+
+    for nif in df["nif"].unique():
+        sub_emp = df[df["nif"] == nif].copy()
+        for fecha_dia in sub_emp["fecha_dia"].unique():
+            sub = sub_emp[sub_emp["fecha_dia"] == fecha_dia].copy()
+            sub = sub.sort_values("fecha_dt")
+
+            sumados = 0
+            descontados = 0
+
+            i = 0
+            n = len(sub)
+            while i < n - 1:
+                a = sub.iloc[i]
+                b = sub.iloc[i + 1]
+                if a.get("direccion") == "entrada" and b.get("direccion") == "salida":
+                    delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
+                    if delta >= 0:
+                        delta_i = int(round(delta))
+                        props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
+                        if int(props.get("descuenta_tiempo", 0)) == 1:
+                            descontados += delta_i
+                        else:
+                            sumados += delta_i
+                    i += 2
+                else:
+                    i += 1
+
+            rows_out.append({"nif": nif, "Fecha": fecha_dia, "segundos_neto": max(0, sumados - descontados)})
+
+    return pd.DataFrame(rows_out)
+
+
+def calcular_primera_ultima(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["nif", "Fecha", "primera_entrada_dt", "ultima_salida_dt"])
+
+    entradas = df[df["direccion"] == "entrada"].groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"].min()
+    entradas = entradas.rename(columns={"fecha_dia": "Fecha", "fecha_dt": "primera_entrada_dt"})
+
+    salidas = df[df["direccion"] == "salida"].groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"].max()
+    salidas = salidas.rename(columns={"fecha_dia": "Fecha", "fecha_dt": "ultima_salida_dt"})
+
+    return entradas.merge(salidas, on=["nif", "Fecha"], how="outer")
+
+
+# ============================================================
+# FILTRO "ACTIVO / CONTRATO" (robusto)
+# ============================================================
+
+def _parse_date_any(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s, errors="coerce").date()
+    except Exception:
+        return None
+
+
+def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
+    if df_emp.empty:
+        return pd.Series([], dtype=bool)
+
+    if "deleted_at" in df_emp.columns:
+        deleted = df_emp["deleted_at"].notna() & df_emp["deleted_at"].astype(str).str.strip().ne("") & df_emp["deleted_at"].astype(str).str.lower().ne("null")
+    else:
+        deleted = pd.Series([False] * len(df_emp))
+
+    flags_true = pd.Series([False] * len(df_emp))
+    for col in ["activo", "en_activo", "contrato_activo"]:
+        if col in df_emp.columns:
+            s = df_emp[col]
+            flags_true = flags_true | s.astype(str).str.strip().str.lower().isin(["1", "true", "t", "si", "sí", "yes", "y"])
+
+    estado_ok = pd.Series([False] * len(df_emp))
+    for col in ["estado", "situacion"]:
+        if col in df_emp.columns:
+            s = df_emp[col].astype(str).str.strip().str.upper()
+            estado_ok = estado_ok | s.isin(["ACTIVO", "ALTA", "EN ALTA", "EN_ALTA", "ACTIVE"])
+
+    if "fecha_baja" in df_emp.columns:
+        fb = df_emp["fecha_baja"].apply(_parse_date_any)
+        fb_has = fb.notna()
+        fb_past = fb_has & (fb <= date.today())
+        baja = fb_past
+    else:
+        baja = pd.Series([False] * len(df_emp))
+
+    fin_ok = pd.Series([False] * len(df_emp))
+    for col in ["fecha_fin_contrato", "fin_contrato"]:
+        if col in df_emp.columns:
+            fc = df_emp[col].apply(_parse_date_any)
+            fin_ok = fin_ok | (fc.notna() & (fc >= date.today()))
+
+    any_signal_cols = any(c in df_emp.columns for c in ["activo", "en_activo", "contrato_activo", "estado", "situacion", "fecha_fin_contrato", "fin_contrato"])
+    if any_signal_cols:
+        active = (flags_true | estado_ok | fin_ok) & (~deleted) & (~baja)
+    else:
+        active = (~deleted) & (~baja)
+
+    return active.fillna(False)
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
+
+with st.spinner("Cargando catálogos…"):
+    departamentos_df = api_exportar_departamentos()
+    empresas_df = api_exportar_empresas()
+    sedes_df = api_exportar_sedes()
+    empleados_df = api_exportar_empleados_completos()
+
+if empleados_df.empty:
+    st.error("No hay empleados disponibles.")
+    st.stop()
+
+empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
+
+empleados_df["empresa_id"] = empleados_df.get("empresa_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
+empleados_df["sede_id"] = empleados_df.get("sede_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
+
+emp_map = {}
+if not empresas_df.empty and "empresa_id" in empresas_df.columns:
+    empresas_df["empresa_id"] = empresas_df["empresa_id"].astype(str).str.strip()
+    emp_map = dict(zip(empresas_df["empresa_id"], empresas_df["empresa_nombre"].fillna("").astype(str)))
+
+sede_map = {}
+if not sedes_df.empty and "sede_id" in sedes_df.columns:
+    sedes_df["sede_id"] = sedes_df["sede_id"].astype(str).str.strip()
+    sede_map = dict(zip(sedes_df["sede_id"], sedes_df["sede_nombre"].fillna("").astype(str)))
+
+empleados_df["Empresa"] = empleados_df["empresa_id"].map(emp_map).fillna("").astype(str)
+empleados_df["Sede"] = empleados_df["sede_id"].map(sede_map).fillna("").astype(str)
+
+empleados_df.loc[empleados_df["Empresa"].str.strip().eq(""), "Empresa"] = empleados_df["empresa_id"]
+empleados_df.loc[empleados_df["Sede"].str.strip().eq(""), "Sede"] = empleados_df["sede_id"]
+
+empleados_df["Empresa_norm"] = empleados_df["Empresa"].apply(_norm_key)
+empleados_df["Sede_norm"] = empleados_df["Sede"].apply(_norm_key)
+
+empleados_df = empleados_df[
+    empleados_df["Empresa_norm"].isin(ALLOWED_EMPRESAS_N) &
+    empleados_df["Sede_norm"].isin(ALLOWED_SEDES_N)
+].copy()
+
 if empleados_df.empty:
     st.error("Tras aplicar filtros de empresas/sedes permitidas, no quedan empleados. Revisa que los nombres coincidan en catálogo.")
     st.stop()
@@ -891,17 +1414,9 @@ if "festivos_csv_bytes" not in st.session_state:
 if "festivos_csv_name" not in st.session_state:
     st.session_state["festivos_csv_name"] = ""
 
-# Persistencia (para que sobreviva a recargas del navegador):
-# - Además de session_state, guardamos/borrramos un CSV local (DEFAULT_FESTIVOS_CSV_PATH)
-
 if clear_festivos:
     st.session_state["festivos_csv_bytes"] = b""
     st.session_state["festivos_csv_name"] = ""
-    try:
-        if os.path.exists(DEFAULT_FESTIVOS_CSV_PATH):
-            os.remove(DEFAULT_FESTIVOS_CSV_PATH)
-    except Exception:
-        pass
 
 # Fuente preferente: upload actual
 fb = b""
@@ -910,16 +1425,11 @@ if fest_file is not None:
     if save_festivos and fb:
         st.session_state["festivos_csv_bytes"] = fb
         st.session_state["festivos_csv_name"] = getattr(fest_file, "name", "") or ""
-        # Persistir a disco para sobrevivir a recargas (Streamlit Cloud incluido)
-        try:
-            with open(DEFAULT_FESTIVOS_CSV_PATH, "wb") as f:
-                f.write(fb)
-        except Exception:
-            pass
 else:
     fb = st.session_state.get("festivos_csv_bytes", b"") or b""
     if not fb:
         try:
+            import os
             if os.path.exists(DEFAULT_FESTIVOS_CSV_PATH):
                 with open(DEFAULT_FESTIVOS_CSV_PATH, "rb") as f:
                     fb = f.read()
@@ -947,325 +1457,580 @@ empleados_filtrados = empleados_df[
 
 st.write("---")
 
-# Botón consultar
-if st.button("Consultar"):
-    # Cargar fichajes
-    fichajes_df = api_exportar_fichajes(fecha_inicio, fecha_fin)
-    if fichajes_df.empty:
-        st.info("No hay fichajes en el rango.")
+
+def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list) -> str:
+    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}"
+
+
+for k, v in [
+    ("last_sig", ""),
+    ("result_incidencias", {}),
+    ("result_bajas", {}),
+    ("result_sin_fichajes", {}),
+    ("result_excesos_semana", {}),
+    ("result_csv_incidencias", b""),
+    ("result_csv_bajas", b""),
+    ("result_csv_sin", b""),
+    ("result_csv_excesos", b""),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+consultar = st.button("Consultar")
+
+if consultar:
+    if fecha_inicio > fecha_fin:
+        st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
+        st.stop()
+    if fecha_fin > hoy:
+        st.error("❌ La fecha fin no puede ser mayor que hoy.")
+        st.stop()
+    if empleados_filtrados.empty:
+        st.warning("No hay empleados con los filtros seleccionados.")
         st.stop()
 
-    # Normalizar columnas en base a tu app base (ajusta si hace falta)
-    # Fecha
-    if "Fecha" not in fichajes_df.columns:
-        for c in ["fecha", "day", "Fecha fichaje"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Fecha"] = fichajes_df[c]
-                break
+    fi = fecha_inicio.strftime("%Y-%m-%d")
+    ff = fecha_fin.strftime("%Y-%m-%d")
+    signature = _sig(fi, ff, sel_empresas, sel_sedes)
 
-    fichajes_df["Fecha_dt"] = pd.to_datetime(fichajes_df["Fecha"], errors="coerce").dt.date
+    with st.spinner("Procesando…"):
+        tipos_map = api_exportar_tipos_fichaje()
 
-    # Empresa / Sede / Nombre / Depto
-    for src, dst in [
-        ("Empresa", "Empresa"),
-        ("Sede", "Sede"),
-        ("Nombre", "Nombre"),
-        ("Departamento", "Departamento"),
-        ("nif", "nif"),
-    ]:
-        if dst not in fichajes_df.columns and src in fichajes_df.columns:
-            fichajes_df[dst] = fichajes_df[src]
+        # --------- FICHAJES ----------
+        fichajes_rows = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
+            for fut in as_completed(futures):
+                emp = futures[fut]
+                for x in (fut.result() or []):
+                    fichajes_rows.append(
+                        {
+                            "nif": emp["nif"],
+                            "Nombre": emp["nombre_completo"],
+                            "Departamento": emp.get("departamento_nombre"),
+                            "Empresa": emp.get("Empresa"),
+                            "Sede": emp.get("Sede"),
+                            "id": x.get("id"),
+                            "tipo": x.get("tipo"),
+                            "direccion": x.get("direccion"),
+                            "fecha": x.get("fecha"),
+                        }
+                    )
 
-    # Forzar filtros empresa/sede permitidos + selección actual
-    fichajes_df["Empresa_norm"] = fichajes_df["Empresa"].apply(_norm_key)
-    fichajes_df["Sede_norm"] = fichajes_df["Sede"].apply(_norm_key)
+        if not fichajes_rows:
+            df_fich = pd.DataFrame(columns=["nif", "Nombre", "Departamento", "Empresa", "Sede", "id", "tipo", "direccion", "fecha", "fecha_dt", "fecha_dia"])
+        else:
+            df_fich = pd.DataFrame(fichajes_rows)
+            df_fich["nif"] = df_fich["nif"].astype(str).str.upper().str.strip()
+            df_fich["fecha_dt"] = pd.to_datetime(df_fich["fecha"], errors="coerce")
+            df_fich = df_fich.dropna(subset=["fecha_dt"])
 
-    fichajes_df = fichajes_df[
-        fichajes_df["Empresa_norm"].isin({_norm_key(x) for x in sel_empresas}) &
-        fichajes_df["Sede_norm"].isin({_norm_key(x) for x in sel_sedes})
-    ].copy()
+            def _dia_row(r):
+                props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
+                return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
 
-    if fichajes_df.empty:
-        st.info("No hay fichajes tras aplicar filtros de Empresa/Sede.")
-        st.stop()
+            df_fich["fecha_dia"] = df_fich.apply(_dia_row, axis=1)
 
-    # Tiempo contabilizado: asumimos columna "Tiempo Contabilizado" o equivalente
-    if "Tiempo Contabilizado" not in fichajes_df.columns:
-        for c in ["tiempo_contabilizado", "tiempoContabilizado", "TiempoContabilizado"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Tiempo Contabilizado"] = fichajes_df[c]
-                break
+        # --------- INCIDENCIAS ----------
+        if df_fich.empty:
+            salida_incidencias = pd.DataFrame(columns=[
+                "Fecha", "Empresa", "Sede", "Nombre", "Departamento",
+                "Primera entrada", "Última salida", "Total trabajado",
+                "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
+            ])
+            resumen = pd.DataFrame()
+        else:
+            df_fich["Numero"] = df_fich.groupby(["nif", "fecha_dia"])["id"].transform("count")
+            conteo = (
+                df_fich.groupby(["nif", "Nombre", "Departamento", "Empresa", "Sede", "fecha_dia"], as_index=False)
+                .agg(Numero=("Numero", "max"))
+                .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
+            )
 
-    # Total trabajado
-    if "Total trabajado" not in fichajes_df.columns:
-        for c in ["total_trabajado", "Total trabajado", "Tiempo trabajado"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Total trabajado"] = fichajes_df[c]
-                break
+            neto = calcular_tiempos_neto(df_fich, tipos_map)
+            resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
+            resumen["segundos_neto"] = resumen["segundos_neto"].fillna(0)
 
-    # Normalización diferencia ±00:01 (consistente)
-    # Convertimos ambos a minutos redondeando a minuto y calculamos diferencia en minutos, luego a hh:mm signed
-    def _hhmm_to_mins_safe(x):
-        try:
-            return hhmm_to_min(str(x))
-        except Exception:
-            return 0
+            resumen["Total trabajado"] = resumen["segundos_neto"].apply(segundos_a_hhmm)
 
-    fichajes_df["mins_total"] = fichajes_df["Total trabajado"].apply(_hhmm_to_mins_safe)
-    fichajes_df["mins_tc"] = fichajes_df["Tiempo Contabilizado"].apply(_hhmm_to_mins_safe)
-    fichajes_df["mins_diff"] = fichajes_df["mins_total"] - fichajes_df["mins_tc"]
-    # si es ±1, lo llevamos a 0
-    fichajes_df.loc[fichajes_df["mins_diff"].abs() == 1, "mins_diff"] = 0
-    fichajes_df["Diferencia"] = fichajes_df["mins_diff"].apply(mins_to_hhmm_signed)
+            io = calcular_primera_ultima(df_fich)
+            resumen = resumen.merge(io, on=["nif", "Fecha"], how="left")
+            resumen["Primera entrada"] = resumen["primera_entrada_dt"].apply(ts_to_hhmm)
+            resumen["Última salida"] = resumen["ultima_salida_dt"].apply(ts_to_hhmm)
 
-    # Primera entrada / última salida
-    if "Primera entrada" not in fichajes_df.columns:
-        for c in ["primera_entrada", "Primera entrada", "Entrada"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Primera entrada"] = fichajes_df[c]
-                break
-    if "Última salida" not in fichajes_df.columns:
-        for c in ["ultima_salida", "Última salida", "Salida"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Última salida"] = fichajes_df[c]
-                break
+            nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
-    # Número fichajes
-    if "Numero de fichajes" not in fichajes_df.columns:
-        for c in ["numero_fichajes", "Numero fichajes", "n_fichajes"]:
-            if c in fichajes_df.columns:
-                fichajes_df["Numero de fichajes"] = fichajes_df[c]
-                break
+            tc_rows = []
+            d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+            d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
-    # --------------------------
-    # Festivo helpers
-    # --------------------------
-    def _is_festivo_day(sede: str, day: date):
-        fest_set = get_festivos_for_sede(sede, festivos_by_sede)
-        ds = day.strftime("%Y-%m-%d")
-        if ds in fest_set:
-            lbl = get_festivo_label_for_sede_date(sede, day, festivos_labels_by_sede)
-            return True, (lbl or "Festivo")
-        return False, ""
+            for cur in _iter_days(d0, d1):
+                desde = cur.strftime("%Y-%m-%d")
+                df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
+                if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+                    hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+                    df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
+                if not df_tc.empty:
+                    df_tc["Fecha"] = desde
+                    tc_rows.append(df_tc)
 
-    # --------------------------
-    # Construcción de incidencias (incluye festivo como “Trabajado en festivo”)
-    # --------------------------
-    def build_incidencia(row):
-        day = row["Fecha_dt"]
-        wd = day.weekday()
-        depto_norm = str(row.get("Departamento") or "").upper().strip()
-        nombre = str(row.get("Nombre") or "")
-        sede = str(row.get("Sede") or "")
+            if tc_rows:
+                tc = pd.concat(tc_rows, ignore_index=True)
+                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+                tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
+            else:
+                tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
 
-        # fin de semana
-        if wd >= 5 and (row.get("mins_tc") or 0) > 0:
-            return "Trabajo en fin de semana"
+            resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
+            resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
 
-        # festivo por sede
-        is_fest, fest_name = _is_festivo_day(sede, day)
-        if is_fest and (row.get("mins_tc") or 0) > 0:
-            return f"Trabajado en festivo ({fest_name})"
+            resumen["Diferencia"] = resumen.apply(
+                lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
+                axis=1
+            )
 
-        # incidencias normales
-        issues = []
-        total_hhmm = str(row.get("Total trabajado") or "00:00")
-        fichajes = int(row.get("Numero de fichajes") or 0)
-        issues += validar_incidencia_horas_fichajes(depto_norm, nombre, wd, total_hhmm, fichajes)
-        issues += validar_horario(depto_norm, nombre, wd, str(row.get("Primera entrada") or ""), str(row.get("Última salida") or ""))
-        return "; ".join(issues)
+            resumen["horas_dec_marcajes"] = resumen["Total trabajado"].apply(hhmm_to_dec)
+            resumen["horas_dec_contabilizado"] = resumen["Tiempo Contabilizado"].apply(hhmm_to_dec)
 
-    fichajes_df["Incidencia"] = fichajes_df.apply(build_incidencia, axis=1)
+            resumen["horas_dec_validacion"] = resumen["horas_dec_marcajes"]
+            mask_tc = resumen["Tiempo Contabilizado"].astype(str).str.strip().ne("")
+            resumen.loc[mask_tc, "horas_dec_validacion"] = resumen.loc[mask_tc, "horas_dec_contabilizado"]
 
-    # --------------------------
-    # Tabs independientes (cada pestaña aparece si tiene datos)
-    # --------------------------
-    # Fichajes con incidencia
-    df_inc = fichajes_df[fichajes_df["Incidencia"].astype(str).str.strip() != ""].copy()
+            resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
-    # Bajas (placeholder: si tu base ya lo tiene, aquí debería venir tu lógica original)
-    df_bajas = pd.DataFrame()
+            def _max_ok(r):
+                sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
+                if sp and "max_fichajes_ok" in sp:
+                    return sp["max_fichajes_ok"]
+                return pd.NA
 
-    # Sin fichajes (placeholder: si tu base ya lo tiene, aquí debería venir tu lógica original)
-    df_sin = pd.DataFrame()
+            resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
 
-    # Exceso de jornada: solo si hay semanas completas
-    full_weeks = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
+            resumen[["min_horas", "min_fichajes"]] = resumen.apply(
+                lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
+                axis=1,
+            )
 
-    # Armamos pestañas según haya datos
-    tab_defs = []
-    if not df_inc.empty:
-        tab_defs.append(("Fichajes", "📌"))
-    if not df_bajas.empty:
-        tab_defs.append(("Bajas", "🧾"))
-    if not df_sin.empty:
-        tab_defs.append(("Sin fichajes", "⛔"))
-    if full_weeks:
-        tab_defs.append(("Exceso de jornada", "🕘"))
+            def build_incidencia(r) -> str:
+                motivos = []
 
-    if not tab_defs:
-        st.info("No hay datos para mostrar en ninguna pestaña con los filtros/rango actuales.")
-        st.stop()
+                # ✅ Festivo: si hay trabajo, se marca como "Trabajado en festivo" y NO se aplican incidencias habituales
+                day_str = str(r.get("Fecha", "") or "")
+                sede_str = str(r.get("Sede", "") or "")
+                fest_set = get_festivos_for_sede(sede_str, festivos_by_sede)
+                if day_str and (day_str in fest_set):
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                        int(r.get("Numero de fichajes", 0) or 0) > 0
+                    )
+                    if worked:
+                        return "Trabajado en festivo"
 
-    tabs = st.tabs([f"{icon} {name}" for name, icon in tab_defs])
+                if int(r.get("dia", 0)) in [5, 6]:
+                    worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
+                        int(r.get("Numero de fichajes", 0) or 0) > 0
+                    )
+                    if worked:
+                        motivos.append("Trabajo en fin de semana")
+                    return "; ".join(motivos)
 
-    def _render_table(df, cols=None):
-        if cols:
-            df = df[cols]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+                motivos += validar_incidencia_horas_fichajes(r)
+                motivos += validar_horario(
+                    r.get("Departamento"),
+                    r.get("Nombre"),
+                    int(r.get("dia", 0)),
+                    r.get("Primera entrada", ""),
+                    r.get("Última salida", ""),
+                )
+                return "; ".join(motivos)
 
-    # --------
-    # Render tabs
-    # --------
-    for i, (name, icon) in enumerate(tab_defs):
-        with tabs[i]:
-            if name == "Fichajes":
-                # agrupar por día como en tu base (aquí dejamos tabla directa)
-                show_cols = [
-                    "Fecha_dt", "Empresa", "Sede", "Nombre", "Departamento",
-                    "Primera entrada", "Última salida", "Total trabajado",
-                    "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
-                ]
-                show_cols = [c for c in show_cols if c in df_inc.columns]
-                _render_table(df_inc.sort_values(["Fecha_dt", "Empresa", "Sede", "Nombre"]), show_cols)
+            resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
 
-            elif name == "Bajas":
-                st.info("Sin datos de bajas en este rango.")
+            salida_incidencias = resumen[resumen["Incidencia"].astype(str).str.strip().ne("")].copy()
 
-            elif name == "Sin fichajes":
-                st.info("Sin datos de sin fichajes en este rango.")
+            if not salida_incidencias.empty:
+                salida_incidencias = salida_incidencias[
+                    [
+                        "Fecha",
+                        "Empresa",
+                        "Sede",
+                        "Nombre",
+                        "Departamento",
+                        "Primera entrada",
+                        "Última salida",
+                        "Total trabajado",
+                        "Tiempo Contabilizado",
+                        "Diferencia",
+                        "Numero de fichajes",
+                        "Incidencia",
+                    ]
+                ].sort_values(["Fecha", "Nombre"], kind="mergesort")
+            else:
+                salida_incidencias = pd.DataFrame(columns=[
+                    "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
+                    "Total trabajado", "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
+                ])
 
-            elif name == "Exceso de jornada":
-                # Preparar columnas extra necesarias
-                if "Primera entrada" in fichajes_df.columns:
-                    fichajes_df["primera_min"] = fichajes_df["Primera entrada"].apply(hhmm_to_min_clock)
+        # --------- BAJAS (día a día) ----------
+        bajas_por_dia = {}
+        d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+        d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+
+        base_emp = empleados_filtrados.copy()
+        base_emp["nif"] = base_emp["nif"].astype(str).str.upper().str.strip()
+        base_emp["num_empleado"] = base_emp.get("num_empleado", pd.Series([""] * len(base_emp))).astype(str).str.strip()
+
+        for cur in _iter_days(d0, d1):
+            day = cur.strftime("%Y-%m-%d")
+            rep = api_informe_empleados(day, day)
+            rows = _extract_rows_from_informe(rep)
+            if not rows:
+                continue
+
+            df_rep = pd.DataFrame(rows)
+            if df_rep.empty:
+                continue
+
+            df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
+            df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
+            if df_rep.empty:
+                continue
+
+            key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
+            key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
+
+            merged = None
+            if key_nif is not None:
+                df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
+                merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="inner")
+            elif key_num is not None:
+                df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
+                merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
+
+            if merged is None or merged.empty:
+                continue
+
+            out = pd.DataFrame({
+                "Fecha": day,
+                "Empresa": merged["Empresa"].fillna("").astype(str),
+                "Sede": merged["Sede"].fillna("").astype(str),
+                "Nombre": merged["nombre_completo"].fillna("").astype(str),
+                "Departamento": merged.get("departamento_nombre", "").fillna("").astype(str),
+                "Horas baja": merged["horas_baja"].round(2),
+            })
+
+            out = out[out["Nombre"].astype(str).str.strip().ne("")]
+            if not out.empty:
+                bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
+
+        # --------- SIN FICHAJES ----------
+        sin_por_dia = {}
+
+        base_emp_sin = base_emp.copy()
+        mask_activo = empleado_activo_o_contrato(base_emp_sin)
+        base_emp_sin = base_emp_sin[mask_activo].copy()
+
+        # ✅ Excluir por NOMBRE (no por NIF)
+        base_emp_sin["nombre_excl_norm"] = base_emp_sin["nombre_completo"].apply(norm_name)
+        base_emp_sin = base_emp_sin[~base_emp_sin["nombre_excl_norm"].isin(EXCLUDE_SIN_FICHAJES_NAMES_NORM)].copy()
+
+        empleados_nifs = base_emp_sin["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+
+        presentes = {}
+        if not df_fich.empty:
+            for day, sub in df_fich.groupby("fecha_dia"):
+                presentes[str(day)] = set(sub["nif"].dropna().astype(str).str.upper().str.strip().tolist())
+
+        for cur in _iter_days(d0, d1):
+            day = cur.strftime("%Y-%m-%d")
+            present_set = presentes.get(day, set())
+            missing = [n for n in empleados_nifs if n not in present_set]
+            if not missing:
+                continue
+
+            miss_df = base_emp_sin[base_emp_sin["nif"].isin(missing)].copy()
+            if miss_df.empty:
+                continue
+
+            out = miss_df[["Empresa", "Sede", "nombre_completo", "departamento_nombre"]].copy()
+            out = out.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
+            out.insert(0, "Fecha", day)
+            out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
+            sin_por_dia[day] = out
+
+        # --------- EXCESO SEMANAL (MOI + ESTRUCTURA + MOD) — usando Tiempo Contabilizado ----------
+# ✅ Criterio (RRHH):
+#   - El exceso se calcula POR DÍA (tramos de 30 min, floor). Luego se suma en la semana.
+#   - Festivos y fin de semana NO son “siempre exceso”: se tratan como jornada esperada 0 ese día.
+#     -> cuentan solo si ese día se trabaja >= 30 min (y se cuantiza a 30/60/90...).
+    excesos_por_semana = {}
+    csv_excesos = b""
+    
+    try:
+        full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+    except Exception:
+        full_weeks = []
+    
+    if (not resumen.empty) and full_weeks:
+        sub = resumen.copy()
+        sub["Departamento_norm"] = sub["Departamento"].astype(str).str.upper().str.strip()
+        sub = sub[sub["Departamento_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])].copy()
+    
+        if not sub.empty:
+            sub["Fecha_dt"] = pd.to_datetime(sub["Fecha"], errors="coerce").dt.date
+            sub = sub.dropna(subset=["Fecha_dt"]).copy()
+    
+            # minutos por día desde Tiempo Contabilizado
+            sub["mins_tc"] = sub["Tiempo Contabilizado"].apply(hhmm_to_min).astype(int)
+    
+            # Para MOD necesitamos aproximar el turno por la primera entrada del día
+            sub["primera_min"] = sub["Primera entrada"].apply(hhmm_to_min_clock)
+    
+            def _is_festivo_day(sede: str, day: date) -> tuple[bool, str]:
+                        # retorna (is_festivo, label)
+                        day_str = day.strftime("%Y-%m-%d")
+                        fest_dates = get_festivos_for_sede(sede, festivos_by_sede)
+                        if day_str in fest_dates:
+                            label = get_festivo_label_for_sede_date(sede, day_str, festivos_labels_by_sede)
+                            return True, (label or "Festivo")
+                        return False, ""    
+            def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
+                # Fin de semana o festivo => jornada esperada 0
+                is_fest, _ = _is_festivo_day(sede, day)
+                if wd >= 5 or is_fest:
+                    return 0
+    
+                if depto_norm in ["MOI", "ESTRUCTURA"]:
+                    min_h, _ = calcular_minimos(depto_norm, wd, nombre)
+                    return int(round(float(min_h) * 60)) if min_h is not None else 0
+    
+                if depto_norm == "MOD":
+                    # jornada estándar MOD: 8h/día L-V (salvo festivo)
+                    return 8 * 60
+    
+                return 0
+    
+            def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
+                # MOD: no cuenta lo trabajado ANTES del inicio del turno.
+                # Turno mañana: 06:00–14:00  | Turno tarde: 14:00–22:00
+                # (Noche no se fuerza aquí; con datos actuales es lo más estable)
+                if primera_min is None:
+                    return max(0, int(mins_tc))
+    
+                # Heurística de turno por primera entrada
+                if primera_min < 12 * 60:
+                    shift_start = 6 * 60
                 else:
-                    fichajes_df["primera_min"] = None
-
-                # Por semana completa, tabla
-                for wk_start, wk_end_incl, typ in sorted(full_weeks, key=lambda x: x[0]):
-                    if typ == "L-D":
-                        label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-D)"
-                    elif typ == "L-S":
-                        label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-S)"
-                    else:
-                        label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-V)"
-
-                    st.subheader(label)
-
-                    mask_week = (fichajes_df["Fecha_dt"] >= wk_start) & (fichajes_df["Fecha_dt"] <= wk_end_incl)
-                    w = fichajes_df[mask_week].copy()
-
-                    # solo MOD/MOI/ESTRUCTURA
-                    w["Departamento"] = w["Departamento"].astype(str)
-                    w = w[w["Departamento"].str.upper().isin(["MOD", "MOI", "ESTRUCTURA"])].copy()
-
-                    rows = []
-
-                    if w.empty:
-                        st.info("No hay datos (MOD/MOI/ESTRUCTURA) en esta semana.")
-                        continue
-
-                    # funciones locales
-                    def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
-                        # Fin de semana o festivo => jornada esperada 0
-                        is_fest, _ = _is_festivo_day(sede, day)
-                        if wd >= 5 or is_fest:
-                            return 0
-
-                        depto_eff = (depto_norm or "").upper().strip()
-                        # Robustez: si viniera algo tipo 'MOD ...', lo tratamos como MOD
-                        if depto_eff.startswith("MOD"):
-                            depto_eff = "MOD"
-
-                        if depto_eff in ["MOI", "ESTRUCTURA", "MOD"]:
-                            min_h, _ = calcular_minimos(depto_eff, wd, nombre)
-                            if min_h is None:
-                                if depto_eff == "MOD":
-                                    min_h = 8.0
-                                else:
-                                    return 0
-                            return int(round(float(min_h) * 60))
-
-                        return 0
-
-                    def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
-                        # MOD: no cuenta lo trabajado ANTES del inicio de turno en día laborable (jornada esperada > 0)
-                        # Turnos de 8h: mañana 06:00-14:00, tarde 14:00-22:00, noche 22:00-06:00
-                        # Si entra antes, no suma ese extra.
-                        if primera_min is None:
-                            return mins_tc
-
-                        start_candidates = [6 * 60, 14 * 60, 22 * 60]
-                        # elegimos el inicio más cercano por debajo/igual a primera_min; si no, el más cercano
-                        start = None
-                        for sc in start_candidates:
-                            if primera_min >= sc:
-                                start = sc
-                        if start is None:
-                            start = 6 * 60
-
-                        # si ha fichado antes del inicio, restamos esos minutos previos (máx hasta mins_tc)
-                        if primera_min < start:
-                            delta = start - primera_min
-                            return max(0, mins_tc - delta)
-                        return mins_tc
-
-                    # agrupación por empleado
+                    shift_start = 14 * 60
+    
+                early = max(0, shift_start - primera_min)  # minutos antes del inicio
+                return max(0, int(mins_tc) - int(early))
+    
+            all_rows = []
+    
+            for wk_start, wk_end_incl, mode in full_weeks:
+                # Etiqueta (L-V / L-S / L-D)
+                if mode == "LD":
+                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-D)"
+                elif mode == "LS":
+                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-S)"
+                else:
+                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-V)"
+    
+                mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
+                w = sub[mask_week].copy()
+    
+                rows = []
+                if not w.empty:
                     for (nif, nombre, depto, empresa, sede), wemp in w.groupby(
                         ["nif", "Nombre", "Departamento", "Empresa", "Sede"]
                     ):
                         depto_norm = str(depto or "").upper().strip()
                         nombre_s = str(nombre or "").strip()
                         sede_s = str(sede or "").strip()
-
-                        balance_sem_min = 0
+    
+                        # exceso semanal = suma de excesos diarios cuantizados
+                        exceso_sem_min = 0
                         trabajado_sem_min = 0
                         jornada_sem_min = 0
-
+    
                         for _, rday in wemp.iterrows():
                             day = rday["Fecha_dt"]
                             wd = int(day.weekday())
                             mins_tc = int(rday.get("mins_tc") or 0)
                             primera_min = rday.get("primera_min")
                             trabajado_sem_min += mins_tc
-
+    
                             exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, day, wd)
                             jornada_sem_min += exp_day
-
+    
                             # trabajado efectivo para MOD (no cuenta minutos antes del inicio de turno)
                             if depto_norm == "MOD" and exp_day > 0:
                                 mins_eff = effective_worked_minutes_for_mod(mins_tc, primera_min)
                             else:
                                 mins_eff = mins_tc
+    
+                            # balance diario (mins_eff - jornada esperada) con tolerancia ±5 min
+                            diff_day = int(mins_eff) - int(exp_day)
+                            bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
+                            exceso_sem_min += int(bal_day_q)
 
-                            delta = mins_eff - exp_day
-                            q = quantize_daily_balance_30(delta)
-                            balance_sem_min += q
+                        # mostrar solo si el balance semanal no es 0 (puede ser + o -)
+                        if exceso_sem_min == 0:
+                            continue
+    
+                        row = {
+                            "Empresa": str(empresa or ""),
+                            "Sede": sede_s,
+                            "Nombre": nombre_s,
+                            "Departamento": str(depto or ""),
+                            "Trabajado semanal": segundos_a_hhmm(trabajado_sem_min * 60),
+                            "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
+                            "Exceso": mins_to_hhmm_signed(exceso_sem_min),
+                        }
+                        rows.append(row)
+                        all_rows.append({"Semana": label, **row})
+    
+                if rows:
+                    dfw = (
+                        pd.DataFrame(rows)
+                        .sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                        .reset_index(drop=True)
+                    )
+                else:
+                    dfw = pd.DataFrame(
+                        columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"]
+                    )
+    
+                excesos_por_semana[label] = dfw
+    
+            if all_rows:
+                df_all = (
+                    pd.DataFrame(all_rows)
+                    .sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                    .reset_index(drop=True)
+                )
+                csv_excesos = df_all.to_csv(index=False).encode("utf-8")
+    
+    # --------- Guardar en estado + CSVs ----------
+            incidencias_por_dia = {}
+            if not salida_incidencias.empty:
+                for day, subd in salida_incidencias.groupby("Fecha"):
+                    incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
+    
+            st.session_state["last_sig"] = signature
+            st.session_state["result_incidencias"] = incidencias_por_dia
+            st.session_state["result_bajas"] = bajas_por_dia
+            st.session_state["result_sin_fichajes"] = sin_por_dia
+            st.session_state["result_excesos_semana"] = excesos_por_semana
+    
+            st.session_state["result_csv_incidencias"] = (
+                salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+            )
+    
+            if bajas_por_dia:
+                df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+                st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
+            else:
+                st.session_state["result_csv_bajas"] = b""
+    
+            if sin_por_dia:
+                df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+                st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
+            else:
+                st.session_state["result_csv_sin"] = b""
+    
+            st.session_state["result_csv_excesos"] = csv_excesos
+    
+    # ------------------------------------------------------------
+# Render: Tabs
+# ------------------------------------------------------------
+fi_sig = fecha_inicio.strftime("%Y-%m-%d")
+ff_sig = fecha_fin.strftime("%Y-%m-%d")
+current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
 
-                        # mostrar positivos y negativos excepto 0
-                        if balance_sem_min != 0:
-                            rows.append(
-                                {
-                                    "Empresa": empresa,
-                                    "Sede": sede,
-                                    "Nombre": nombre,
-                                    "Departamento": depto_norm,
-                                    "Trabajado semanal": segundos_a_hhmm(trabajado_sem_min * 60),
-                                    "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
-                                    "Balance": mins_to_hhmm_signed(balance_sem_min),
-                                }
-                            )
+if st.session_state["last_sig"] != current_sig:
+    st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
+    st.stop()
 
-                    if not rows:
-                        st.info("No hay balances (positivos o negativos) en esta semana completa (o no hay datos).")
-                    else:
-                        dfw = pd.DataFrame(rows).sort_values(["Empresa", "Sede", "Nombre"])
-                        st.dataframe(
-                            dfw,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "Balance": st.column_config.TextColumn(help="Suma semanal de balances diarios cuantizados en tramos de 30 min.")
-                            }
-                        )
+try:
+    weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
+except Exception:
+    weeks_ui = []
+show_week_tab = bool(weeks_ui)
+
+if show_week_tab:
+    tab1, tab2, tab3, tab4 = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
+else:
+    tab1, tab2, tab3 = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"])
+
+with tab1:
+    incid = st.session_state.get("result_incidencias", {}) or {}
+    if not incid:
+        st.success("🎉 No hay incidencias en el rango seleccionado.")
+    else:
+        for day in sorted(incid.keys()):
+            # Etiqueta de festivo (si aplica a alguna fila del día)
+            fest_names = set()
+            try:
+                df_day = incid[day]
+                if isinstance(df_day, pd.DataFrame) and (not df_day.empty):
+                    for _, rr in df_day.iterrows():
+                        sede_rr = str(rr.get("Sede", "") or "")
+                        if str(day) in get_festivos_for_sede(sede_rr, festivos_by_sede):
+                            nm = get_festivo_label_for_sede_date(sede_rr, str(day), festivos_labels_by_sede)
+                            fest_names.add(nm or "Festivo")
+            except Exception:
+                fest_names = set()
+
+            if len(fest_names) == 1:
+                fest_label = next(iter(fest_names))
+                st.markdown(f"### 📅 {day} ({fest_label})")
+            elif len(fest_names) > 1:
+                st.markdown(f"### 📅 {day} (Festivo)")
+            else:
+                st.markdown(f"### 📅 {day}")
+            st.data_editor(incid[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
+        if csv_i:
+            st.download_button("⬇ Descargar CSV incidencias", csv_i, "fichajes_incidencias.csv", "text/csv")
+
+with tab2:
+    bajas = st.session_state.get("result_bajas", {}) or {}
+    if not bajas:
+        st.info("No hay empleados de baja en el rango seleccionado.")
+    else:
+        for day in sorted(bajas.keys()):
+            st.markdown(f"### 🏥 Empleados de baja — {day}")
+            st.data_editor(bajas[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        csv_b = st.session_state.get("result_csv_bajas", b"") or b""
+        if csv_b:
+            st.download_button("⬇ Descargar CSV bajas", csv_b, "empleados_baja.csv", "text/csv")
+
+with tab3:
+    sinf = st.session_state.get("result_sin_fichajes", {}) or {}
+    if not sinf:
+        st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
+    else:
+        for day in sorted(sinf.keys()):
+            st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
+            st.data_editor(sinf[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        csv_s = st.session_state.get("result_csv_sin", b"") or b""
+        if csv_s:
+            st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
+
+if show_week_tab:
+    with tab4:
+        excesos = st.session_state.get("result_excesos_semana", {}) or {}
+
+        for wk_start, wk_end_incl, wk_mode in weeks_ui:
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
+            st.markdown(f"### 🗓 {label}")
+            dfw = excesos.get(label)
+            if dfw is None or dfw.empty:
+                st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
+            else:
+                st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+
+        csv_w = st.session_state.get("result_csv_excesos", b"") or b""
+        if csv_w:
+            st.download_button("⬇ Descargar CSV excesos (todas las semanas)", csv_w, "excesos_jornada_semanal.csv", "text/csv")
