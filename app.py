@@ -1177,6 +1177,67 @@ def _to_float_any(x) -> float:
         return 0.0
 
 
+
+
+def _parse_hhmm_to_minutes(v) -> int:
+    """Parsea horas a minutos. Acepta 'HH:MM', 'HH:MM:SS', horas float/int o strings con coma."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return 0
+    try:
+        if isinstance(v, (int, float)):
+            return int(round(float(v) * 60))
+        s = str(v).strip()
+        if not s:
+            return 0
+        s = s.replace(",", ".")
+        if ":" in s:
+            parts = s.split(":")
+            if len(parts) >= 2:
+                h = int(parts[0]) if parts[0] else 0
+                m = int(parts[1]) if parts[1] else 0
+                return h * 60 + m
+        return int(round(float(s) * 60))
+    except Exception:
+        return 0
+
+
+def build_horas_programadas_map(informe_empleados) -> dict:
+    """Devuelve dict {(num_empleado_str, 'YYYY-MM-DD'): minutos_programados} a partir de /informes/empleados."""
+    mp = {}
+    if not isinstance(informe_empleados, list):
+        return mp
+
+    date_keys = ["fecha", "dia", "fecha_dia", "fecha_registro", "date"]
+    for row in informe_empleados:
+        if not isinstance(row, dict):
+            continue
+        num = str(row.get("num_empleado") or row.get("numempleado") or row.get("empleado") or "").strip()
+        if not num:
+            continue
+
+        dval = None
+        for k in date_keys:
+            if row.get(k):
+                dval = row.get(k)
+                break
+        if not dval:
+            continue
+
+        ds = str(dval).strip()
+        ds_norm = None
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+            try:
+                ds_norm = datetime.strptime(ds, fmt).date().strftime("%Y-%m-%d")
+                break
+            except Exception:
+                pass
+        if not ds_norm:
+            continue
+
+        mp[(num, ds_norm)] = _parse_hhmm_to_minutes(row.get("horas_programadas"))
+
+    return mp
+
 def _extract_rows_from_informe(rep):
     if rep is None:
         return []
@@ -1628,6 +1689,12 @@ if consultar:
             d0 = datetime.strptime(fi, "%Y-%m-%d").date()
             d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
+
+            # --------- JORNADA PROGRAMADA (fuente de verdad) ----------
+            # Se usa para Exceso de jornada: horas_programadas por empleado y día.
+            informe_empleados_rango = api_informe_empleados(fi, ff)
+            horas_prog_map = build_horas_programadas_map(informe_empleados_rango)
+
             for cur in _iter_days(d0, d1):
                 desde = cur.strftime("%Y-%m-%d")
                 df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
@@ -1857,23 +1924,27 @@ if consultar:
                             label = get_festivo_label_for_sede_date(sede, day_str, festivos_labels_by_sede)
                             return True, (label or "Festivo")
                         return False, ""    
+            nombre_s_to_num = dict(zip(base_emp.get('nombre_s', pd.Series(dtype=str)), base_emp.get('num_empleado', pd.Series(dtype=str))))
             def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
-                # Fin de semana o festivo => jornada esperada 0
+                # Fuente de verdad: horas_programadas de /informes/empleados (ya viene 0 si no laborable).
+                try:
+                    num_local = str(nombre_s_to_num.get(nombre) or "").strip()
+                    if num_local:
+                        v = horas_prog_map.get((num_local, day.strftime("%Y-%m-%d")))
+                        if v is not None:
+                            return int(v)
+                except Exception:
+                    pass
+
+                # Fallback: lógica previa (festivos/fin de semana + mínimos por depto)
                 is_fest, _ = _is_festivo_day(sede, day)
                 if wd >= 5 or is_fest:
                     return 0
-    
-                if depto_norm in ["MOI", "ESTRUCTURA"]:
-                    min_h, _ = calcular_minimos(depto_norm, wd, nombre)
-                    return int(round(float(min_h) * 60)) if min_h is not None else 0
-    
-                if depto_norm == "MOD":
-                    # MOD: la jornada diaria se calcula igual que el resto (respeta jornadas especiales por persona)
-                    min_h, _ = calcular_minimos(depto_norm, wd, nombre)
-                    return int(round(float(min_h) * 60)) if min_h is not None else 0
-    
-                return 0
-    
+
+                min_h, _ = calcular_minimos(depto_norm, wd, nombre)
+                return int(round(float(min_h) * 60)) if min_h is not None else 0
+
+
             def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
                 # MOD: no cuenta lo trabajado ANTES del inicio del turno.
                 # Turno mañana: 06:00–14:00  | Turno tarde: 14:00–22:00
@@ -1995,35 +2066,35 @@ if consultar:
                 )
                 csv_excesos = df_all.to_csv(index=False).encode("utf-8")
     
-    # --------- Guardar en estado + CSVs ----------
-            incidencias_por_dia = {}
-            if not salida_incidencias.empty:
-                for day, subd in salida_incidencias.groupby("Fecha"):
-                    incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
-    
-            st.session_state["last_sig"] = signature
-            st.session_state["result_incidencias"] = incidencias_por_dia
-            st.session_state["result_bajas"] = bajas_por_dia
-            st.session_state["result_sin_fichajes"] = sin_por_dia
-            st.session_state["result_excesos_semana"] = excesos_por_semana
-    
-            st.session_state["result_csv_incidencias"] = (
-                salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
-            )
-    
-            if bajas_por_dia:
-                df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_bajas"] = b""
-    
-            if sin_por_dia:
-                df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_sin"] = b""
-    
-            st.session_state["result_csv_excesos"] = csv_excesos
+            # --------- Guardar en estado + CSVs ----------
+        incidencias_por_dia = {}
+        if not salida_incidencias.empty:
+            for day, subd in salida_incidencias.groupby("Fecha"):
+                incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
+
+        st.session_state["last_sig"] = signature
+        st.session_state["result_incidencias"] = incidencias_por_dia
+        st.session_state["result_bajas"] = bajas_por_dia
+        st.session_state["result_sin_fichajes"] = sin_por_dia
+        st.session_state["result_excesos_semana"] = excesos_por_semana
+
+        st.session_state["result_csv_incidencias"] = (
+            salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+        )
+
+        if bajas_por_dia:
+            df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+            st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
+        else:
+            st.session_state["result_csv_bajas"] = b""
+
+        if sin_por_dia:
+            df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+            st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
+        else:
+            st.session_state["result_csv_sin"] = b""
+
+        st.session_state["result_csv_excesos"] = csv_excesos
     
     # ------------------------------------------------------------
 # Render: Tabs
