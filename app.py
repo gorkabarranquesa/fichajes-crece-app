@@ -2049,9 +2049,12 @@ fi_sig = fecha_inicio.strftime("%Y-%m-%d")
 ff_sig = fecha_fin.strftime("%Y-%m-%d")
 current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
 
-results_ready = (st.session_state.get("last_sig", "") == current_sig)
-if not results_ready:
+last_sig = st.session_state.get("last_sig", "")
+results_match = (last_sig == current_sig)
+if not last_sig:
     st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
+elif not results_match:
+    st.warning("Los filtros han cambiado desde la última consulta. Se muestran los **últimos resultados consultados**. Pulsa **Consultar** para refrescar.")
 
 
 try:
@@ -2061,10 +2064,10 @@ except Exception:
 
 # Pestañas (siempre visibles)
 # Solo mostramos resultados si corresponden a los filtros actuales (firma coincide)
-res_incid = (st.session_state.get("result_incidencias", {}) or {}) if results_ready else {}
-res_bajas = (st.session_state.get("result_bajas", {}) or {}) if results_ready else {}
-res_sin = (st.session_state.get("result_sin_fichajes", {}) or {}) if results_ready else {}
-res_exc = (st.session_state.get("result_excesos_semana", {}) or {}) if results_ready else {}
+res_incid = st.session_state.get("result_incidencias", {}) or {}
+res_bajas = st.session_state.get("result_bajas", {}) or {}
+res_sin = st.session_state.get("result_sin_fichajes", {}) or {}
+res_exc = st.session_state.get("result_excesos_semana", {}) or {}
 
 _tab_fich, _tab_bajas, _tab_sin, _tab_exc = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
 
@@ -2123,7 +2126,7 @@ if "tab_bajas" in tab_map:
 
 if "tab_sin" in tab_map:
     with tab_map["tab_sin"]:
-        sinf = st.session_state.get("result_sin_fichajes", {}) or {}
+        sinf = res_sin
         if not sinf:
             st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
         else:
@@ -2134,19 +2137,19 @@ if "tab_sin" in tab_map:
             if csv_s:
                 st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
 
-    if "tab_exc" in tab_map:
-        with tab_map["tab_exc"]:
-            excesos = st.session_state.get("result_excesos_semana", {}) or {}
+if "tab_exc" in tab_map:
+    with tab_map["tab_exc"]:
+        excesos = res_exc
 
-            for wk_start, wk_end_incl, wk_mode in weeks_ui:
-                label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
-                st.markdown(f"### 🗓 {label}")
-                dfw = excesos.get(label)
-                if dfw is None or dfw.empty:
-                    st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
-                else:
-                    st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+        for wk_start, wk_end_incl, wk_mode in weeks_ui:
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
+            st.markdown(f"### 🗓 {label}")
+            dfw = excesos.get(label)
+            if dfw is None or dfw.empty:
+                st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
+            else:
+                st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
 
-            csv_w = st.session_state.get("result_csv_excesos", b"") or b""
-            if csv_w:
-                st.download_button("⬇ Descargar CSV excesos (todas las semanas)", csv_w, "excesos_jornada_semanal.csv", "text/csv")
+        csv_w = st.session_state.get("result_csv_excesos", b"") or b""
+        if csv_w:
+            st.download_button("⬇ Descargar CSV excesos (todas las semanas)", csv_w, "excesos_jornada_semanal.csv", "text/csv")
