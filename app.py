@@ -1237,6 +1237,72 @@ def _get_horas_baja_from_row(row: dict) -> float:
     return 0.0
 
 
+def _get_horas_programadas_minutes_from_row(row: dict) -> int | None:
+    """Devuelve minutos programados del día (jornada esperada) si el informe lo trae.
+
+    Soporta formatos típicos:
+    - "08:30" / "8:30"  -> 510
+    - 8.5                  -> 510 (horas decimales)
+    - "8h 30m"           -> 510
+    """
+    if not isinstance(row, dict):
+        return None
+
+    candidates = [
+        "horas_programadas",
+        "horasProgramadas",
+        "horas_programadas_dia",
+        "horasProgramadasDia",
+        "horas_jornada",
+        "horasJornada",
+        "jornada",
+        "jornada_diaria",
+        "jornadaDiaria",
+    ]
+    val = None
+    for c in candidates:
+        if c in row and row.get(c) not in (None, ""):
+            val = row.get(c)
+            break
+    if val in (None, ""):
+        return None
+
+    # string hh:mm
+    if isinstance(val, str):
+        s = val.strip()
+        # hh:mm
+        if re.match(r"^\d{1,2}:\d{2}$", s):
+            try:
+                h, m = s.split(":")
+                return int(h) * 60 + int(m)
+            except Exception:
+                pass
+        # "8h 30m"
+        m1 = re.match(r"^(\d{1,2})\s*h\s*(\d{1,2})\s*m$", s, flags=re.IGNORECASE)
+        if m1:
+            return int(m1.group(1)) * 60 + int(m1.group(2))
+        # "8h" or "8 h"
+        m2 = re.match(r"^(\d{1,2})\s*h$", s, flags=re.IGNORECASE)
+        if m2:
+            return int(m2.group(1)) * 60
+        # fallback float parsing
+        try:
+            f = float(s.replace(",", "."))
+            return int(round(f * 60))
+        except Exception:
+            return None
+
+    # numeric hours
+    if isinstance(val, (int, float)):
+        try:
+            return int(round(float(val) * 60))
+        except Exception:
+            return None
+
+    return None
+
+
+
 def _pick_key(df: pd.DataFrame, names: list[str]):
     for n in names:
         if n in df.columns:
@@ -1728,6 +1794,7 @@ if consultar:
 
         # --------- BAJAS (día a día) ----------
         bajas_por_dia = {}
+        prog_by_day_nif = {}
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
@@ -1745,6 +1812,35 @@ if consultar:
             df_rep = pd.DataFrame(rows)
             if df_rep.empty:
                 continue
+
+            # Guardar horas_programadas (si existe) para cálculo de jornada esperada (por día)
+            try:
+                df_rep["horas_prog_min"] = df_rep.apply(lambda r: _get_horas_programadas_minutes_from_row(r.to_dict()), axis=1)
+            except Exception:
+                df_rep["horas_prog_min"] = None
+
+            key_nif_all = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
+            key_num_all = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
+
+            merged_all = None
+            if key_nif_all is not None:
+                df_rep["nif_join_all"] = df_rep[key_nif_all].astype(str).str.upper().str.strip()
+                merged_all = df_rep.merge(base_emp, left_on="nif_join_all", right_on="nif", how="inner")
+            elif key_num_all is not None:
+                df_rep["num_join_all"] = df_rep[key_num_all].astype(str).str.strip()
+                merged_all = df_rep.merge(base_emp, left_on="num_join_all", right_on="num_empleado", how="inner")
+
+            if merged_all is not None and (not merged_all.empty):
+                day_map = prog_by_day_nif.setdefault(day, {})
+                for _, rr in merged_all.iterrows():
+                    try:
+                        nif_u = str(rr.get("nif", "")).upper().strip()
+                        mp = rr.get("horas_prog_min", None)
+                        if nif_u and mp is not None and int(mp) >= 0:
+                            day_map[nif_u] = int(mp)
+                    except Exception:
+                        pass
+
 
             df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
             df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
@@ -1849,23 +1945,34 @@ if consultar:
                             label = get_festivo_label_for_sede_date(sede, day_str, festivos_labels_by_sede)
                             return True, (label or "Festivo")
                         return False, ""    
-            def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int) -> int:
-                # Fin de semana o festivo => jornada esperada 0
+            
+            def expected_day_minutes(depto_norm: str, nombre: str, sede: str, day: date, wd: int, nif: str | None = None) -> int:
+                """Jornada esperada (minutos) por día.
+            
+                Prioridad:
+                1) horas_programadas del informe /informes/empleados (si existe para ese empleado y día)
+                2) reglas internas (calcular_minimos), aplicando festivos/fin de semana = 0
+                """
+                # 1) Si tenemos horas_programadas del API, eso manda (ya viene con festivos/fin de semana aplicado)
+                try:
+                    if nif:
+                        mp = prog_by_day_nif.get(day.strftime("%Y-%m-%d"), {}).get(str(nif).upper().strip())
+                        if mp is not None:
+                            return int(mp)
+                except Exception:
+                    pass
+            
+                # 2) fallback: fin de semana o festivo => 0
                 is_fest, _ = _is_festivo_day(sede, day)
                 if wd >= 5 or is_fest:
                     return 0
-    
-                if depto_norm in ["MOI", "ESTRUCTURA"]:
+            
+                if depto_norm in ["MOI", "ESTRUCTURA", "MOD"]:
                     min_h, _ = calcular_minimos(depto_norm, wd, nombre)
                     return int(round(float(min_h) * 60)) if min_h is not None else 0
-    
-                if depto_norm == "MOD":
-                    # MOD: la jornada diaria se calcula igual que el resto (respeta jornadas especiales por persona)
-                    min_h, _ = calcular_minimos(depto_norm, wd, nombre)
-                    return int(round(float(min_h) * 60)) if min_h is not None else 0
-    
+            
                 return 0
-    
+            
             def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
                 # MOD: no cuenta lo trabajado ANTES del inicio del turno.
                 # Turno mañana: 06:00–14:00  | Turno tarde: 14:00–22:00
@@ -1933,7 +2040,7 @@ if consultar:
                             mins_tc = int(rec["mins_tc"]) if rec else 0
                             primera_min = rec.get("primera_min") if rec else None
 
-                            exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, cur_day, wd)
+                            exp_day = expected_day_minutes(depto_norm, nombre_s, sede_s, cur_day, wd, nif=nif)
                             jornada_sem_min += exp_day
 
                             # trabajado efectivo para MOD (solo si es día laborable y hay jornada esperada)
@@ -1986,38 +2093,38 @@ if consultar:
                     .reset_index(drop=True)
                 )
                 csv_excesos = df_all.to_csv(index=False).encode("utf-8")
-    
-    # --------- Guardar en estado + CSVs ----------
-            incidencias_por_dia = {}
-            if not salida_incidencias.empty:
-                for day, subd in salida_incidencias.groupby("Fecha"):
-                    incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
-    
-            st.session_state["last_sig"] = signature
-            st.session_state["result_incidencias"] = incidencias_por_dia
-            st.session_state["result_bajas"] = bajas_por_dia
-            st.session_state["result_sin_fichajes"] = sin_por_dia
-            st.session_state["result_excesos_semana"] = excesos_por_semana
-    
-            st.session_state["result_csv_incidencias"] = (
-                salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
-            )
-    
-            if bajas_por_dia:
-                df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_bajas"] = b""
-    
-            if sin_por_dia:
-                df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_sin"] = b""
-    
-            st.session_state["result_csv_excesos"] = csv_excesos
-    
-    # ------------------------------------------------------------
+
+# --------- Guardar en estado + CSVs ----------
+incidencias_por_dia = {}
+if not salida_incidencias.empty:
+    for day, subd in salida_incidencias.groupby("Fecha"):
+        incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
+
+st.session_state["last_sig"] = signature
+st.session_state["result_incidencias"] = incidencias_por_dia
+st.session_state["result_bajas"] = bajas_por_dia
+st.session_state["result_sin_fichajes"] = sin_por_dia
+st.session_state["result_excesos_semana"] = excesos_por_semana
+
+st.session_state["result_csv_incidencias"] = (
+    salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+)
+
+if bajas_por_dia:
+    df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+    st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
+else:
+    st.session_state["result_csv_bajas"] = b""
+
+if sin_por_dia:
+    df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+    st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
+else:
+    st.session_state["result_csv_sin"] = b""
+
+st.session_state["result_csv_excesos"] = csv_excesos
+
+# ------------------------------------------------------------
 # Render: Tabs
 # ------------------------------------------------------------
 fi_sig = fecha_inicio.strftime("%Y-%m-%d")
