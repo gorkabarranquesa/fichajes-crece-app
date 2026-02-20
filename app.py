@@ -2069,14 +2069,25 @@ res_bajas = st.session_state.get("result_bajas", {}) or {}
 res_sin = st.session_state.get("result_sin_fichajes", {}) or {}
 res_exc = st.session_state.get("result_excesos_semana", {}) or {}
 
-_tab_fich, _tab_bajas, _tab_sin, _tab_exc = st.tabs(["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes", "🕒 Exceso de jornada"])
+# Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
+range_days = (fecha_fin - fecha_inicio).days + 1 if fecha_fin >= fecha_inicio else 0
+tab_labels = ["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"]
+show_exceso_tab = range_days >= 7
+if show_exceso_tab:
+    tab_labels.append("🕒 Exceso de jornada")
+
+_tabs = st.tabs(tab_labels)
+_tab_fich, _tab_bajas, _tab_sin = _tabs[0], _tabs[1], _tabs[2]
+_tab_exc = _tabs[3] if show_exceso_tab else None
+
 
 tab_map = {
     "tab_fich": _tab_fich,
     "tab_bajas": _tab_bajas,
     "tab_sin": _tab_sin,
-    "tab_exc": _tab_exc,
 }
+if _tab_exc is not None:
+    tab_map["tab_exc"] = _tab_exc
 
 
 if "tab_fich" in tab_map:
