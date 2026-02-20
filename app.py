@@ -1891,7 +1891,8 @@ if consultar:
 #   - El exceso se calcula POR DÍA (tramos de 30 min, floor). Luego se suma en la semana.
 #   - Festivos y fin de semana NO son “siempre exceso”: se tratan como jornada esperada 0 ese día.
 #     -> cuentan solo si ese día se trabaja >= 30 min (y se cuantiza a 30/60/90...).
-    show_exceso_calc = ((d1 - d0).days + 1) >= 7
+
+    show_exceso_calc = bool(full_weeks)
     excesos_por_semana = {}
     csv_excesos = b""
 
@@ -2107,7 +2108,7 @@ res_exc = st.session_state.get("result_excesos_semana", {}) or {}
 # Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
 range_days = (fecha_fin - fecha_inicio).days + 1 if fecha_fin >= fecha_inicio else 0
 tab_labels = ["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"]
-show_exceso_tab = range_days >= 7
+show_exceso_tab = bool(globals().get('show_exceso_calc', False))
 if show_exceso_tab:
     tab_labels.append("🕒 Exceso de jornada")
 
