@@ -1169,10 +1169,60 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
             return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
         return _parse_tiempo_trabajado_payload(data_dec)
-
     except Exception as e:
         _safe_fail(e)
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def build_tiempo_contabilizado_diario_map(desde: str, hasta: str, nifs: list[str]) -> dict[tuple[str, str], int]:
+    """Devuelve {(NIF_norm, 'YYYY-MM-DD'): minutos_contabilizados} usando exportación/tiempo-trabajado.
+    Para tener dato diario fiable, llama al endpoint día a día (desde=day, hasta=day)."""
+    try:
+        d0 = datetime.strptime(desde, "%Y-%m-%d").date()
+        d1 = datetime.strptime(hasta, "%Y-%m-%d").date()
+    except Exception:
+        return {}
+
+    nifs_norm = []
+    for n in (nifs or []):
+        s = str(n).upper().strip()
+        if s:
+            nifs_norm.append(s)
+    nifs_norm = sorted(set(nifs_norm))
+
+    out: dict[tuple[str, str], int] = {}
+
+    cur = d0
+    # Llamada diaria: el endpoint devuelve totales del rango; con rango=1 día obtenemos el valor diario.
+    while cur <= d1:
+        day_str = cur.strftime("%Y-%m-%d")
+        try:
+            df_tt = api_exportar_tiempo_trabajado(day_str, day_str, nifs_norm)
+        except Exception:
+            df_tt = pd.DataFrame(columns=["nif", "tiempoContabilizado_seg"])
+
+        if isinstance(df_tt, pd.DataFrame) and (not df_tt.empty):
+            if "nif" in df_tt.columns:
+                df_tt["nif"] = df_tt["nif"].astype(str).str.upper().str.strip()
+            # tiempoContabilizado en segundos (puede venir None)
+            for _, r in df_tt.iterrows():
+                nif = str(r.get("nif") or "").upper().strip()
+                if not nif:
+                    continue
+                try:
+                    seg = int(float(r.get("tiempoContabilizado_seg") or 0))
+                except Exception:
+                    seg = 0
+                mins = max(0, seg // 60)
+                out[(nif, day_str)] = mins
+        else:
+            # sin datos => minutos 0 por defecto (no lo insertamos para no inflar memoria)
+            pass
+
+        cur += timedelta(days=1)
+
+    return out
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
@@ -1710,6 +1760,25 @@ if consultar:
 
             resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
             resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
+
+            # ✅ Fuente única para "Tiempo Contabilizado" diario (portal): exportación/tiempo-trabajado (tiempoContabilizado)
+            # Construimos un mapa diario {(nif, fecha): minutos} y sustituimos la columna para que:
+            # - Incidencias comparen contra lo mismo que CRECE
+            # - Excesos sumen el "contabilizado" real diario
+            try:
+                _nifs_tt = []
+                if isinstance(base_emp, pd.DataFrame) and ("nif" in base_emp.columns):
+                    _nifs_tt = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+                tt_map = build_tiempo_contabilizado_diario_map(fi, ff, _nifs_tt)
+                if isinstance(tt_map, dict) and tt_map:
+                    def _tc_from_map(r):
+                        _n = str(r.get("nif") or "").upper().strip()
+                        _d = str(r.get("Fecha") or "").strip()
+                        mins = int(tt_map.get((_n, _d), 0) or 0)
+                        return segundos_a_hhmm(mins * 60)
+                    resumen["Tiempo Contabilizado"] = resumen.apply(_tc_from_map, axis=1)
+            except Exception as _e:
+                _safe_fail(_e)
 
             resumen["Diferencia"] = resumen.apply(
                 lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
