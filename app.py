@@ -1892,7 +1892,14 @@ if consultar:
 #   - Festivos y fin de semana NO son “siempre exceso”: se tratan como jornada esperada 0 ese día.
 #     -> cuentan solo si ese día se trabaja >= 30 min (y se cuantiza a 30/60/90...).
 
-    show_exceso_calc = bool(full_weeks)
+    # Semanas completas disponibles dentro del rango (L-V, L-S, L-D)
+    full_weeks = []  # init robust to avoid NameError
+    try:
+        full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+    except Exception:
+        full_weeks = []
+
+    show_exceso_calc = bool(full_weeks) if isinstance(full_weeks, (list, tuple)) else False
     excesos_por_semana = {}
     csv_excesos = b""
 
