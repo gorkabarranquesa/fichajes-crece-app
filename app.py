@@ -1765,6 +1765,7 @@ if consultar:
             # Construimos un mapa diario {(nif, fecha): minutos} y sustituimos la columna para que:
             # - Incidencias comparen contra lo mismo que CRECE
             # - Excesos sumen el "contabilizado" real diario
+            tt_map = {}
             try:
                 _nifs_tt = []
                 if isinstance(base_emp, pd.DataFrame) and ("nif" in base_emp.columns):
@@ -2058,7 +2059,12 @@ if consultar:
                             while cur_day <= wk_end_incl:
                                 wd = int(cur_day.weekday())  # (informativo)
                                 rec = day_map.get(cur_day)
-                                mins_tc = int(rec["mins_tc"]) if rec else 0
+                                # Minutos contabilizados del día: fuente única = exportación/tiempo-trabajado (incluye permisos, cierres, etc.)
+                                day_key = (str(nif).upper().strip(), cur_day.strftime("%Y-%m-%d"))
+                                mins_tc = int((tt_map.get(day_key, 0) if isinstance(tt_map, dict) else 0) or 0)
+                                # Si no hay dato en exportación, cae al resumen (mejor que 0)
+                                if mins_tc == 0 and rec:
+                                    mins_tc = int(rec["mins_tc"] or 0)
                                 primera_min = rec.get("primera_min") if rec else None
 
                                 exp_day = expected_day_minutes(nif, cur_day)
@@ -2106,7 +2112,7 @@ if consultar:
                         )
                     else:
                         dfw = pd.DataFrame(
-                            columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso", "Incidencias"]
+                            columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"]
                         )
     
                     excesos_por_semana[label] = dfw
