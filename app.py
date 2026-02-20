@@ -2052,7 +2052,9 @@ current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
 last_sig = st.session_state.get("last_sig", "")
 results_match = (last_sig == current_sig)
 if not last_sig:
-    st.info("Ajusta filtros/fechas y pulsa **Consultar** para ver resultados.")
+    # En el arranque (sin haber pulsado Consultar) NO mostramos nada más que los filtros.
+    # Importante: sin mensajes ni pestañas.
+    st.stop()
 elif not results_match:
     st.warning("Los filtros han cambiado desde la última consulta. Se muestran los **últimos resultados consultados**. Pulsa **Consultar** para refrescar.")
 
