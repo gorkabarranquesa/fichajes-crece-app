@@ -2024,7 +2024,7 @@ if consultar:
                                 "Trabajado semanal": segundos_a_hhmm(trabajado_sem_tc_min * 60),
                                 "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
                                 "Exceso": mins_to_hhmm_signed(exceso_sem_min),
-                                "Incidencias": ("Trabajado en día no laborable: " + ", ".join(sorted(incid_no_laborable_days))) if incid_no_laborable_days else "",
+                                #"Incidencias": ("Trabajado en día no laborable: " + ", ".join(sorted(incid_no_laborable_days))) if incid_no_laborable_days else "",
                             }
                             rows.append(row)
                             all_rows.append({"Semana": label, **row})
