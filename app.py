@@ -1165,49 +1165,6 @@ def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
 # HELPERS BAJAS (ROBUSTO)
 # ============================================================
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def build_tc_day_minutes_map(fi_date: date, ff_date: date, nifs: list[str]) -> dict:
-    """Mapa {(nif, 'YYYY-MM-DD'): minutos_tiempoContabilizado}.
-    Fuente única: /exportacion/tiempo-trabajado (tiempoContabilizado).
-    Se consulta día a día para capturar permisos/cierres aunque no haya fichaje.
-    """
-    out: dict[tuple[str, str], int] = {}
-    if not nifs:
-        return out
-    nifs_norm = [str(x).upper().strip() for x in nifs if str(x).strip()]
-    if not nifs_norm:
-        return out
-
-    cur = fi_date
-    while cur <= ff_date:
-        day = cur.strftime("%Y-%m-%d")
-        df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs_norm)
-
-        # Fallback si 'hasta' es exclusivo
-        if df_tc.empty or ("tiempoContabilizado_seg" in df_tc.columns and df_tc["tiempoContabilizado_seg"].isna().all()):
-            nxt = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
-            df_tc = api_exportar_tiempo_trabajado(day, nxt, nifs=nifs_norm)
-
-        if not df_tc.empty:
-            for _, r in df_tc.iterrows():
-                nif = str(r.get("nif") or "").upper().strip()
-                if not nif:
-                    continue
-                seg = r.get("tiempoContabilizado_seg")
-                try:
-                    mins = int(round((float(seg) if seg is not None else 0.0) / 60.0))
-                except Exception:
-                    mins = 0
-                out[(nif, day)] = mins
-        else:
-            for nif in nifs_norm:
-                out[(nif, day)] = out.get((nif, day), 0)
-
-        cur += timedelta(days=1)
-
-    return out
-
-
 def _to_float_any(x) -> float:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return 0.0
@@ -1869,197 +1826,264 @@ if consultar:
 #   - El exceso se calcula POR DÍA (tramos de 30 min, floor). Luego se suma en la semana.
 #   - Festivos y fin de semana NO son “siempre exceso”: se tratan como jornada esperada 0 ese día.
 #     -> cuentan solo si ese día se trabaja >= 30 min (y se cuantiza a 30/60/90...).
-    excesos_por_semana = {}
-    csv_excesos = b""
-    
+excesos_por_semana = {}
+csv_excesos = b""
+
+# ------------------------------------------------------------
+# EXCESO SEMANAL (MOI + ESTRUCTURA + MOD)
+# Reglas (RRHH):
+#   - Trabajado diario: SIEMPRE tiempoContabilizado (exportacion/tiempo-trabajado)
+#   - Esperado diario: SIEMPRE horas_programadas (informes/empleados)
+#   - Balance diario = trabajado - esperado, con tolerancia ±5 min => 0
+#   - Cuantización a 30 min:
+#       * positivos: +6..+29 => 0, >=30 => floor a múltiplos de 30
+#       * negativos: <-5 => ceil (a más falta) a múltiplos de 30
+#   - Semanal = suma de balances diarios cuantizados (con signo)
+#   - MOD matiz: en día laborable (esperado > 0), no cuenta lo trabajado antes del inicio de turno
+# ------------------------------------------------------------
+
+try:
+    full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+except Exception:
+    full_weeks = []
+
+# Helpers locales para mapas diarios
+def _parse_hours_to_minutes(v) -> int:
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        # normalmente horas (ej. 8.0) -> 480
+        try:
+            return int(round(float(v) * 60))
+        except Exception:
+            return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    # "HH:MM"
+    if ":" in s:
+        try:
+            hh, mm = s.split(":")[:2]
+            return int(hh) * 60 + int(mm)
+        except Exception:
+            return 0
+    # "8,00" o "8.00"
     try:
-        full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+        s2 = s.replace(",", ".")
+        return int(round(float(s2) * 60))
     except Exception:
-        full_weeks = []
-    
-    if full_weeks:
-        sub = resumen.copy()
-        sub["Departamento_norm"] = sub["Departamento"].astype(str).str.upper().str.strip()
-        sub = sub[sub["Departamento_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])].copy()
-    
-        if not sub.empty:
-            sub["Fecha_dt"] = pd.to_datetime(sub["Fecha"], errors="coerce").dt.date
-            sub = sub.dropna(subset=["Fecha_dt"]).copy()
-    
-            # minutos por día desde Tiempo Contabilizado
-            sub["mins_tc"] = sub["Tiempo Contabilizado"].apply(hhmm_to_min).astype(int)
-    
-            # Para MOD necesitamos aproximar el turno por la primera entrada del día
-            sub["primera_min"] = sub["Primera entrada"].apply(hhmm_to_min_clock)
-    
-            
-# Fuente única de jornada esperada: horas_programadas (día a día)
-try:
-    horas_prog_day_map = build_horas_programadas_day_map(d0, d1)
-except Exception as _e:
-    _safe_fail(_e)
-    horas_prog_day_map = {}
+        return 0
 
-def expected_day_minutes(nif: str, day: date) -> int:
+def build_horas_programadas_day_map(d0_: date, d1_: date) -> dict:
+    out = {}
+    # Llamada día a día para garantizar granularidad diaria
+    for cur in _iter_days(d0_, d1_):
+        ds = cur.strftime("%Y-%m-%d")
+        payload = api_informe_empleados(ds, ds)
+        if not payload:
+            continue
+
+        # payload puede ser lista o dict; extraemos filas dict con nif + horas_programadas
+        items = payload if isinstance(payload, list) else payload.get("data") if isinstance(payload, dict) else None
+        if not items:
+            continue
+        if isinstance(items, dict):
+            items = [items]
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            nif = it.get("nif") or it.get("NIF") or it.get("dni") or it.get("DNI")
+            if not nif:
+                continue
+            nif = str(nif).upper().strip()
+            hp = it.get("horas_programadas") or it.get("horasProgramadas") or it.get("horas_programadas_dia")
+            mins = _parse_hours_to_minutes(hp)
+            out[(nif, ds)] = mins
+    return out
+
+def build_tc_day_minutes_map(d0_: date, d1_: date, nifs_: list[str]) -> dict:
+    out = {}
+    for cur in _iter_days(d0_, d1_):
+        ds = cur.strftime("%Y-%m-%d")
+        df_tc = api_exportar_tiempo_trabajado(ds, ds, nifs=nifs_)
+        if df_tc is None or df_tc.empty:
+            continue
+        for _, rr in df_tc.iterrows():
+            nif = str(rr.get("nif") or "").upper().strip()
+            if not nif:
+                continue
+            sec = rr.get("tiempoContabilizado_seg")
+            try:
+                mins = int(round(float(sec) / 60.0)) if sec is not None else 0
+            except Exception:
+                mins = 0
+            out[(nif, ds)] = mins
+    return out
+
+def _expected_day_minutes(nif: str, day: date) -> int:
     return int(horas_prog_day_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
-def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
-                # MOD: no cuenta lo trabajado ANTES del inicio del turno.
-                # Turno mañana: 06:00–14:00  | Turno tarde: 14:00–22:00
-                # (Noche no se fuerza aquí; con datos actuales es lo más estable)
-                if primera_min is None:
-                    return max(0, int(mins_tc))
-    
-                # Heurística de turno por primera entrada
-                if primera_min < 12 * 60:
-                    shift_start = 6 * 60
+
+def _effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
+    # MOD: no cuenta lo trabajado ANTES del inicio del turno (heurística)
+    if primera_min is None:
+        return max(0, int(mins_tc))
+    if primera_min < 12 * 60:
+        shift_start = 6 * 60
+    else:
+        shift_start = 14 * 60
+    early = max(0, shift_start - int(primera_min))
+    return max(0, int(mins_tc) - int(early))
+
+if full_weeks:
+    # empleados del filtro (para pedir tc diario)
+    nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+
+    try:
+        horas_prog_day_map = build_horas_programadas_day_map(d0, d1)
+    except Exception as _e:
+        _safe_fail(_e)
+        horas_prog_day_map = {}
+
+    try:
+        tc_day_minutes_map = build_tc_day_minutes_map(d0, d1, nifs_all)
+    except Exception as _e:
+        _safe_fail(_e)
+        tc_day_minutes_map = {}
+
+    # Para MOD, sacamos primera entrada del día del resumen (si existe). Si no, None.
+    primera_map = {}
+    if not resumen.empty:
+        tmp = resumen.copy()
+        tmp["Fecha_dt"] = pd.to_datetime(tmp["Fecha"], errors="coerce").dt.date
+        tmp = tmp.dropna(subset=["Fecha_dt"]).copy()
+        tmp["nif_norm"] = tmp["nif"].astype(str).str.upper().str.strip()
+        tmp["primera_min"] = tmp["Primera entrada"].apply(hhmm_to_min_clock)
+        for (nif, f), g in tmp.groupby(["nif_norm", "Fecha_dt"]):
+            pm = g["primera_min"].dropna()
+            primera_map[(nif, f.strftime("%Y-%m-%d"))] = int(pm.min()) if not pm.empty else None
+
+    # Construimos lista de empleados por DEPARTAMENTO (MOI/ESTRUCTURA/MOD) desde base_emp
+    base_dept = base_emp.copy()
+    base_dept["nif_norm"] = base_dept["nif"].astype(str).str.upper().str.strip()
+    base_dept["depto_norm"] = base_dept["departamento_nombre"].astype(str).str.upper().str.strip()
+    base_dept = base_dept[base_dept["depto_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])].copy()
+
+    all_rows = []
+
+    for wk_start, wk_end_incl, mode in full_weeks:
+        if mode == "LD":
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-D)"
+        elif mode == "LS":
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-S)"
+        else:
+            label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-V)"
+
+        rows = []
+        # Para cada empleado del filtro, calculamos semana completa por días
+        for _, emp in base_dept.iterrows():
+            nif = str(emp.get("nif_norm") or "").upper().strip()
+            if not nif:
+                continue
+            nombre = str(emp.get("nombre_completo") or "").strip()
+            depto = str(emp.get("departamento_nombre") or "").strip()
+            depto_norm = str(emp.get("depto_norm") or "").strip()
+            empresa = str(emp.get("Empresa") or "")
+            sede = str(emp.get("Sede") or "")
+
+            exceso_sem_min = 0
+            trabajado_sem_min = 0
+            jornada_sem_min = 0
+
+            cur_day = wk_start
+            while cur_day <= wk_end_incl:
+                day_str = cur_day.strftime("%Y-%m-%d")
+
+                mins_tc = int(tc_day_minutes_map.get((nif, day_str), 0) or 0)
+                exp_day = int(_expected_day_minutes(nif, cur_day) or 0)
+                jornada_sem_min += exp_day
+
+                # trabajado semanal mostrado: SIEMPRE tc (sin recortes)
+                trabajado_sem_min += mins_tc
+
+                # para balance diario, MOD recorta solo en días laborables (exp>0)
+                primera_min = primera_map.get((nif, day_str))
+                if depto_norm == "MOD" and exp_day > 0:
+                    mins_for_balance = _effective_worked_minutes_for_mod(mins_tc, primera_min)
                 else:
-                    shift_start = 14 * 60
-    
-                early = max(0, shift_start - primera_min)  # minutos antes del inicio
-                return max(0, int(mins_tc) - int(early))
-    
-            
-# Fuente única de trabajado diario: tiempoContabilizado (día a día) para todos los empleados del filtro
-nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-try:
-    tc_day_minutes_map = build_tc_day_minutes_map(d0, d1, nifs_all)
-except Exception as _e:
-    _safe_fail(_e)
-    tc_day_minutes_map = {}
-all_rows = []
-    
-            for wk_start, wk_end_incl, mode in full_weeks:
-                # Etiqueta (L-V / L-S / L-D)
-                if mode == "LD":
-                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-D)"
-                elif mode == "LS":
-                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-S)"
-                else:
-                    label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (L-V)"
-    
-                mask_week = (sub["Fecha_dt"] >= wk_start) & (sub["Fecha_dt"] <= wk_end_incl)
-                w = sub[mask_week].copy()
-    
-                rows = []
-                if not w.empty:
-                    for (nif, nombre, depto, empresa, sede), wemp in w.groupby(
-                        ["nif", "Nombre", "Departamento", "Empresa", "Sede"]
-                    ):
-                        depto_norm = str(depto or "").upper().strip()
-                        nombre_s = str(nombre or "").strip()
-                        sede_s = str(sede or "").strip()
-    
-                        # exceso semanal = suma de excesos diarios cuantizados
-                        exceso_sem_min = 0
-                        trabajado_sem_min = 0
-                        jornada_sem_min = 0
+                    mins_for_balance = mins_tc
 
-                        # Mapa día -> (mins_tc, primera_min) (por si hubiera duplicados)
-                        day_map: dict[date, dict] = {}
-                        for _, rr in wemp.iterrows():
-                            d = rr["Fecha_dt"]
-                            mins = int(rr.get("mins_tc") or 0)
-                            pm = rr.get("primera_min")
-                            if d not in day_map:
-                                day_map[d] = {"mins_tc": mins, "primera_min": pm}
-                            else:
-                                day_map[d]["mins_tc"] += mins
-                                if pm is not None:
-                                    cur = day_map[d].get("primera_min")
-                                    if cur is None or (isinstance(cur, (int, float)) and pm < cur):
-                                        day_map[d]["primera_min"] = pm
+                diff_day = int(mins_for_balance) - int(exp_day)
+                bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
+                exceso_sem_min += int(bal_day_q)
 
-                        # Recorremos TODOS los días de la semana (incluidos días sin fichajes)
-                        cur_day = wk_start
-                        while cur_day <= wk_end_incl:
-                            wd = int(cur_day.weekday())
-                            rec = day_map.get(cur_day)
-                            day_key = cur_day.strftime("%Y-%m-%d")
-                            mins_tc = int(tc_day_minutes_map.get((str(nif).upper().strip(), day_key), 0) or 0)
-                            primera_min = rec.get("primera_min") if rec else None
+                cur_day += timedelta(days=1)
 
-                            exp_day = expected_day_minutes(nif, cur_day)
-                            jornada_sem_min += exp_day
+            if exceso_sem_min == 0:
+                continue
 
-                            # Excesos: trabajado diario = tiempoContabilizado para TODOS los departamentos
-                            mins_eff = mins_tc
+            row = {
+                "Empresa": empresa,
+                "Sede": sede,
+                "Nombre": nombre,
+                "Departamento": depto,
+                "Trabajado semanal": segundos_a_hhmm(trabajado_sem_min * 60),
+                "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
+                "Exceso": mins_to_hhmm_signed(exceso_sem_min),
+            }
+            rows.append(row)
+            all_rows.append({"Semana": label, **row})
 
-                            trabajado_sem_min += int(mins_eff)
-
-                            diff_day = int(mins_eff) - int(exp_day)
-                            bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
-                            exceso_sem_min += int(bal_day_q)
-
-                            cur_day += timedelta(days=1)
-
-                        # mostrar solo si el balance semanal no es 0 (puede ser + o -)
-                        if exceso_sem_min == 0:
-                            continue
-    
-                        row = {
-                            "Empresa": str(empresa or ""),
-                            "Sede": sede_s,
-                            "Nombre": nombre_s,
-                            "Departamento": str(depto or ""),
-                            "Trabajado semanal": segundos_a_hhmm(trabajado_sem_min * 60),
-                            "Jornada semanal": segundos_a_hhmm(jornada_sem_min * 60),
-                            "Exceso": mins_to_hhmm_signed(exceso_sem_min),
-                        }
-                        rows.append(row)
-                        all_rows.append({"Semana": label, **row})
-    
-                if rows:
-                    dfw = (
-                        pd.DataFrame(rows)
-                        .sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
-                        .reset_index(drop=True)
-                    )
-                else:
-                    dfw = pd.DataFrame(
-                        columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"]
-                    )
-    
-                excesos_por_semana[label] = dfw
-    
-            if all_rows:
-                df_all = (
-                    pd.DataFrame(all_rows)
-                    .sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
-                    .reset_index(drop=True)
-                )
-                csv_excesos = df_all.to_csv(index=False).encode("utf-8")
-    
-    # --------- Guardar en estado + CSVs ----------
-            incidencias_por_dia = {}
-            if not salida_incidencias.empty:
-                for day, subd in salida_incidencias.groupby("Fecha"):
-                    incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
-    
-            st.session_state["last_sig"] = signature
-            st.session_state["result_incidencias"] = incidencias_por_dia
-            st.session_state["result_bajas"] = bajas_por_dia
-            st.session_state["result_sin_fichajes"] = sin_por_dia
-            st.session_state["result_excesos_semana"] = excesos_por_semana
-    
-            st.session_state["result_csv_incidencias"] = (
-                salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+        if rows:
+            dfw = (
+                pd.DataFrame(rows)
+                .sort_values(["Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                .reset_index(drop=True)
             )
+        else:
+            dfw = pd.DataFrame(
+                columns=["Empresa", "Sede", "Nombre", "Departamento", "Trabajado semanal", "Jornada semanal", "Exceso"]
+            )
+
+        excesos_por_semana[label] = dfw
+
+    if all_rows:
+        df_all = (
+            pd.DataFrame(all_rows)
+            .sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+            .reset_index(drop=True)
+        )
+        csv_excesos = df_all.to_csv(index=False).encode("utf-8")
+    # --------- Guardar en estado + CSVs ----------
+    incidencias_por_dia = {}
+    if not salida_incidencias.empty:
+        for day, subd in salida_incidencias.groupby("Fecha"):
+            incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
     
-            if bajas_por_dia:
-                df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_bajas"] = b""
+    st.session_state["last_sig"] = signature
+    st.session_state["result_incidencias"] = incidencias_por_dia
+    st.session_state["result_bajas"] = bajas_por_dia
+    st.session_state["result_sin_fichajes"] = sin_por_dia
+    st.session_state["result_excesos_semana"] = excesos_por_semana
     
-            if sin_por_dia:
-                df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
-                st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
-            else:
-                st.session_state["result_csv_sin"] = b""
+    st.session_state["result_csv_incidencias"] = (
+        salida_incidencias.to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+    )
     
-            st.session_state["result_csv_excesos"] = csv_excesos
+    if bajas_por_dia:
+        df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_bajas"] = df_all_bajas.to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_bajas"] = b""
     
-    # ------------------------------------------------------------
+    if sin_por_dia:
+        df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_sin"] = df_all_sin.to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_sin"] = b""
+    
+    st.session_state["result_csv_excesos"] = csv_excesos
+        # ------------------------------------------------------------
 # Render: Tabs
 # ------------------------------------------------------------
 fi_sig = fecha_inicio.strftime("%Y-%m-%d")
