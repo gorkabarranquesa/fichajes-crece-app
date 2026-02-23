@@ -1579,6 +1579,10 @@ for k, v in [
     ("result_csv_bajas", b""),
     ("result_csv_sin", b""),
     ("result_csv_excesos", b""),
+    ("scope_fi", ""),
+    ("scope_ff", ""),
+    ("scope_empresas_norm", set()),
+    ("scope_sedes_norm", set()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -2024,6 +2028,12 @@ if consultar:
             incidencias_por_dia[str(day)] = subd.reset_index(drop=True)
 
     st.session_state["last_sig"] = signature
+
+    # Alcance (scope) de la última consulta: permite re-filtrar en memoria al reducir Empresa/Sede
+    st.session_state["scope_fi"] = fecha_inicio.isoformat()
+    st.session_state["scope_ff"] = fecha_fin.isoformat()
+    st.session_state["scope_empresas_norm"] = {_norm_key(x) for x in sel_empresas}
+    st.session_state["scope_sedes_norm"] = {_norm_key(x) for x in sel_sedes}
     st.session_state["result_incidencias"] = incidencias_por_dia
     st.session_state["result_bajas"] = bajas_por_dia
     st.session_state["result_sin_fichajes"] = sin_por_dia
@@ -2062,7 +2072,7 @@ if not last_sig:
     # Importante: sin mensajes ni pestañas.
     st.stop()
 elif not results_match:
-    st.warning("Los filtros han cambiado desde la última consulta. Se muestran los **últimos resultados consultados**. Pulsa **Consultar** para refrescar.")
+    pass
 
 
 try:
@@ -2076,6 +2086,67 @@ res_incid = st.session_state.get("result_incidencias", {}) or {}
 res_bajas = st.session_state.get("result_bajas", {}) or {}
 res_sin = st.session_state.get("result_sin_fichajes", {}) or {}
 res_exc = st.session_state.get("result_excesos_semana", {}) or {}
+
+# --- Re-filtrado local (sin recargar) cuando el usuario REDUCE Empresa/Sede tras una consulta ---
+active_emp_norm = {_norm_key(x) for x in sel_empresas}
+active_sed_norm = {_norm_key(x) for x in sel_sedes}
+
+scope_fi = st.session_state.get("scope_fi", "")
+scope_ff = st.session_state.get("scope_ff", "")
+scope_emp_norm = set(st.session_state.get("scope_empresas_norm", set()) or set())
+scope_sed_norm = set(st.session_state.get("scope_sedes_norm", set()) or set())
+
+same_dates_as_scope = (scope_fi == fecha_inicio.isoformat()) and (scope_ff == fecha_fin.isoformat())
+can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm)
+
+def _ensure_norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "Empresa_norm" not in df.columns:
+        if "Empresa" in df.columns:
+            df = df.copy()
+            df["Empresa_norm"] = df["Empresa"].apply(_norm_key)
+    if "Sede_norm" not in df.columns:
+        if "Sede" in df.columns:
+            df = df.copy()
+            df["Sede_norm"] = df["Sede"].apply(_norm_key)
+    return df
+
+def _filter_df_by_active(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df = _ensure_norm_cols(df)
+    if "Empresa_norm" in df.columns:
+        df = df[df["Empresa_norm"].isin(active_emp_norm)]
+    if "Sede_norm" in df.columns:
+        df = df[df["Sede_norm"].isin(active_sed_norm)]
+    return df
+
+def _filter_day_dict(d: dict) -> dict:
+    if not isinstance(d, dict) or not d:
+        return d or {}
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, pd.DataFrame):
+            out[k] = _filter_df_by_active(v)
+        else:
+            out[k] = v
+    return out
+
+# Si podemos filtrar localmente, aplicamos el filtro a los resultados cacheados para render
+if can_filter_locally:
+    res_incid = _filter_day_dict(res_incid)
+    res_bajas = _filter_day_dict(res_bajas)
+    res_sin = _filter_day_dict(res_sin)
+    # Excesos suele venir agregado y puede no tener Empresa/Sede: lo dejamos tal cual
+else:
+    # Si el usuario ha intentado AMPLIAR el alcance (añadir Empresa/Sede o cambiar fechas), avisamos
+    if st.session_state.get("last_sig", ""):
+        if not same_dates_as_scope:
+            st.info("ℹ️ Has cambiado el rango de fechas respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)):
+            st.info("ℹ️ Has ampliado Empresa/Sede respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+
 
 # Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
 range_days = (fecha_fin - fecha_inicio).days + 1 if fecha_fin >= fecha_inicio else 0
