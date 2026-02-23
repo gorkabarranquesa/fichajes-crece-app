@@ -21,6 +21,19 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
+# ---- Hardened cache: avoid storing NIFs in cache keys/values ----
+_NIFS_REGISTRY: dict[str, tuple[str, ...]] = {}
+
+def _hash_nif(nif: str) -> str:
+    """Fast, deterministic hash for NIF keys used in cached maps (no salt)."""
+    s = (nif or "").upper().strip().encode("utf-8")
+    return hashlib.blake2s(s, digest_size=8).hexdigest()
+
+def _fingerprint_nifs(nifs: tuple[str, ...]) -> str:
+    """Stable fingerprint for a set of NIFs (used as cache key component)."""
+    joined = "|".join(nifs).encode("utf-8")
+    return hashlib.md5(joined).hexdigest()
+
 CPU = multiprocessing.cpu_count()
 MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
@@ -658,7 +671,11 @@ def api_exportar_departamentos() -> pd.DataFrame:
     resp = safe_request("GET", url)
     if resp is None:
         return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception:
+        _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/departamentos"))
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     data = _try_parse_encrypted_response(resp)
     if not isinstance(data, list):
         return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
@@ -724,7 +741,11 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     resp = safe_request("POST", url, data=data)
     if resp is None:
         return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception:
+        _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/empleados"))
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
 
     data_dec = _try_parse_encrypted_response(resp)
     if not isinstance(data_dec, list):
@@ -893,7 +914,7 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_tuple: tuple[str, ...]) -> dict:
+def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_fingerprint: str) -> dict:
     """Cache seguro (TTL corto): devuelve {(NIF, YYYY-MM-DD): minutos_contabilizados}.
     Solo cachea minutos (int), no payloads ni datos sensibles extra.
     """
@@ -903,7 +924,7 @@ def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_tuple: tuple
     except Exception:
         return {}
 
-    nifs = [str(x).upper().strip() for x in (nifs_tuple or ()) if str(x).strip()]
+    nifs = [str(x).upper().strip() for x in (_NIFS_REGISTRY.get(nifs_fingerprint, ()) or ()) if str(x).strip()]
     if not nifs:
         return {}
 
@@ -912,7 +933,7 @@ def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_tuple: tuple
         return {}
 
     max_workers = _max_workers_days(len(days))
-    out: dict[tuple[str, str], int] = {}
+    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}  # {(hash_nif, YYYY-MM-DD): minutes}
 
     def _fetch_day(day: str):
         df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs)
@@ -933,7 +954,7 @@ def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_tuple: tuple
                     mins = int(round(float(seg or 0) / 60.0))
                 except Exception:
                     mins = 0
-                out[(nif_tc, day)] = max(0, mins)
+                out[(_hash_nif(nif_tc), day)] = max(0, mins)
 
     return out
 
@@ -947,7 +968,19 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
     nifs_norm = tuple(sorted({str(x).upper().strip() for x in (nifs or []) if str(x).strip()}))
     if not nifs_norm:
         return {}
-    return _cached_tiempo_contabilizado_map(d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"), nifs_norm)
+    fp = _fingerprint_nifs(nifs_norm)
+    _NIFS_REGISTRY[fp] = nifs_norm
+    hashed = _cached_tiempo_contabilizado_map(d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"), fp)
+    if not hashed:
+        return {}
+    hash_to_nif = {_hash_nif(n): n for n in nifs_norm}
+    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}
+    for (hn, day), mins in hashed.items():
+        nif = hash_to_nif.get(hn)
+        if not nif:
+            continue
+        out[(nif, day)] = int(mins)
+    return out
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
@@ -1197,7 +1230,7 @@ def _cached_horas_programadas_map(
         return {}
 
     max_workers = _max_workers_days(len(days))
-    out: dict[tuple[str, str], int] = {}
+    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}  # {(hash_nif, YYYY-MM-DD): minutes}
 
     def _fetch_day(day: str):
         rep = api_informe_empleados(day, day)
