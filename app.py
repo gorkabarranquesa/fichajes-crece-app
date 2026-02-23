@@ -4,7 +4,6 @@ import json
 import multiprocessing
 import random
 import time
-import unicodedata
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,8 +55,102 @@ EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
     "BENITO MENDINUETA ANDUEZA",
 }
 
+# ============================================================
+# - Upload en la app (prioridad)
+# - Si no se sube, intenta usar un CSV local llamado así (junto a app.py)
+# ============================================================
 
-# (Festivos eliminados: la jornada esperada se obtiene desde horas_programadas)
+
+
+def _safe_fail(_exc: Exception) -> None:
+    return None
+
+
+def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT):
+    method = (method or "").upper().strip()
+    if method not in {"GET", "POST"}:
+        return None
+
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = _SESSION.request(
+                method,
+                url,
+                data=data,
+                params=params,
+                json=json_body,
+                timeout=timeout,
+                verify=True,
+            )
+
+            if resp.status_code in RETRY_STATUS:
+                if attempt < MAX_RETRIES:
+                    wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                    wait += random.uniform(0, 0.25)
+                    time.sleep(wait)
+                    continue
+                return resp
+
+            return resp
+
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < MAX_RETRIES:
+                wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+                wait += random.uniform(0, 0.25)
+                time.sleep(wait)
+                continue
+            _safe_fail(last_exc)
+            return None
+
+    _safe_fail(last_exc if last_exc else Exception("Unknown request error"))
+    return None
+
+
+# ============================================================
+# NORMALIZACIÓN
+# ============================================================
+
+def norm_name(s: str) -> str:
+    if s is None:
+        return ""
+    return " ".join(str(s).upper().strip().split())
+
+
+def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
+    return bool(nombre_norm) and bool(prefix_norm) and nombre_norm.startswith(prefix_norm)
+
+
+def _norm_key(s: str) -> str:
+    return " ".join((s or "").strip().upper().split())
+
+
+
+def _sede_code(sede: str) -> str:
+    """Devuelve el código P0/P1/P2/P3 a partir del nombre de sede normalizado."""
+    s = _norm_key(sede)
+    if not s:
+        return ""
+    tok = s.split()[0]
+    if tok in {"P0", "P1", "P2", "P3"}:
+        return tok
+    for c in ["P0", "P1", "P2", "P3"]:
+        if s.startswith(c):
+            return c
+    return ""
+
+
+# ============================================================
+# ============================================================
+
+@st.cache_data(show_spinner=False, ttl=3600)
+
+
+
+
+
+
 
 def _iter_days(d0: date, d1: date):
     cur = d0
@@ -194,20 +287,6 @@ ALLOWED_SEDES = [
     "P2 COMARCA II",
     "P3 UHARTE",
 ]
-
-def _norm_key(x: str) -> str:
-    """Normaliza texto para comparaciones (sin tildes, minúsculas, espacios colapsados)."""
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if not s:
-        return ""
-    # quitar acentos
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # normalizar espacios y minúsculas
-    s = " ".join(s.split()).lower()
-    return s
 
 ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
 ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
@@ -798,11 +877,12 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
         return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 
+
 def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
     """Devuelve {(NIF, YYYY-MM-DD): minutos_contabilizados} para rango [d0,d1].
 
-    Regla: SIEMPRE se usa tiempoContabilizado del endpoint exportacion/tiempo-trabajado, haya fichaje o no.
-    Se consulta día a día y se paraleliza con un número moderado de workers.
+    Regla: SIEMPRE se usa tiempoContabilizado de /exportacion/tiempo-trabajado, haya fichaje o no.
+    Para rangos grandes, consultamos día a día y paralelizamos con workers conservadores.
     """
     nifs = [str(x).upper().strip() for x in (nifs or []) if str(x).strip()]
     if not nifs:
@@ -812,16 +892,11 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
     if not days:
         return {}
 
-    max_workers = min(10, max(2, len(days)))  # conservador para evitar 429
+    max_workers = min(10, max(2, len(days)))
     out: dict[tuple[str, str], int] = {}
 
     def _fetch_day(day: str):
         df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs)
-        # fallback histórico (por si el endpoint devuelve vacío para un día exacto)
-        if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
-            d = datetime.strptime(day, "%Y-%m-%d").date()
-            hasta = (d + timedelta(days=1)).strftime("%Y-%m-%d")
-            df_tc = api_exportar_tiempo_trabajado(day, hasta, nifs=nifs)
         return day, df_tc
 
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
@@ -842,6 +917,7 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
                 out[(nif_tc, day)] = max(0, mins)
 
     return out
+
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
     url = f"{API_URL_BASE}/informes/empleados"
@@ -1064,8 +1140,9 @@ def _get_horas_programadas_from_row(row: dict) -> float:
 def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> dict:
     """Devuelve {(nif, YYYY-MM-DD): minutos_programados} para el rango [d0,d1].
 
-    Se consulta el informe empleados día a día (fi=ff) porque es la forma más robusta de obtener el valor diario real,
-    y se paraleliza con un número moderado de workers para mejorar rendimiento sin saturar la API.
+    Regla: SIEMPRE usamos horas_programadas del informe empleados.
+    Para obtener el valor diario real de forma robusta, consultamos día a día (fecha_desde=fecha_hasta),
+    y paralelizamos con un número moderado de workers para acelerar rangos grandes sin saturar la API.
     """
     if base_emp is None or base_emp.empty:
         return {}
@@ -1084,7 +1161,8 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
     if not days:
         return {}
 
-    max_workers = min(10, max(2, len(days)))  # conservador para evitar 429
+    # workers conservador: evita 429 y suele mejorar mucho en rangos grandes
+    max_workers = min(10, max(2, len(days)))
     out: dict[tuple[str, str], int] = {}
 
     def _fetch_day(day: str):
@@ -1101,27 +1179,28 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
             for r in rows:
                 if not isinstance(r, dict):
                     continue
+
                 nif = str(r.get("nif") or r.get("NIF") or "").upper().strip()
                 num = str(r.get("num_empleado") or r.get("numEmpleado") or "").strip()
                 if num:
                     num = _normalize_emp_code(num, pad=pad)
                 if not nif and num:
                     nif = map_num_to_nif.get(num, "")
+
                 if not nif or nif not in nifs_set:
                     continue
 
                 hp = _get_horas_programadas_from_row(r)
-                mins = 0
                 try:
                     v = float(hp)
-                    # Heurística: si el valor parece venir en minutos (>=25), usarlo tal cual, si no, horas -> minutos
-                    mins = int(round(v)) if v >= 25 else int(round(v * 60))
+                    mins = int(round(v)) if v >= 25 else int(round(v * 60))  # minutos vs horas
                 except Exception:
                     mins = 0
 
                 out[(nif, day)] = max(0, int(mins))
 
     return out
+
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
     if df_emp.empty:
         return pd.Series([], dtype=bool)
@@ -1288,9 +1367,6 @@ if consultar:
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
     signature = _sig(fi, ff, sel_empresas, sel_sedes)
-    # mapas compartidos (se rellenan si procede)
-    horas_prog_map_incid = {}
-    tc_map_global = {}
 
     with st.spinner("Procesando…"):
         tipos_map = api_exportar_tipos_fichaje()
@@ -1359,7 +1435,7 @@ if consultar:
 
             nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
-            tc_map_global = {}  # {(NIF, YYYY-MM-DD): minutos_contabilizados}
+            tc_rows = []
             d0 = datetime.strptime(fi, "%Y-%m-%d").date()
             d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
@@ -1374,21 +1450,21 @@ if consultar:
                 _safe_fail(_e)
                 horas_prog_map_incid = {}
 
-            # tiempoContabilizado (minutos) SIEMPRE desde exportacion/tiempo-trabajado, día a día (paralelizado)
-            try:
-                nifs_all = empleados_filtrados["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-                tc_map_global = build_tiempo_contabilizado_map(d0, d1, nifs_all)
-            except Exception as _e:
-                _safe_fail(_e)
-                tc_map_global = {}
 
-            # DataFrame para merge de tiempo contabilizado por día (solo para los NIF presentes en 'resumen')
-            if tc_map_global:
-                tc_rows = [
-                    {"nif": nif, "Fecha": day, "Tiempo Contabilizado": segundos_a_hhmm(int(mins) * 60)}
-                    for (nif, day), mins in tc_map_global.items()
-                ]
-                tc = pd.DataFrame(tc_rows)
+            for cur in _iter_days(d0, d1):
+                desde = cur.strftime("%Y-%m-%d")
+                df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
+                if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+                    hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+                    df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
+                if not df_tc.empty:
+                    df_tc["Fecha"] = desde
+                    tc_rows.append(df_tc)
+
+            if tc_rows:
+                tc = pd.concat(tc_rows, ignore_index=True)
+                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
+                tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
             else:
                 tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
 
@@ -1483,7 +1559,7 @@ if consultar:
                     "Total trabajado", "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
                 ])
 
-# --------- BAJAS (día a día) ----------
+        # --------- BAJAS (día a día) ----------
         bajas_por_dia = {}
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
@@ -1492,23 +1568,21 @@ if consultar:
         base_emp["nif"] = base_emp["nif"].astype(str).str.upper().str.strip()
         base_emp["num_empleado"] = base_emp.get("num_empleado", pd.Series([""] * len(base_emp))).astype(str).str.strip()
 
-        days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
-        max_workers_bajas = min(10, max(2, len(days)))  # conservador
-
-        def _bajas_day(day: str):
+        for cur in _iter_days(d0, d1):
+            day = cur.strftime("%Y-%m-%d")
             rep = api_informe_empleados(day, day)
             rows = _extract_rows_from_informe(rep)
             if not rows:
-                return day, None
+                continue
 
             df_rep = pd.DataFrame(rows)
             if df_rep.empty:
-                return day, None
+                continue
 
             df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
             df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
             if df_rep.empty:
-                return day, None
+                continue
 
             key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
             key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
@@ -1522,7 +1596,7 @@ if consultar:
                 merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
 
             if merged is None or merged.empty:
-                return day, None
+                continue
 
             out = pd.DataFrame({
                 "Fecha": day,
@@ -1534,17 +1608,8 @@ if consultar:
             })
 
             out = out[out["Nombre"].astype(str).str.strip().ne("")]
-            if out.empty:
-                return day, None
-            out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
-            return day, out
-
-        with ThreadPoolExecutor(max_workers=max_workers_bajas) as exe:
-            futs = [exe.submit(_bajas_day, day) for day in days]
-            for fut in as_completed(futs):
-                day, out = fut.result()
-                if out is not None and not out.empty:
-                    bajas_por_dia[day] = out
+            if not out.empty:
+                bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
 
         # --------- SIN FICHAJES ----------
         sin_por_dia = {}
@@ -1600,10 +1665,9 @@ if consultar:
         csv_excesos = b""
 
         if full_weeks:
-# 1) horas_programadas (minutos) para TODOS los empleados del filtro, día a día
-            #    Reutilizamos el mapa ya calculado en incidencias si existe; si no, lo calculamos aquí.
+            # 1) horas_programadas (minutos) para TODOS los empleados del filtro, día a día
             try:
-                horas_prog_map = horas_prog_map_incid if isinstance(horas_prog_map_incid, dict) and horas_prog_map_incid else build_horas_programadas_map(d0, d1, base_emp)
+                horas_prog_map = build_horas_programadas_map(d0, d1, base_emp)
             except Exception as _e:
                 _safe_fail(_e)
                 horas_prog_map = {}
@@ -1611,14 +1675,9 @@ if consultar:
             def expected_day_minutes(nif: str, day: date) -> int:
                 return int(horas_prog_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
 
-            # 2) tiempoContabilizado (minutos) SIEMPRE desde exportacion/tiempo-trabajado
-            #    Reutilizamos el mapa ya calculado en incidencias si existe; si no, lo calculamos aquí.
-            try:
-                nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-                tc_map = tc_map_global if isinstance(tc_map_global, dict) and tc_map_global else build_tiempo_contabilizado_map(d0, d1, nifs_all)
-            except Exception as _e:
-                _safe_fail(_e)
-                tc_map = {}
+            # 2) tiempoContabilizado (minutos) para TODOS los empleados del filtro, día a día
+            nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+            tc_map = build_tiempo_contabilizado_map(d0, d1, nifs_all)
 
             def worked_day_minutes(nif: str, day: date) -> int:
                 return int(tc_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
