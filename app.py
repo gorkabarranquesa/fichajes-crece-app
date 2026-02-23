@@ -117,6 +117,74 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
 
 
 # ============================================================
+# ============================================================
+# DESCIFRADO CRECE (AES-CBC)
+# ============================================================
+
+def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
+    json_raw = base64.b64decode(payload_b64).decode("utf-8")
+    payload = json.loads(json_raw)
+
+    iv = base64.b64decode(payload["iv"])
+    ct = base64.b64decode(payload["value"])
+    key = base64.b64decode(app_key_b64)
+
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    decrypted = unpad(cipher.decrypt(ct), AES.block_size)
+    return decrypted.decode("utf-8")
+
+
+def _try_parse_encrypted_response(resp: requests.Response):
+    """Intenta parsear respuesta cifrada de Crece Personas.
+
+    Devuelve objeto Python (list/dict) o None.
+    No loguea payloads (seguridad).
+    """
+    if resp is None:
+        return None
+
+    raw_text = (resp.text or "").strip()
+    candidates = []
+
+    try:
+        candidates.append(resp.json())
+    except Exception:
+        pass
+
+    candidates.append(raw_text)
+
+    for c in candidates:
+        try:
+            if isinstance(c, dict) and "iv" in c and "value" in c:
+                payload_obj = {"iv": c["iv"], "value": c["value"]}
+                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
+                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                return json.loads(dec)
+
+            if isinstance(c, str):
+                s = c.strip().strip('"').strip()
+
+                if s.startswith("{") and s.endswith("}"):
+                    obj = json.loads(s)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
+                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                        return json.loads(dec)
+
+                try:
+                    dec_json_raw = base64.b64decode(s).decode("utf-8")
+                    obj = json.loads(dec_json_raw)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        dec = decrypt_crece_payload(s, APP_KEY_B64)
+                        return json.loads(dec)
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+    return None
+
 # NORMALIZACIÓN
 # ============================================================
 
