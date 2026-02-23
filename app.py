@@ -2207,8 +2207,11 @@ if "tab_bajas" in tab_map:
             st.info("No hay empleados de baja en el rango seleccionado.")
         else:
             for day in sorted(bajas.keys()):
+                view_df = _df_view(bajas.get(day))
+                if view_df is None or (hasattr(view_df, 'empty') and view_df.empty):
+                    continue
                 st.markdown(f"### 🏥 Empleados de baja — {day}")
-                st.data_editor(_df_view(bajas[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('bajas', day, current_sig))
+                st.data_editor(view_df, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('bajas', day, current_sig))
             csv_b = st.session_state.get("result_csv_bajas", b"") or b""
             if csv_b:
                 st.download_button("⬇ Descargar CSV bajas", csv_b, "empleados_baja.csv", "text/csv")
@@ -2220,8 +2223,11 @@ if "tab_sin" in tab_map:
             st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
         else:
             for day in sorted(sinf.keys()):
+                view_df = _df_view(sinf.get(day))
+                if view_df is None or (hasattr(view_df, 'empty') and view_df.empty):
+                    continue
                 st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
-                st.data_editor(_df_view(sinf[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('sinf', day, current_sig))
+                st.data_editor(view_df, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('sinf', day, current_sig))
             csv_s = st.session_state.get("result_csv_sin", b"") or b""
             if csv_s:
                 st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
