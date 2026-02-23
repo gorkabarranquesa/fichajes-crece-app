@@ -668,7 +668,7 @@ def segundos_a_hhmm(seg: float) -> str:
 def _df_view(df):
     """Return a dataframe ready for UI display (hide internal helper columns)."""
     try:
-        cols_hide = {"empresa_norm", "sede_norm"}
+        cols_hide = {"empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
         return df.drop(columns=[c for c in cols_hide if c in df.columns], errors="ignore")
     except Exception:
         return df
@@ -2153,7 +2153,7 @@ if can_filter_locally:
     res_incid = _filter_day_dict(res_incid)
     res_bajas = _filter_day_dict(res_bajas)
     res_sin = _filter_day_dict(res_sin)
-    # Excesos suele venir agregado y puede no tener Empresa/Sede: lo dejamos tal cual
+    res_exc = _filter_day_dict(res_exc)
 else:
     # Si el usuario ha intentado AMPLIAR el alcance (añadir Empresa/Sede o cambiar fechas), avisamos
     if st.session_state.get("last_sig", ""):
@@ -2191,9 +2191,11 @@ if "tab_fich" in tab_map:
             st.success("🎉 No hay incidencias en el rango seleccionado.")
         else:
             for day in sorted(incid.keys()):
-                
+                view_df = _df_view(incid[day])
+                if view_df is None or (hasattr(view_df, "empty") and view_df.empty):
+                    continue
                 st.markdown(f"### 📅 {day}")
-                st.data_editor(_df_view(incid[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('incid', day, current_sig))
+                st.data_editor(view_df, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('incid', day, current_sig))
             csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
             if csv_i:
                 st.download_button("⬇ Descargar CSV incidencias", csv_i, "fichajes_incidencias.csv", "text/csv")
