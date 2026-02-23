@@ -22,7 +22,21 @@ API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 CPU = multiprocessing.cpu_count()
-MAX_WORKERS = max(8, min(24, CPU * 3))
+
+
+def _max_workers_io(n_tasks: int, *, cap: int = 12, minw: int = 4) -> int:
+    """Workers conservador para evitar 429 y saturación."""
+    try:
+        n = int(n_tasks or 0)
+    except Exception:
+        n = 0
+    base = max(minw, min(cap, max(4, int(CPU * 2))))
+    if n <= 0:
+        return base
+    return max(minw, min(cap, min(base, n)))
+
+
+MAX_WORKERS = _max_workers_io(0)
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 TOLERANCIA_MINUTOS = 5
@@ -56,15 +70,6 @@ EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
 }
 
 # ============================================================
-# FESTIVOS por sede (CSV)
-# - Upload en la app (prioridad)
-# - Si no se sube, intenta usar un CSV local llamado así (junto a app.py)
-# ============================================================
-
-DEFAULT_FESTIVOS_CSV_PATH = "Listado Festivos.csv"
-FESTIVOS_PERSIST_PATH = "festivos_saved.csv"  # persistente entre recargas (si el FS lo permite)
-
-
 def _safe_fail(_exc: Exception) -> None:
     return None
 
@@ -146,644 +151,6 @@ def _sede_code(sede: str) -> str:
 
 
 # ============================================================
-# FESTIVOS CSV -> {SEDE_NORM: set(YYYY-MM-DD)}
-# ============================================================
-
-@st.cache_data(show_spinner=False, ttl=3600)
-
-
-def get_festivos_for_sede(sede: str, festivos_by_sede: dict) -> set:
-    """Devuelve set de fechas 'YYYY-MM-DD' festivas para esa sede, con matching robusto."""
-    if not festivos_by_sede:
-        return set()
-
-    sede_norm = _norm_key(sede)
-    if sede_norm in festivos_by_sede:
-        return set(festivos_by_sede.get(sede_norm, set()) or set())
-
-    code = _sede_code(sede_norm)
-    if not code:
-        return set()
-
-    out = set()
-
-    # Caso: CSV con clave "P1"
-    if code in festivos_by_sede:
-        out |= set(festivos_by_sede.get(code, set()) or set())
-
-    # Caso: CSV con clave "P1 LAKUNTZA" (o variantes)
-    for k, v in festivos_by_sede.items():
-        k_norm = _norm_key(k)
-        if k_norm.startswith(code):
-            out |= set(v or set())
-
-    return out
-
-def _read_festivos_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
-    """Lee CSV de festivos de forma robusta (encoding/sep) y devuelve DataFrame."""
-    if not file_bytes:
-        return pd.DataFrame()
-    import io
-
-    # Intentos de decodificación
-    raw = None
-    for enc in ["utf-8-sig", "utf-8", "latin-1"]:
-        try:
-            raw = file_bytes.decode(enc)
-            break
-        except Exception:
-            continue
-    if raw is None:
-        raw = file_bytes.decode("latin-1", errors="ignore")
-
-    best_df = pd.DataFrame()
-    best_cols = 0
-    for sep in [";", ",", "\t", "|"]:
-        try:
-            df_try = pd.read_csv(io.StringIO(raw), sep=sep, dtype=str)
-            if df_try.shape[1] > best_cols:
-                best_df = df_try
-                best_cols = df_try.shape[1]
-        except Exception:
-            continue
-
-    if best_cols < 2:
-        try:
-            best_df = pd.read_csv(io.StringIO(raw), sep=None, engine="python", dtype=str)
-        except Exception:
-            return pd.DataFrame()
-
-    if not best_df.empty:
-        best_df = best_df.dropna(axis=1, how="all")
-    return best_df
-
-def load_festivos_from_csv_bytes(file_bytes: bytes) -> dict:
-    """
-    Devuelve {SEDE_NORM: set({YYYY-MM-DD,...})}.
-
-    CSV esperado (separador ';') con columnas tipo:
-      - "Próxima ocurrencia" (dd/mm/yyyy)
-      - "Sede(s)" (con sedes separadas por '|')
-      - opcional "Repetición"/"Notas" con exclusiones tipo: "En P3 no será festivo"
-
-    Regla (según RRHH):
-      - NO se infiere 'NACIONAL' como "para todas las sedes".
-      - Se aplica exactamente a lo que ponga en "Sede(s)" (y se respetan exclusiones en notas).
-    """
-    if not file_bytes:
-        return {}
-
-    df = _read_festivos_csv_bytes(file_bytes)
-
-    if df.empty:
-        return {}
-
-    col_fecha = None
-    for c in ["Próxima ocurrencia", "Proxima ocurrencia", "PROXIMA OCURRENCIA", "Fecha", "FECHA"]:
-        if c in df.columns:
-            col_fecha = c
-            break
-
-    col_sedes = None
-    for c in ["Sede(s)", "Sedes", "Sede", "SEDE(S)", "SEDE"]:
-        if c in df.columns:
-            col_sedes = c
-            break
-
-    col_nota = None
-    for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
-        if c in df.columns:
-            col_nota = c
-            break
-    if col_nota is None:
-        for c in df.columns:
-            if str(c).startswith("Unnamed:"):
-                col_nota = c
-                break
-
-    if not col_fecha or not col_sedes:
-        return {}
-
-    def parse_ddmmyyyy(s: str):
-        if not isinstance(s, str):
-            return None
-        s = s.strip()
-        if not s:
-            return None
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.date().strftime("%Y-%m-%d")
-
-    def excluded_codes_from_note(note_u: str) -> set:
-        if not note_u:
-            return set()
-        out = set()
-        # patrón típico: "En P3 no será festivo"
-        for code_ in ["P0", "P1", "P2", "P3"]:
-            if (f"EN {code_}" in note_u) and ("NO" in note_u) and ("FESTIV" in note_u):
-                out.add(code_)
-        return out
-
-    out: dict[str, set] = {}
-
-    for _, r in df.iterrows():
-        fecha_raw = str(r.get(col_fecha, "") or "").strip()
-        if not fecha_raw:
-            continue
-        fecha = parse_ddmmyyyy(fecha_raw)
-        if not fecha:
-            continue
-
-        sede_raw = str(r.get(col_sedes, "") or "").strip()
-        if not sede_raw:
-            continue
-
-        nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
-        excluded = excluded_codes_from_note(nota_u)
-
-        sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
-        for s in sedes_list:
-            s_norm = _norm_key(s)
-            code_ = _sede_code(s_norm)
-            if code_ and (code_ in excluded):
-                continue
-            out.setdefault(s_norm, set()).add(fecha)
-
-    return out
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_festivos_labels_from_csv_bytes(file_bytes: bytes) -> dict:
-    """
-    Devuelve {SEDE_NORM: {YYYY-MM-DD: 'Nombre del festivo'}}.
-
-    Regla (según RRHH):
-      - NO se infiere 'NACIONAL' como "para todas las sedes".
-      - Se aplica exactamente a lo que ponga en "Sede(s)" (y se respetan exclusiones en notas).
-    """
-    if not file_bytes:
-        return {}
-
-    df = _read_festivos_csv_bytes(file_bytes)
-
-    if df.empty:
-        return {}
-
-    col_fecha = None
-    for c in ["Próxima ocurrencia", "Proxima ocurrencia", "PROXIMA OCURRENCIA", "Fecha", "FECHA"]:
-        if c in df.columns:
-            col_fecha = c
-            break
-
-    col_sedes = None
-    for c in ["Sede(s)", "Sedes", "Sede", "SEDE(S)", "SEDE"]:
-        if c in df.columns:
-            col_sedes = c
-            break
-
-    col_nombre = None
-    for c in ["Nombre del festivo", "NOMBRE DEL FESTIVO", "Nombre", "FESTIVO", "Descripcion", "Descripción"]:
-        if c in df.columns:
-            col_nombre = c
-            break
-
-    col_nota = None
-    for c in ["Repetición", "Repeticion", "Notas", "NOTAS"]:
-        if c in df.columns:
-            col_nota = c
-            break
-    if col_nota is None:
-        for c in df.columns:
-            if str(c).startswith("Unnamed:"):
-                col_nota = c
-                break
-
-    if not col_fecha or not col_sedes:
-        return {}
-
-    def parse_ddmmyyyy(s: str):
-        if not isinstance(s, str):
-            return None
-        s = s.strip()
-        if not s:
-            return None
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.date().strftime("%Y-%m-%d")
-
-    def excluded_codes_from_note(note_u: str) -> set:
-        if not note_u:
-            return set()
-        out = set()
-        for code_ in ["P0", "P1", "P2", "P3"]:
-            if (f"EN {code_}" in note_u) and ("NO" in note_u) and ("FESTIV" in note_u):
-                out.add(code_)
-        return out
-
-    out: dict[str, dict] = {}
-
-    for _, r in df.iterrows():
-        fecha_raw = str(r.get(col_fecha, "") or "").strip()
-        sede_raw = str(r.get(col_sedes, "") or "").strip()
-        if not fecha_raw or not sede_raw:
-            continue
-
-        fecha = parse_ddmmyyyy(fecha_raw)
-        if not fecha:
-            continue
-
-        nota_u = str(r.get(col_nota, "") or "").strip().upper() if col_nota else ""
-        excluded = excluded_codes_from_note(nota_u)
-
-        nombre = str(r.get(col_nombre, "") or "").strip() if col_nombre else ""
-        if not nombre:
-            nombre = "Festivo"
-
-        sedes_list = [x.strip() for x in sede_raw.split("|") if x.strip()]
-        for s in sedes_list:
-            s_norm = _norm_key(s)
-            code_ = _sede_code(s_norm)
-            if code_ in excluded:
-                continue
-            out.setdefault(s_norm, {})[fecha] = nombre
-
-    return out
-
-
-def get_festivo_label_for_sede_date(sede: str, day_yyyy_mm_dd: str, festivos_labels_by_sede: dict) -> str:
-    """Devuelve el nombre del festivo (si lo hay) para esa sede y fecha (matching robusto)."""
-    if not festivos_labels_by_sede:
-        return ""
-    sede_norm = _norm_key(sede)
-    if sede_norm in festivos_labels_by_sede:
-        return str((festivos_labels_by_sede.get(sede_norm, {}) or {}).get(day_yyyy_mm_dd, "") or "")
-
-    code = _sede_code(sede_norm)
-    if not code:
-        return ""
-
-    if code in festivos_labels_by_sede:
-        return str((festivos_labels_by_sede.get(code, {}) or {}).get(day_yyyy_mm_dd, "") or "")
-
-    for k, v in festivos_labels_by_sede.items():
-        k_norm = _norm_key(k)
-        if k_norm.startswith(code):
-            val = (v or {}).get(day_yyyy_mm_dd)
-            if val:
-                return str(val)
-
-    return ""
-
-def _iter_days(d0: date, d1: date):
-    cur = d0
-    while cur <= d1:
-        yield cur
-        cur += timedelta(days=1)
-
-
-
-def list_full_workweeks_in_range(fi: date, ff: date):
-    """
-    Semanas completas contenidas dentro del rango.
-
-    Reglas:
-    - Para incluir una semana, el rango debe cubrir como mínimo L-V.
-    - Si además cubre sábado -> se devuelve como L-S.
-    - Si además cubre sábado+domingo -> se devuelve como L-D.
-
-    Devuelve lista de tuplas: (week_start_monday, week_end_inclusive, weekend_mode)
-      weekend_mode: "LV" | "LS" | "LD"
-    """
-
-    def monday_of(d: date) -> date:
-        return d - timedelta(days=d.weekday())
-
-    weeks = []
-    cur = monday_of(fi)
-    end_limit = monday_of(ff)
-
-    while cur <= end_limit:
-        mon = cur
-        fri = cur + timedelta(days=4)
-        sat = cur + timedelta(days=5)
-        sun = cur + timedelta(days=6)
-
-        # Semana base L-V completa
-        if (fi <= mon) and (ff >= fri):
-            include_sat = (fi <= sat) and (ff >= sat)
-            include_sun = (fi <= sun) and (ff >= sun)
-
-            if include_sun and include_sat:
-                end_incl = sun
-                mode = "LD"
-            elif include_sat:
-                end_incl = sat
-                mode = "LS"
-            else:
-                end_incl = fri
-                mode = "LV"
-
-            weeks.append((mon, end_incl, mode))
-
-        cur += timedelta(days=7)
-
-    return weeks
-
-
-
-def floor_to_30(mins: int) -> int:
-    if mins <= 0:
-        return 0
-    return (mins // 30) * 30
-
-
-def ceil_to_30(mins: int) -> int:
-    if mins <= 0:
-        return 0
-    return ((mins + 29) // 30) * 30
-
-
-def quantize_daily_balance_30(diff_mins: int, tol: int = 5) -> int:
-    """Cuantiza un balance diario en tramos de 30 min con tolerancia.
-    - |diff| <= tol => 0
-    - diff > tol: no suma nada si diff < 30; si diff >= 30 => floor a múltiplos de 30
-    - diff < -tol: resta hacia 'más falta' => -ceil(|diff|/30)*30
-    """
-    d = int(diff_mins)
-    if abs(d) <= int(tol):
-        return 0
-    if d > 0:
-        return floor_to_30(d) if d >= 30 else 0
-    return -ceil_to_30(abs(d))
-
-
-
-def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
-    """Para MOD: en día laborable (horas_programadas>0), NO cuenta el tiempo antes del inicio de turno.
-    Heurística:
-      - Primera entrada < 12:00  -> turno mañana empieza 06:00
-      - Primera entrada >= 12:00 -> turno tarde empieza 14:00
-    Si primera_entrada < inicio_turno: restamos (inicio_turno - primera_entrada) del total contabilizado.
-    """
-    try:
-        total = int(mins_tc or 0)
-    except Exception:
-        total = 0
-    if total <= 0:
-        return 0
-    if primera_min is None:
-        return total
-    try:
-        pe = int(primera_min)
-    except Exception:
-        return total
-
-    shift_start = 6 * 60 if pe < (12 * 60) else 14 * 60
-    if pe >= shift_start:
-        return total
-    exclude = shift_start - pe
-    return max(0, total - exclude)
-
-
-def mins_to_hhmm_signed(mins: int) -> str:
-    sign = "+" if mins >= 0 else "-"
-    a = abs(int(mins))
-    h = a // 60
-    m = a % 60
-    return f"{sign}{h:02d}:{m:02d}"
-
-
-# ============================================================
-# RESTRICCIONES (solo estas empresas y sedes)
-# ============================================================
-
-ALLOWED_EMPRESAS = [
-    "Barranquesa Tower Flanges, S.L.",
-    "Barranquesa Anchor Cages, S.L.",
-    "Industrial Barranquesa S.A.",
-]
-
-ALLOWED_SEDES = [
-    "P0 IBSA",
-    "P1 LAKUNTZA",
-    "P2 COMARCA II",
-    "P3 UHARTE",
-]
-
-ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
-ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
-
-
-# ============================================================
-# DESCIFRADO CRECE (AES-CBC)
-# ============================================================
-
-def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
-    json_raw = base64.b64decode(payload_b64).decode("utf-8")
-    payload = json.loads(json_raw)
-
-    iv = base64.b64decode(payload["iv"])
-    ct = base64.b64decode(payload["value"])
-    key = base64.b64decode(app_key_b64)
-
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    decrypted = unpad(cipher.decrypt(ct), AES.block_size)
-    return decrypted.decode("utf-8")
-
-
-def _try_parse_encrypted_response(resp: requests.Response):
-    if resp is None:
-        return None
-
-    raw_text = (resp.text or "").strip()
-    candidates = []
-
-    try:
-        candidates.append(resp.json())
-    except Exception:
-        pass
-
-    candidates.append(raw_text)
-
-    for c in candidates:
-        try:
-            if isinstance(c, dict) and "iv" in c and "value" in c:
-                payload_obj = {"iv": c["iv"], "value": c["value"]}
-                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
-                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                return json.loads(dec)
-
-            if isinstance(c, str):
-                s = c.strip().strip('"').strip()
-
-                if s.startswith("{") and s.endswith("}"):
-                    obj = json.loads(s)
-                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
-                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                        return json.loads(dec)
-
-                try:
-                    dec_json_raw = base64.b64decode(s).decode("utf-8")
-                    obj = json.loads(dec_json_raw)
-                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                        dec = decrypt_crece_payload(s, APP_KEY_B64)
-                        return json.loads(dec)
-                except Exception:
-                    pass
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# TIEMPOS (con redondeo consistente)
-# ============================================================
-
-def _round_seconds_to_minute(seg: float) -> int:
-    if seg is None or (isinstance(seg, float) and pd.isna(seg)):
-        return 0
-    try:
-        s = float(seg)
-    except Exception:
-        return 0
-    if s < 0:
-        s = 0.0
-    return int(round(s / 60.0)) * 60
-
-
-def segundos_a_hhmm(seg: float) -> str:
-    seg_i = _round_seconds_to_minute(seg)
-    total_min = seg_i // 60
-    h = total_min // 60
-    m = total_min % 60
-    return f"{h:02d}:{m:02d}"
-
-
-
-def _df_view(df):
-    """Return a dataframe ready for UI display (hide internal helper columns)."""
-    try:
-        cols_hide = {"empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
-        return df.drop(columns=[c for c in cols_hide if c in df.columns], errors="ignore")
-    except Exception:
-        return df
-
-def _make_editor_key(prefix: str, *parts) -> str:
-    raw = prefix + "|" + "|".join(str(p) for p in parts)
-    return prefix + "_" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
-
-
-def hhmm_to_min(hhmm: str) -> int:
-    if not isinstance(hhmm, str) or ":" not in hhmm:
-        return 0
-    try:
-        h, m = map(int, hhmm.split(":"))
-        return max(0, h * 60 + m)
-    except Exception:
-        return 0
-
-
-def hhmm_to_dec(hhmm: str) -> float:
-    return hhmm_to_min(hhmm) / 60.0
-
-
-def diferencia_hhmm(tc_hhmm: str, tt_hhmm: str) -> str:
-    tc_hhmm = (tc_hhmm or "").strip()
-    tt_hhmm = (tt_hhmm or "").strip()
-    if not tc_hhmm or not tt_hhmm:
-        return ""
-
-    tc_min = hhmm_to_min(tc_hhmm)
-    tt_min = hhmm_to_min(tt_hhmm)
-
-    # ✅ tolerancia de 1 minuto para eliminar +00:01 / -00:01 por redondeos
-    if abs(tc_min - tt_min) <= 1:
-        return ""
-
-    diff = tc_min - tt_min
-    sign = "+" if diff > 0 else "-"
-    diff = abs(diff)
-
-    h = diff // 60
-    m = diff % 60
-    return f"{sign}{h:02d}:{m:02d}"
-
-
-def ts_to_hhmm(ts):
-    if ts is None or pd.isna(ts):
-        return ""
-    try:
-        return pd.to_datetime(ts).strftime("%H:%M")
-    except Exception:
-        return ""
-
-
-def hhmm_to_min_clock(hhmm: str):
-    if not isinstance(hhmm, str) or ":" not in hhmm:
-        return None
-    try:
-        h, m = map(int, hhmm.split(":"))
-        return h * 60 + m
-    except Exception:
-        return None
-
-
-# ============================================================
-# REGLAS ESPECIALES (las tuyas)
-# ============================================================
-
-N_DAVID = norm_name("David Rodriguez Vazquez")
-N_DEBORA = norm_name("Debora Luis Soto")
-N_ETOR = norm_name("Etor Alegria Reparaz")
-N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
-N_MIRIAM = norm_name("Miriam Martin Muñoz")
-N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
-
-SPECIAL_RULES_PREFIX = [
-    ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
-    ("MOI", N_DEBORA, {"min_fichajes": 2}),
-    ("MOI", N_ETOR, {"min_fichajes": 2}),
-    ("MOI", N_MIRIAM, {"min_horas": 5.5, "min_fichajes": 2}),
-    ("ESTRUCTURA", N_BEATRIZ, {"min_horas": 6.5, "min_fichajes": 2, "max_fichajes_ok": 4}),
-]
-
-SCHEDULE_EXEMPT_PREFIX = [
-    ("MOD", N_DAVID),
-    ("MOI", N_MIRIAM),
-]
-
-FLEX_BY_DEPTO = {
-    "ESTRUCTURA": [N_FRAN],
-    "MOI": [N_DEBORA, N_ETOR],
-}
-
-
-def _lookup_special(depto_norm: str, nombre_norm: str):
-    for d, pref, rules in SPECIAL_RULES_PREFIX:
-        if depto_norm == d and name_startswith(nombre_norm, pref):
-            return rules
-    return None
-
-
-def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
-    for d, pref in SCHEDULE_EXEMPT_PREFIX:
-        if depto_norm == d and name_startswith(nombre_norm, pref):
-            return True
-    return False
-
-
-def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
-    for pref in FLEX_BY_DEPTO.get(depto_norm, []):
-        if name_startswith(nombre_norm, pref):
-            return True
-    return False
-
-
 def calcular_minimos(depto: str, dia: int, nombre: str):
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
@@ -813,36 +180,6 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
     return min_h, min_f
 
-
-def expected_week_minutes_for_employee(
-    depto: str,
-    nombre: str,
-    sede: str,
-    week_mon: date,
-    week_fri: date,
-    festivos_by_sede: dict
-) -> int:
-    """
-    Jornada esperada semanal por empleado:
-    - suma jornada diaria esperada (calcular_minimos) de L-V
-    - si un día es festivo en ESA sede -> no suma jornada ese día
-    - así los de jornada especial quedan automáticamente bien
-    """
-    festivos = get_festivos_for_sede(sede, festivos_by_sede)
-
-    total = 0
-    cur = week_mon
-    while cur <= week_fri:
-        wd = cur.weekday()
-        if wd <= 4:
-            day_str = cur.strftime("%Y-%m-%d")
-            if day_str not in festivos:
-                min_h, _ = calcular_minimos(depto, wd, nombre)
-                if min_h is not None:
-                    total += int(round(float(min_h) * 60))
-        cur += timedelta(days=1)
-
-    return max(0, total)
 
 
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
@@ -1409,36 +746,43 @@ def _get_horas_programadas_from_row(row: dict) -> float:
 
 
 def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> dict:
-    """Devuelve {(nif, YYYY-MM-DD): minutos_programados} para el rango [d0,d1]."""
+    """Devuelve {(nif, YYYY-MM-DD): minutos_programados} para el rango [d0,d1].
+
+    Rendimiento:
+      - Paraleliza la descarga día a día con un nº de workers conservador.
+    Seguridad:
+      - No imprime ni loguea payloads ni datos personales.
+    """
     if base_emp is None or base_emp.empty:
         return {}
 
     be = base_emp.copy()
-    be['nif'] = be['nif'].astype(str).str.upper().str.strip()
-    be['num_empleado'] = be.get('num_empleado', '').astype(str).str.strip()
+    be["nif"] = be["nif"].astype(str).str.upper().str.strip()
+    be["num_empleado"] = be.get("num_empleado", "").astype(str).str.strip()
 
-    pad = int(be['num_empleado'].astype(str).str.len().max() or 10)
-    be['num_empleado_norm'] = be['num_empleado'].apply(lambda x: _normalize_emp_code(x, pad=pad))
+    pad = int(be["num_empleado"].astype(str).str.len().max() or 10)
+    be["num_empleado_norm"] = be["num_empleado"].apply(lambda x: _normalize_emp_code(x, pad=pad))
 
-    map_num_to_nif = dict(zip(be['num_empleado_norm'], be['nif']))
-    nifs_set = set(be['nif'].tolist())
+    map_num_to_nif = dict(zip(be["num_empleado_norm"], be["nif"]))
+    nifs_set = set(be["nif"].tolist())
 
-    out = {}
-    cur = d0
-    while cur <= d1:
-        day = cur.strftime('%Y-%m-%d')
+    days = [cur for cur in _iter_days(d0, d1)]
+
+    def _fetch_one(day_dt: date):
+        day = day_dt.strftime("%Y-%m-%d")
         rep = api_informe_empleados(day, day)
         rows = _extract_rows_from_informe(rep)
+        out_local = {}
         if rows:
             for r in rows:
                 if not isinstance(r, dict):
                     continue
-                nif = str(r.get('nif') or r.get('NIF') or '').upper().strip()
-                num = str(r.get('num_empleado') or r.get('numEmpleado') or '').strip()
+                nif = str(r.get("nif") or r.get("NIF") or "").upper().strip()
+                num = str(r.get("num_empleado") or r.get("numEmpleado") or "").strip()
                 if num:
                     num = _normalize_emp_code(num, pad=pad)
                 if not nif and num:
-                    nif = map_num_to_nif.get(num, '')
+                    nif = map_num_to_nif.get(num, "")
                 if not nif or nif not in nifs_set:
                     continue
 
@@ -1446,6 +790,7 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
                 mins = 0
                 try:
                     v = float(hp)
+                    # Heurística compat: algunos endpoints devuelven minutos directamente si es muy grande.
                     if v >= 25:
                         mins = int(round(v))
                     else:
@@ -1453,10 +798,65 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
                 except Exception:
                     mins = 0
 
-                out[(nif, day)] = mins
-        cur = cur + timedelta(days=1)
+                out_local[(nif, day)] = int(max(0, mins))
+        return out_local
+
+    out = {}
+    maxw = _max_workers_io(len(days), cap=10, minw=4)
+    with ThreadPoolExecutor(max_workers=maxw) as exe:
+        futs = [exe.submit(_fetch_one, d) for d in days]
+        for fut in as_completed(futs):
+            try:
+                out.update(fut.result() or {})
+            except Exception as _e:
+                _safe_fail(_e)
 
     return out
+def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
+    """Devuelve {(nif, YYYY-MM-DD): minutos_contabilizados} usando exportacion/tiempo-trabajado.
+    Siempre se usa tiempoContabilizado (haya fichaje o no).
+    Optimizado: paraleliza por día con workers conservador.
+    """
+    nifs = [str(x).upper().strip() for x in (nifs or []) if str(x).strip()]
+    if not nifs:
+        return {}
+
+    days = [cur for cur in _iter_days(d0, d1)]
+
+    def _fetch_one(day_dt: date):
+        day = day_dt.strftime("%Y-%m-%d")
+        df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs)
+        # Fallback legacy: algunas veces devuelve vacío para rango 1 día (probado antes)
+        if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
+            hasta = (day_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            df_tc = api_exportar_tiempo_trabajado(day, hasta, nifs=nifs)
+
+        out_local = {}
+        if not df_tc.empty:
+            for _, rr in df_tc.iterrows():
+                nif_tc = str(rr.get("nif") or "").upper().strip()
+                if not nif_tc:
+                    continue
+                seg = rr.get("tiempoContabilizado_seg")
+                try:
+                    mins = int(round(float(seg or 0) / 60.0))
+                except Exception:
+                    mins = 0
+                out_local[(nif_tc, day)] = int(max(0, mins))
+        return out_local
+
+    out = {}
+    maxw = _max_workers_io(len(days), cap=10, minw=4)
+    with ThreadPoolExecutor(max_workers=maxw) as exe:
+        futs = [exe.submit(_fetch_one, d) for d in days]
+        for fut in as_completed(futs):
+            try:
+                out.update(fut.result() or {})
+            except Exception as _e:
+                _safe_fail(_e)
+
+    return out
+
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
     if df_emp.empty:
         return pd.Series([], dtype=bool)
@@ -1632,7 +1032,7 @@ if consultar:
 
         # --------- FICHAJES ----------
         fichajes_rows = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+        with ThreadPoolExecutor(max_workers=_max_workers_io(len(empleados_filtrados), cap=12, minw=4)) as exe:
             futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
             for fut in as_completed(futures):
                 emp = futures[fut]
@@ -1694,11 +1094,10 @@ if consultar:
 
             nifs = resumen["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
-            tc_rows = []
             d0 = datetime.strptime(fi, "%Y-%m-%d").date()
             d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
-            # horas_programadas (minutos) para el rango (incidencias + exceso)
+            # horas_programadas (minutos) para el rango (fuente única de esperado)
             horas_prog_map_incid = {}
             try:
                 base_emp_hp = empleados_filtrados.copy()
@@ -1709,26 +1108,29 @@ if consultar:
                 _safe_fail(_e)
                 horas_prog_map_incid = {}
 
+            # tiempoContabilizado (minutos) para el rango (fuente única de trabajado)
+            tc_map_incid = {}
+            try:
+                nifs_all = base_emp_hp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+                tc_map_incid = build_tiempo_contabilizado_map(d0, d1, nifs_all)
+            except Exception as _e:
+                _safe_fail(_e)
+                tc_map_incid = {}
 
-            for cur in _iter_days(d0, d1):
-                desde = cur.strftime("%Y-%m-%d")
-                df_tc = api_exportar_tiempo_trabajado(desde, desde, nifs=nifs)
-                if df_tc.empty or df_tc["tiempoContabilizado_seg"].isna().all():
-                    hasta = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
-                    df_tc = api_exportar_tiempo_trabajado(desde, hasta, nifs=nifs)
-                if not df_tc.empty:
-                    df_tc["Fecha"] = desde
-                    tc_rows.append(df_tc)
+            # Guardar mapas para reutilizar (p.ej. Excesos) sin re-llamar a API en esta consulta
+            st.session_state["_hp_map_last"] = horas_prog_map_incid
+            st.session_state["_tc_map_last"] = tc_map_incid
 
-            if tc_rows:
-                tc = pd.concat(tc_rows, ignore_index=True)
-                tc["Tiempo Contabilizado"] = tc["tiempoContabilizado_seg"].apply(segundos_a_hhmm)
-                tc = tc[["nif", "Fecha", "Tiempo Contabilizado"]]
-            else:
-                tc = pd.DataFrame(columns=["nif", "Fecha", "Tiempo Contabilizado"])
-
-            resumen = resumen.merge(tc, on=["nif", "Fecha"], how="left")
-            resumen["Tiempo Contabilizado"] = resumen["Tiempo Contabilizado"].fillna("")
+            # Rellenar Tiempo Contabilizado en resumen con el mapa diario (coincide con portal)
+            keys = list(zip(resumen["nif"].astype(str).str.upper().str.strip().tolist(), resumen["Fecha"].astype(str).tolist()))
+            tc_vals = []
+            for nif_k, day_k in keys:
+                mins = tc_map_incid.get((nif_k, day_k))
+                if mins is None:
+                    tc_vals.append("")
+                else:
+                    tc_vals.append(segundos_a_hhmm(int(mins) * 60))
+            resumen["Tiempo Contabilizado"] = tc_vals
 
             resumen["Diferencia"] = resumen.apply(
                 lambda r: diferencia_hhmm(r.get("Tiempo Contabilizado", ""), r.get("Total trabajado", "")),
@@ -1924,33 +1326,13 @@ if consultar:
         csv_excesos = b""
 
         if full_weeks:
-            # 1) horas_programadas (minutos) para TODOS los empleados del filtro, día a día
-            try:
-                horas_prog_map = build_horas_programadas_map(d0, d1, base_emp)
-            except Exception as _e:
-                _safe_fail(_e)
-                horas_prog_map = {}
+
+            # 1) Mapas diarios (reutilizados): esperado = horas_programadas, trabajado = tiempoContabilizado
+            horas_prog_map = st.session_state.get("_hp_map_last", {}) or {}
+            tc_map = st.session_state.get("_tc_map_last", {}) or {}
 
             def expected_day_minutes(nif: str, day: date) -> int:
                 return int(horas_prog_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
-
-            # 2) tiempoContabilizado (minutos) para TODOS los empleados del filtro, día a día
-            nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
-            tc_map = {}  # {(nif, 'YYYY-MM-DD'): minutos_contabilizados}
-            for cur in _iter_days(d0, d1):
-                day = cur.strftime("%Y-%m-%d")
-                df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs_all)
-                if not df_tc.empty:
-                    for _, rr in df_tc.iterrows():
-                        nif_tc = str(rr.get("nif") or "").upper().strip()
-                        if not nif_tc:
-                            continue
-                        seg = rr.get("tiempoContabilizado_seg")
-                        try:
-                            mins = int(round(float(seg or 0) / 60.0))
-                        except Exception:
-                            mins = 0
-                        tc_map[(nif_tc, day)] = max(0, mins)
 
             def worked_day_minutes(nif: str, day: date) -> int:
                 return int(tc_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
