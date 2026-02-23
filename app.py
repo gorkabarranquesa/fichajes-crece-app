@@ -144,15 +144,8 @@ def _sede_code(sede: str) -> str:
 # ============================================================
 # ============================================================
 
-@st.cache_data(show_spinner=False, ttl=3600)
-
-
-
-
-
-
-
 def _iter_days(d0: date, d1: date):
+    """Itera fechas (inclusive) sin cache (evita objetos no serializables)."""
     cur = d0
     while cur <= d1:
         yield cur
