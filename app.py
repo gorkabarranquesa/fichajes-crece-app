@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import random
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -193,6 +194,20 @@ ALLOWED_SEDES = [
     "P2 COMARCA II",
     "P3 UHARTE",
 ]
+
+def _norm_key(x: str) -> str:
+    """Normaliza texto para comparaciones (sin tildes, minúsculas, espacios colapsados)."""
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if not s:
+        return ""
+    # quitar acentos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # normalizar espacios y minúsculas
+    s = " ".join(s.split()).lower()
+    return s
 
 ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
 ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
