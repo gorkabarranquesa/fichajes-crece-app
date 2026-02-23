@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import multiprocessing
 import random
@@ -661,6 +662,20 @@ def segundos_a_hhmm(seg: float) -> str:
     h = total_min // 60
     m = total_min % 60
     return f"{h:02d}:{m:02d}"
+
+
+
+def _df_view(df):
+    """Return a dataframe ready for UI display (hide internal helper columns)."""
+    try:
+        cols_hide = {"empresa_norm", "sede_norm"}
+        return df.drop(columns=[c for c in cols_hide if c in df.columns], errors="ignore")
+    except Exception:
+        return df
+
+def _make_editor_key(prefix: str, *parts) -> str:
+    raw = prefix + "|" + "|".join(str(p) for p in parts)
+    return prefix + "_" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
 
 
 def hhmm_to_min(hhmm: str) -> int:
@@ -2178,7 +2193,7 @@ if "tab_fich" in tab_map:
             for day in sorted(incid.keys()):
                 
                 st.markdown(f"### 📅 {day}")
-                st.data_editor(incid[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+                st.data_editor(_df_view(incid[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('incid', day, current_sig))
             csv_i = st.session_state.get("result_csv_incidencias", b"") or b""
             if csv_i:
                 st.download_button("⬇ Descargar CSV incidencias", csv_i, "fichajes_incidencias.csv", "text/csv")
@@ -2191,7 +2206,7 @@ if "tab_bajas" in tab_map:
         else:
             for day in sorted(bajas.keys()):
                 st.markdown(f"### 🏥 Empleados de baja — {day}")
-                st.data_editor(bajas[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+                st.data_editor(_df_view(bajas[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('bajas', day, current_sig))
             csv_b = st.session_state.get("result_csv_bajas", b"") or b""
             if csv_b:
                 st.download_button("⬇ Descargar CSV bajas", csv_b, "empleados_baja.csv", "text/csv")
@@ -2204,7 +2219,7 @@ if "tab_sin" in tab_map:
         else:
             for day in sorted(sinf.keys()):
                 st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
-                st.data_editor(sinf[day], use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+                st.data_editor(_df_view(sinf[day]), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('sinf', day, current_sig))
             csv_s = st.session_state.get("result_csv_sin", b"") or b""
             if csv_s:
                 st.download_button("⬇ Descargar CSV sin fichajes", csv_s, "empleados_sin_fichajes.csv", "text/csv")
@@ -2220,7 +2235,7 @@ if "tab_exc" in tab_map:
             if dfw is None or dfw.empty:
                 st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
             else:
-                st.data_editor(dfw, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed")
+                st.data_editor(_df_view(dfw), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('exceso', label, current_sig))
 
         csv_w = st.session_state.get("result_csv_excesos", b"") or b""
         if csv_w:
