@@ -2118,7 +2118,7 @@ if "tab_fich" in tab_map:
     with tab_map["tab_fich"]:
         incid = res_incid
         if not incid:
-            st.success("🎉 No hay incidencias en el rango seleccionado.")
+            st.info("No hay incidencias en el rango seleccionado.")
         else:
             for day in sorted(incid.keys()):
                 view_df = _df_view(incid[day])
@@ -2150,13 +2150,13 @@ if "tab_sin" in tab_map:
     with tab_map["tab_sin"]:
         sinf = res_sin
         if not sinf:
-            st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
+            st.info("No hay empleados sin fichajes en el rango seleccionado.")
         else:
             for day in sorted(sinf.keys()):
                 view_df = _df_view(sinf.get(day))
                 if view_df is None or (hasattr(view_df, 'empty') and view_df.empty):
                     continue
-                st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
+                st.markdown(f"### ⛔ Empleados sin fichajes — {day}")
                 st.data_editor(view_df, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('sinf', day, current_sig))
             csv_s = st.session_state.get("result_csv_sin", b"") or b""
             if csv_s:
