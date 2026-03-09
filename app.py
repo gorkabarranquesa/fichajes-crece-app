@@ -2165,15 +2165,20 @@ if "tab_sin" in tab_map:
 if "tab_exc" in tab_map:
     with tab_map["tab_exc"]:
         excesos = res_exc
+        shown_any_week = False
 
         for wk_start, wk_end_incl, wk_mode in weeks_ui:
             label = f"{wk_start:%Y-%m-%d} → {wk_end_incl:%Y-%m-%d} (" + ("L-D" if wk_mode=="LD" else ("L-S" if wk_mode=="LS" else "L-V")) + ")"
-            st.markdown(f"### 🗓 {label}")
             dfw = excesos.get(label)
             if dfw is None or dfw.empty:
-                st.info("No hay excesos (MOI/ESTRUCTURA/MOD) en esta semana completa (o no hay datos).")
-            else:
-                st.data_editor(_df_view(dfw), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('exceso', label, current_sig))
+                continue
+
+            shown_any_week = True
+            st.markdown(f"### 🗓 {label}")
+            st.data_editor(_df_view(dfw), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('exceso', label, current_sig))
+
+        if not shown_any_week:
+            st.info("No hay excesos de jornada en el rango seleccionado.")
 
         csv_w = st.session_state.get("result_csv_excesos", b"") or b""
         if csv_w:
