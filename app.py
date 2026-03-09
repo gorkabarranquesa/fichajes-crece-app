@@ -1258,7 +1258,11 @@ def _cached_horas_programadas_map(
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
         futs = [exe.submit(_fetch_day, day) for day in days]
         for fut in as_completed(futs):
-            day, rows = fut.result()
+            try:
+                day, rows = fut.result()
+            except Exception as _e:
+                _safe_fail(_e)
+                continue
             if not rows:
                 continue
             for r in rows:
@@ -1443,12 +1447,14 @@ with f1:
 with f2:
     sel_sedes = st.multiselect("Sede", options=sedes_opts, default=sedes_opts)
 
-empleados_filtrados = empleados_df[
+empleados_filtrados_emp_sede = empleados_df[
     empleados_df["Empresa"].apply(_norm_key).isin({_norm_key(x) for x in sel_empresas}) &
     empleados_df["Sede"].apply(_norm_key).isin({_norm_key(x) for x in sel_sedes})
 ].copy()
 
-empleados_activos_opts_df = empleados_filtrados[empleado_activo_o_contrato(empleados_filtrados)].copy()
+# Opciones del selector de empleados: todos los activos del universo permitido
+# (si eliges empleados concretos, su filtro manda por encima de Empresa/Sede)
+empleados_activos_opts_df = empleados_df[empleado_activo_o_contrato(empleados_df)].copy()
 empleados_activos_opts_df = empleados_activos_opts_df.sort_values(["nombre_completo"], kind="mergesort")
 emp_opts_map = dict(
     zip(
@@ -1461,7 +1467,7 @@ sel_empleados = st.multiselect(
     "Empleados activos",
     options=emp_opts_names,
     default=[],
-    help="Si no seleccionas ninguno, se muestran todos los empleados como hasta ahora.",
+    help="Si no seleccionas ninguno, se filtra por Empresa/Sede. Si seleccionas empleados, ese filtro tiene prioridad.",
 )
 sel_empleados_nifs = {
     emp_opts_map[n]
@@ -1470,9 +1476,11 @@ sel_empleados_nifs = {
 }
 
 if sel_empleados_nifs:
-    empleados_filtrados = empleados_filtrados[
-        empleados_filtrados["nif"].astype(str).str.upper().str.strip().isin(sel_empleados_nifs)
+    empleados_filtrados = empleados_df[
+        empleados_df["nif"].astype(str).str.upper().str.strip().isin(sel_empleados_nifs)
     ].copy()
+else:
+    empleados_filtrados = empleados_filtrados_emp_sede.copy()
 
 st.write("---")
 
@@ -1480,7 +1488,13 @@ st.write("---")
 def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list, empleados_sel_nifs: set[str] | None = None) -> str:
     empleados_sel_nifs = empleados_sel_nifs or set()
     emp_part = ','.join(sorted(map(str, empleados_sel_nifs)))
-    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}|EMP:{emp_part}"
+    if empleados_sel_nifs:
+        empresas_part = '*'
+        sedes_part = '*'
+    else:
+        empresas_part = ','.join(sorted(map(str, empresas_sel)))
+        sedes_part = ','.join(sorted(map(str, sedes_sel)))
+    return f"{fi}|{ff}|E:{empresas_part}|S:{sedes_part}|EMP:{emp_part}"
 
 
 for k, v in [
@@ -1497,6 +1511,7 @@ for k, v in [
     ("scope_ff", ""),
     ("scope_empresas_norm", set()),
     ("scope_sedes_norm", set()),
+    ("scope_empleados_nif", set()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1535,7 +1550,12 @@ if consultar:
             futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
             for fut in as_completed(futures):
                 emp = futures[fut]
-                for x in (fut.result() or []):
+                try:
+                    rows_fich = fut.result() or []
+                except Exception as _e:
+                    _safe_fail(_e)
+                    rows_fich = []
+                for x in rows_fich:
                     fichajes_rows.append(
                         {
                             "nif": emp["nif"],
@@ -1735,7 +1755,11 @@ if consultar:
         with ThreadPoolExecutor(max_workers=max_workers_bajas) as exe:
             futs = [exe.submit(_fetch_bajas_day, day) for day in days_bajas]
             for fut in as_completed(futs):
-                day, rows = fut.result()
+                try:
+                    day, rows = fut.result()
+                except Exception as _e:
+                    _safe_fail(_e)
+                    continue
                 if not rows:
                     continue
 
@@ -2007,7 +2031,11 @@ active_emp_nifs = set(sel_empleados_nifs or set())
 
 same_dates_as_scope = (scope_fi == fecha_inicio.isoformat()) and (scope_ff == fecha_fin.isoformat())
 can_filter_emps_locally = (not active_emp_nifs) or active_emp_nifs.issubset(scope_emp_nifs)
-can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm) and can_filter_emps_locally
+if active_emp_nifs:
+    # Si hay empleados seleccionados, ese filtro manda por encima de Empresa/Sede
+    can_filter_locally = same_dates_as_scope and can_filter_emps_locally
+else:
+    can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm) and can_filter_emps_locally
 
 def _ensure_norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -2026,12 +2054,14 @@ def _filter_df_by_active(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = _ensure_norm_cols(df)
+    if active_emp_nifs:
+        if "nif" in df.columns:
+            df = df[df["nif"].astype(str).str.upper().str.strip().isin(active_emp_nifs)]
+        return df
     if "Empresa_norm" in df.columns:
         df = df[df["Empresa_norm"].isin(active_emp_norm)]
     if "Sede_norm" in df.columns:
         df = df[df["Sede_norm"].isin(active_sed_norm)]
-    if active_emp_nifs and "nif" in df.columns:
-        df = df[df["nif"].astype(str).str.upper().str.strip().isin(active_emp_nifs)]
     return df
 
 def _filter_day_dict(d: dict) -> dict:
@@ -2056,8 +2086,11 @@ else:
     if st.session_state.get("last_sig", ""):
         if not same_dates_as_scope:
             st.info("ℹ️ Has cambiado el rango de fechas respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
-        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)) or (active_emp_nifs and not active_emp_nifs.issubset(scope_emp_nifs)):
-            st.info("ℹ️ Has ampliado Empresa/Sede/Empleados respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+        elif active_emp_nifs:
+            if not active_emp_nifs.issubset(scope_emp_nifs):
+                st.info("ℹ️ Has ampliado Empleados respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)):
+            st.info("ℹ️ Has ampliado Empresa/Sede respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
 
 
 # Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
