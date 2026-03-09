@@ -23,6 +23,23 @@ APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
 # ---- Hardened cache: avoid storing NIFs in cache keys/values ----
 _NIFS_REGISTRY: dict[str, tuple[str, ...]] = {}
+_NIFS_REGISTRY_MAX = 256
+
+def _registry_put(fp: str, nifs: tuple[str, ...]) -> None:
+    """Mantiene una registry efímera y acotada para resolver fingerprints->NIFs."""
+    global _NIFS_REGISTRY
+    if not fp:
+        return
+    if fp in _NIFS_REGISTRY:
+        _NIFS_REGISTRY.pop(fp, None)
+    _NIFS_REGISTRY[fp] = tuple(nifs or ())
+    while len(_NIFS_REGISTRY) > _NIFS_REGISTRY_MAX:
+        try:
+            oldest = next(iter(_NIFS_REGISTRY))
+            _NIFS_REGISTRY.pop(oldest, None)
+        except Exception:
+            break
+
 
 def _hash_nif(nif: str) -> str:
     """Fast, deterministic hash for NIF keys used in cached maps (no salt)."""
@@ -410,7 +427,7 @@ def segundos_a_hhmm(seg: float) -> str:
 def _df_view(df):
     """Return a dataframe ready for UI display (hide internal helper columns)."""
     try:
-        cols_hide = {"nif","NIF","empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
+        cols_hide = {"empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
         return df.drop(columns=[c for c in cols_hide if c in df.columns], errors="ignore")
     except Exception:
         return df
@@ -734,6 +751,7 @@ def api_exportar_sedes() -> pd.DataFrame:
     )
 
 
+@st.cache_data(show_spinner=False, ttl=300)
 def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
@@ -969,7 +987,7 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
     if not nifs_norm:
         return {}
     fp = _fingerprint_nifs(nifs_norm)
-    _NIFS_REGISTRY[fp] = nifs_norm
+    _registry_put(fp, nifs_norm)
     hashed = _cached_tiempo_contabilizado_map(d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"), fp)
     if not hashed:
         return {}
@@ -1206,12 +1224,12 @@ def _get_horas_programadas_from_row(row: dict) -> float:
 def _cached_horas_programadas_map(
     d0_iso: str,
     d1_iso: str,
-    nifs_tuple: tuple[str, ...],
+    nifs_fingerprint: str,
     num_map_items: tuple[tuple[str, str], ...],
     pad: int,
 ) -> dict:
-    """Cache seguro (TTL corto): {(nif, YYYY-MM-DD): minutos_programados}.
-    Cachea solo minutos (int), sin nombres.
+    """Cache seguro (TTL corto): {(hash_nif, YYYY-MM-DD): minutos_programados}.
+    Cachea solo minutos (int), sin NIFs en claro.
     """
     try:
         d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
@@ -1219,10 +1237,10 @@ def _cached_horas_programadas_map(
     except Exception:
         return {}
 
-    nifs_set = set(str(x).upper().strip() for x in (nifs_tuple or ()) if str(x).strip())
-    if not nifs_set:
+    nifs = [str(x).upper().strip() for x in (_NIFS_REGISTRY.get(nifs_fingerprint, ()) or ()) if str(x).strip()]
+    if not nifs:
         return {}
-
+    nifs_set = set(nifs)
     map_num_to_nif = {k: v for k, v in (num_map_items or ()) if k and v}
 
     days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
@@ -1230,7 +1248,7 @@ def _cached_horas_programadas_map(
         return {}
 
     max_workers = _max_workers_days(len(days))
-    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}  # {(hash_nif, YYYY-MM-DD): minutes}
+    out: dict[tuple[str, str], int] = {}
 
     def _fetch_day(day: str):
         rep = api_informe_empleados(day, day)
@@ -1264,7 +1282,7 @@ def _cached_horas_programadas_map(
                 except Exception:
                     mins = 0
 
-                out[(nif, day)] = max(0, int(mins))
+                out[(_hash_nif(nif), day)] = max(0, int(mins))
 
     return out
 
@@ -1287,15 +1305,30 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
 
     map_num_to_nif = dict(zip(be["num_empleado_norm"], be["nif"]))
     nifs_norm = tuple(sorted({x for x in be["nif"].tolist() if x}))
-    num_items = tuple(sorted((k, v) for k, v in map_num_to_nif.items() if k and v))
+    if not nifs_norm:
+        return {}
+    fp = _fingerprint_nifs(nifs_norm)
+    _registry_put(fp, nifs_norm)
 
-    return _cached_horas_programadas_map(
+    num_items = tuple(sorted((k, v) for k, v in map_num_to_nif.items() if k and v))
+    hashed = _cached_horas_programadas_map(
         d0.strftime("%Y-%m-%d"),
         d1.strftime("%Y-%m-%d"),
-        nifs_norm,
+        fp,
         num_items,
         int(pad_local),
     )
+    if not hashed:
+        return {}
+
+    hash_to_nif = {_hash_nif(n): n for n in nifs_norm}
+    out: dict[tuple[str, str], int] = {}
+    for (hn, day), mins in hashed.items():
+        nif = hash_to_nif.get(hn)
+        if not nif:
+            continue
+        out[(nif, day)] = int(mins)
+    return out
 
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
@@ -1415,39 +1448,11 @@ empleados_filtrados = empleados_df[
     empleados_df["Sede"].apply(_norm_key).isin({_norm_key(x) for x in sel_sedes})
 ].copy()
 
-empleados_activos_opts_df = empleados_filtrados[empleado_activo_o_contrato(empleados_filtrados)].copy()
-empleados_activos_opts_df = empleados_activos_opts_df.sort_values(["nombre_completo"], kind="mergesort")
-emp_opts_map = dict(
-    zip(
-        empleados_activos_opts_df["nombre_completo"].astype(str),
-        empleados_activos_opts_df["nif"].astype(str).str.upper().str.strip(),
-    )
-)
-emp_opts_names = list(emp_opts_map.keys())
-sel_empleados = st.multiselect(
-    "Empleados activos",
-    options=emp_opts_names,
-    default=[],
-    help="Si no seleccionas ninguno, se muestran todos los empleados como hasta ahora.",
-)
-sel_empleados_nifs = {
-    emp_opts_map[n]
-    for n in sel_empleados
-    if n in emp_opts_map and str(emp_opts_map[n]).strip()
-}
-
-if sel_empleados_nifs:
-    empleados_filtrados = empleados_filtrados[
-        empleados_filtrados["nif"].astype(str).str.upper().str.strip().isin(sel_empleados_nifs)
-    ].copy()
-
 st.write("---")
 
 
-def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list, empleados_sel_nifs: set[str] | None = None) -> str:
-    empleados_sel_nifs = empleados_sel_nifs or set()
-    emp_part = ','.join(sorted(map(str, empleados_sel_nifs)))
-    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}|EMP:{emp_part}"
+def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list) -> str:
+    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}"
 
 
 for k, v in [
@@ -1464,7 +1469,6 @@ for k, v in [
     ("scope_ff", ""),
     ("scope_empresas_norm", set()),
     ("scope_sedes_norm", set()),
-    ("scope_empleados_nif", set()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1492,7 +1496,7 @@ if consultar:
 
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
-    signature = _sig(fi, ff, sel_empresas, sel_sedes, sel_empleados_nifs)
+    signature = _sig(fi, ff, sel_empresas, sel_sedes)
 
     with st.spinner("Procesando…"):
         tipos_map = api_exportar_tipos_fichaje()
@@ -1663,7 +1667,6 @@ if consultar:
             if not salida_incidencias.empty:
                 salida_incidencias = salida_incidencias[
                     [
-                        "nif",
                         "Fecha",
                         "Empresa",
                         "Sede",
@@ -1680,7 +1683,7 @@ if consultar:
                 ].sort_values(["Fecha", "Nombre"], kind="mergesort")
             else:
                 salida_incidencias = pd.DataFrame(columns=[
-                    "nif", "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
+                    "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
                     "Total trabajado", "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
                 ])
 
@@ -1693,49 +1696,56 @@ if consultar:
         base_emp["nif"] = base_emp["nif"].astype(str).str.upper().str.strip()
         base_emp["num_empleado"] = base_emp.get("num_empleado", pd.Series([""] * len(base_emp))).astype(str).str.strip()
 
-        for cur in _iter_days(d0, d1):
-            day = cur.strftime("%Y-%m-%d")
+        days_bajas = [cur.strftime("%Y-%m-%d") for cur in _iter_days(d0, d1)]
+        max_workers_bajas = _max_workers_days(len(days_bajas))
+
+        def _fetch_bajas_day(day: str):
             rep = api_informe_empleados(day, day)
             rows = _extract_rows_from_informe(rep)
-            if not rows:
-                continue
+            return day, rows
 
-            df_rep = pd.DataFrame(rows)
-            if df_rep.empty:
-                continue
+        with ThreadPoolExecutor(max_workers=max_workers_bajas) as exe:
+            futs = [exe.submit(_fetch_bajas_day, day) for day in days_bajas]
+            for fut in as_completed(futs):
+                day, rows = fut.result()
+                if not rows:
+                    continue
 
-            df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
-            df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
-            if df_rep.empty:
-                continue
+                df_rep = pd.DataFrame(rows)
+                if df_rep.empty:
+                    continue
 
-            key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
-            key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
+                df_rep["horas_baja"] = df_rep.apply(lambda r: _get_horas_baja_from_row(r.to_dict()), axis=1)
+                df_rep = df_rep[df_rep["horas_baja"] > 0.0].copy()
+                if df_rep.empty:
+                    continue
 
-            merged = None
-            if key_nif is not None:
-                df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
-                merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="inner")
-            elif key_num is not None:
-                df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
-                merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
+                key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
+                key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
 
-            if merged is None or merged.empty:
-                continue
+                merged = None
+                if key_nif is not None:
+                    df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
+                    merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="inner")
+                elif key_num is not None:
+                    df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
+                    merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
 
-            out = pd.DataFrame({
-                "nif": merged["nif"].astype(str).str.upper().str.strip(),
-                "Fecha": day,
-                "Empresa": merged["Empresa"].fillna("").astype(str),
-                "Sede": merged["Sede"].fillna("").astype(str),
-                "Nombre": merged["nombre_completo"].fillna("").astype(str),
-                "Departamento": merged.get("departamento_nombre", "").fillna("").astype(str),
-                "Horas baja": merged["horas_baja"].round(2),
-            })
+                if merged is None or merged.empty:
+                    continue
 
-            out = out[out["Nombre"].astype(str).str.strip().ne("")]
-            if not out.empty:
-                bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
+                out = pd.DataFrame({
+                    "Fecha": day,
+                    "Empresa": merged["Empresa"].fillna("").astype(str),
+                    "Sede": merged["Sede"].fillna("").astype(str),
+                    "Nombre": merged["nombre_completo"].fillna("").astype(str),
+                    "Departamento": merged.get("departamento_nombre", "").fillna("").astype(str),
+                    "Horas baja": merged["horas_baja"].round(2),
+                })
+
+                out = out[out["Nombre"].astype(str).str.strip().ne("")]
+                if not out.empty:
+                    bajas_por_dia[day] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
 
         # --------- SIN FICHAJES ----------
         sin_por_dia = {}
@@ -1766,7 +1776,7 @@ if consultar:
             if miss_df.empty:
                 continue
 
-            out = miss_df[["nif", "Empresa", "Sede", "nombre_completo", "departamento_nombre"]].copy()
+            out = miss_df[["Empresa", "Sede", "nombre_completo", "departamento_nombre"]].copy()
             out = out.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
             out.insert(0, "Fecha", day)
             out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
@@ -1859,7 +1869,6 @@ if consultar:
                             continue
 
                         row = {
-                            "nif": nif,
                             "Empresa": empresa,
                             "Sede": sede,
                             "Nombre": nombre,
@@ -1903,7 +1912,6 @@ if consultar:
     st.session_state["scope_ff"] = fecha_fin.isoformat()
     st.session_state["scope_empresas_norm"] = {_norm_key(x) for x in sel_empresas}
     st.session_state["scope_sedes_norm"] = {_norm_key(x) for x in sel_sedes}
-    st.session_state["scope_empleados_nif"] = set(empleados_filtrados["nif"].astype(str).str.upper().str.strip().tolist())
     st.session_state["result_incidencias"] = incidencias_por_dia
     st.session_state["result_bajas"] = bajas_por_dia
     st.session_state["result_sin_fichajes"] = sin_por_dia
@@ -1933,7 +1941,7 @@ if consultar:
 # ------------------------------------------------------------
 fi_sig = fecha_inicio.strftime("%Y-%m-%d")
 ff_sig = fecha_fin.strftime("%Y-%m-%d")
-current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes, sel_empleados_nifs)
+current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
 
 last_sig = st.session_state.get("last_sig", "")
 results_match = (last_sig == current_sig)
@@ -1965,12 +1973,9 @@ scope_fi = st.session_state.get("scope_fi", "")
 scope_ff = st.session_state.get("scope_ff", "")
 scope_emp_norm = set(st.session_state.get("scope_empresas_norm", set()) or set())
 scope_sed_norm = set(st.session_state.get("scope_sedes_norm", set()) or set())
-scope_emp_nifs = set(st.session_state.get("scope_empleados_nif", set()) or set())
-active_emp_nifs = set(sel_empleados_nifs or set())
 
 same_dates_as_scope = (scope_fi == fecha_inicio.isoformat()) and (scope_ff == fecha_fin.isoformat())
-can_filter_emps_locally = (not active_emp_nifs) or active_emp_nifs.issubset(scope_emp_nifs)
-can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm) and can_filter_emps_locally
+can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm)
 
 def _ensure_norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1993,8 +1998,6 @@ def _filter_df_by_active(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["Empresa_norm"].isin(active_emp_norm)]
     if "Sede_norm" in df.columns:
         df = df[df["Sede_norm"].isin(active_sed_norm)]
-    if active_emp_nifs and "nif" in df.columns:
-        df = df[df["nif"].astype(str).str.upper().str.strip().isin(active_emp_nifs)]
     return df
 
 def _filter_day_dict(d: dict) -> dict:
@@ -2019,8 +2022,8 @@ else:
     if st.session_state.get("last_sig", ""):
         if not same_dates_as_scope:
             st.info("ℹ️ Has cambiado el rango de fechas respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
-        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)) or (active_emp_nifs and not active_emp_nifs.issubset(scope_emp_nifs)):
-            st.info("ℹ️ Has ampliado Empresa/Sede/Empleados respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)):
+            st.info("ℹ️ Has ampliado Empresa/Sede respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
 
 
 # Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
