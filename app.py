@@ -410,7 +410,7 @@ def segundos_a_hhmm(seg: float) -> str:
 def _df_view(df):
     """Return a dataframe ready for UI display (hide internal helper columns)."""
     try:
-        cols_hide = {"empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
+        cols_hide = {"nif","NIF","empresa_norm","sede_norm","Empresa_norm","Sede_norm","EMPRESA_NORM","SEDE_NORM"}
         return df.drop(columns=[c for c in cols_hide if c in df.columns], errors="ignore")
     except Exception:
         return df
@@ -1415,11 +1415,39 @@ empleados_filtrados = empleados_df[
     empleados_df["Sede"].apply(_norm_key).isin({_norm_key(x) for x in sel_sedes})
 ].copy()
 
+empleados_activos_opts_df = empleados_filtrados[empleado_activo_o_contrato(empleados_filtrados)].copy()
+empleados_activos_opts_df = empleados_activos_opts_df.sort_values(["nombre_completo"], kind="mergesort")
+emp_opts_map = dict(
+    zip(
+        empleados_activos_opts_df["nombre_completo"].astype(str),
+        empleados_activos_opts_df["nif"].astype(str).str.upper().str.strip(),
+    )
+)
+emp_opts_names = list(emp_opts_map.keys())
+sel_empleados = st.multiselect(
+    "Empleados activos",
+    options=emp_opts_names,
+    default=[],
+    help="Si no seleccionas ninguno, se muestran todos los empleados como hasta ahora.",
+)
+sel_empleados_nifs = {
+    emp_opts_map[n]
+    for n in sel_empleados
+    if n in emp_opts_map and str(emp_opts_map[n]).strip()
+}
+
+if sel_empleados_nifs:
+    empleados_filtrados = empleados_filtrados[
+        empleados_filtrados["nif"].astype(str).str.upper().str.strip().isin(sel_empleados_nifs)
+    ].copy()
+
 st.write("---")
 
 
-def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list) -> str:
-    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}"
+def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list, empleados_sel_nifs: set[str] | None = None) -> str:
+    empleados_sel_nifs = empleados_sel_nifs or set()
+    emp_part = ','.join(sorted(map(str, empleados_sel_nifs)))
+    return f"{fi}|{ff}|E:{','.join(sorted(map(str, empresas_sel)))}|S:{','.join(sorted(map(str, sedes_sel)))}|EMP:{emp_part}"
 
 
 for k, v in [
@@ -1436,6 +1464,7 @@ for k, v in [
     ("scope_ff", ""),
     ("scope_empresas_norm", set()),
     ("scope_sedes_norm", set()),
+    ("scope_empleados_nif", set()),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1463,7 +1492,7 @@ if consultar:
 
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
-    signature = _sig(fi, ff, sel_empresas, sel_sedes)
+    signature = _sig(fi, ff, sel_empresas, sel_sedes, sel_empleados_nifs)
 
     with st.spinner("Procesando…"):
         tipos_map = api_exportar_tipos_fichaje()
@@ -1634,6 +1663,7 @@ if consultar:
             if not salida_incidencias.empty:
                 salida_incidencias = salida_incidencias[
                     [
+                        "nif",
                         "Fecha",
                         "Empresa",
                         "Sede",
@@ -1650,7 +1680,7 @@ if consultar:
                 ].sort_values(["Fecha", "Nombre"], kind="mergesort")
             else:
                 salida_incidencias = pd.DataFrame(columns=[
-                    "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
+                    "nif", "Fecha", "Empresa", "Sede", "Nombre", "Departamento", "Primera entrada", "Última salida",
                     "Total trabajado", "Tiempo Contabilizado", "Diferencia", "Numero de fichajes", "Incidencia"
                 ])
 
@@ -1694,6 +1724,7 @@ if consultar:
                 continue
 
             out = pd.DataFrame({
+                "nif": merged["nif"].astype(str).str.upper().str.strip(),
                 "Fecha": day,
                 "Empresa": merged["Empresa"].fillna("").astype(str),
                 "Sede": merged["Sede"].fillna("").astype(str),
@@ -1735,7 +1766,7 @@ if consultar:
             if miss_df.empty:
                 continue
 
-            out = miss_df[["Empresa", "Sede", "nombre_completo", "departamento_nombre"]].copy()
+            out = miss_df[["nif", "Empresa", "Sede", "nombre_completo", "departamento_nombre"]].copy()
             out = out.rename(columns={"nombre_completo": "Nombre", "departamento_nombre": "Departamento"})
             out.insert(0, "Fecha", day)
             out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
@@ -1828,6 +1859,7 @@ if consultar:
                             continue
 
                         row = {
+                            "nif": nif,
                             "Empresa": empresa,
                             "Sede": sede,
                             "Nombre": nombre,
@@ -1871,6 +1903,7 @@ if consultar:
     st.session_state["scope_ff"] = fecha_fin.isoformat()
     st.session_state["scope_empresas_norm"] = {_norm_key(x) for x in sel_empresas}
     st.session_state["scope_sedes_norm"] = {_norm_key(x) for x in sel_sedes}
+    st.session_state["scope_empleados_nif"] = set(empleados_filtrados["nif"].astype(str).str.upper().str.strip().tolist())
     st.session_state["result_incidencias"] = incidencias_por_dia
     st.session_state["result_bajas"] = bajas_por_dia
     st.session_state["result_sin_fichajes"] = sin_por_dia
@@ -1900,7 +1933,7 @@ if consultar:
 # ------------------------------------------------------------
 fi_sig = fecha_inicio.strftime("%Y-%m-%d")
 ff_sig = fecha_fin.strftime("%Y-%m-%d")
-current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes)
+current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes, sel_empleados_nifs)
 
 last_sig = st.session_state.get("last_sig", "")
 results_match = (last_sig == current_sig)
@@ -1932,9 +1965,12 @@ scope_fi = st.session_state.get("scope_fi", "")
 scope_ff = st.session_state.get("scope_ff", "")
 scope_emp_norm = set(st.session_state.get("scope_empresas_norm", set()) or set())
 scope_sed_norm = set(st.session_state.get("scope_sedes_norm", set()) or set())
+scope_emp_nifs = set(st.session_state.get("scope_empleados_nif", set()) or set())
+active_emp_nifs = set(sel_empleados_nifs or set())
 
 same_dates_as_scope = (scope_fi == fecha_inicio.isoformat()) and (scope_ff == fecha_fin.isoformat())
-can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm)
+can_filter_emps_locally = (not active_emp_nifs) or active_emp_nifs.issubset(scope_emp_nifs)
+can_filter_locally = same_dates_as_scope and active_emp_norm.issubset(scope_emp_norm) and active_sed_norm.issubset(scope_sed_norm) and can_filter_emps_locally
 
 def _ensure_norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1957,6 +1993,8 @@ def _filter_df_by_active(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["Empresa_norm"].isin(active_emp_norm)]
     if "Sede_norm" in df.columns:
         df = df[df["Sede_norm"].isin(active_sed_norm)]
+    if active_emp_nifs and "nif" in df.columns:
+        df = df[df["nif"].astype(str).str.upper().str.strip().isin(active_emp_nifs)]
     return df
 
 def _filter_day_dict(d: dict) -> dict:
@@ -1981,8 +2019,8 @@ else:
     if st.session_state.get("last_sig", ""):
         if not same_dates_as_scope:
             st.info("ℹ️ Has cambiado el rango de fechas respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
-        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)):
-            st.info("ℹ️ Has ampliado Empresa/Sede respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
+        elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)) or (active_emp_nifs and not active_emp_nifs.issubset(scope_emp_nifs)):
+            st.info("ℹ️ Has ampliado Empresa/Sede/Empleados respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
 
 
 # Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
