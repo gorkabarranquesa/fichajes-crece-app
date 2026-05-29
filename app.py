@@ -334,6 +334,14 @@ ALLOWED_SEDES = [
 ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
 ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
 
+# Empresa exenta de validación horaria en la pestaña Fichajes:
+# - No generar incidencias por entrada temprana/tarde/fuera de rango.
+# - No generar incidencias por salida temprana.
+# - Mantener validaciones de horas, número de fichajes y día no laborable.
+HORARIO_EXEMPT_EMPRESAS_N = {
+    _norm_key("Barranquesa Tower Flanges, S.L."),
+}
+
 
 # ============================================================
 # DESCIFRADO CRECE (AES-CBC)
@@ -1758,6 +1766,9 @@ if consultar:
                 axis=1,
             )
 
+            def _empresa_exenta_horario(r) -> bool:
+                return _norm_key(r.get("Empresa", "")) in HORARIO_EXEMPT_EMPRESAS_N
+
             def build_incidencia(r) -> str:
                 motivos = []
 
@@ -1774,14 +1785,22 @@ if consultar:
                     return "Trabajado en día no laborable" if worked else ""
 
                 motivos += validar_incidencia_horas_fichajes(r)
-                motivos += validar_horario(
-                    r.get("Departamento"),
-                    r.get("Nombre"),
-                    int(r.get("dia", 0)),
-                    r.get("Primera entrada", ""),
-                    r.get("Última salida", ""),
-                    exp_min,
-                )
+
+                # Para Barranquesa Tower Flanges, S.L. se elimina la validación horaria
+                # de entrada/salida en la pestaña Fichajes. Se mantienen:
+                # - horas mínimas según horas_programadas,
+                # - número de fichajes,
+                # - trabajo en día no laborable.
+                if not _empresa_exenta_horario(r):
+                    motivos += validar_horario(
+                        r.get("Departamento"),
+                        r.get("Nombre"),
+                        int(r.get("dia", 0)),
+                        r.get("Primera entrada", ""),
+                        r.get("Última salida", ""),
+                        exp_min,
+                    )
+
                 return "; ".join(motivos)
 
             resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
