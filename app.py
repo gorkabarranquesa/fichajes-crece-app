@@ -543,7 +543,24 @@ def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
     return False
 
 
+def _format_hours_minimum(hours_value: float) -> str:
+    """Formatea mínimos de horas sin decimales innecesarios."""
+    try:
+        v = float(hours_value)
+    except Exception:
+        return str(hours_value)
+    if abs(v - int(v)) < 0.001:
+        return str(int(v))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
 def calcular_minimos(depto: str, dia: int, nombre: str):
+    """
+    Fallback histórico.
+
+    Se mantiene por compatibilidad, pero en el apartado Fichajes la jornada válida
+    debe salir de horas_programadas de /api/informes/empleados, igual que en Excesos.
+    """
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
@@ -573,9 +590,46 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     return min_h, min_f
 
 
+def calcular_minimos_por_jornada_programada(depto: str, nombre: str, jornada_programada_min: int):
+    """
+    Mínimos para Fichajes basados en horas_programadas.
+
+    Motivo:
+    - Un jueves normal puede ser 8,5h.
+    - Un jueves previo a festivo puede ser 6,5h.
+    - Un festivo o no laborable debe tener 0h.
+    Por tanto, no se debe inferir la jornada solo por día de semana.
+    """
+    try:
+        exp_min = int(jornada_programada_min or 0)
+    except Exception:
+        exp_min = 0
+
+    if exp_min <= 0:
+        return None, None
+
+    depto_norm = (depto or "").upper().strip()
+    nombre_norm = norm_name(nombre)
+    min_h = round(exp_min / 60.0, 2)
+    min_f = None
+
+    if depto_norm in ["ESTRUCTURA", "MOI"]:
+        # Jornada reducida / previa a festivo: 2 fichajes.
+        # Jornada partida normal: 4 fichajes.
+        min_f = 2 if exp_min <= (6 * 60 + 35) else 4
+    elif depto_norm == "MOD":
+        min_f = 2
+
+    special = _lookup_special(depto_norm, nombre_norm)
+    if special and "min_fichajes" in special and min_f is not None:
+        min_f = int(special["min_fichajes"])
+
+    return min_h, min_f
 
 
-def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
+
+
+def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str, jornada_programada_min: int | None = None) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
@@ -624,7 +678,18 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
-            salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
+
+            try:
+                exp_min = int(jornada_programada_min or 0)
+            except Exception:
+                exp_min = 0
+
+            # Si CRECE dice que la jornada programada es reducida (por ejemplo previo a festivo),
+            # la salida mínima pasa a 13:30 aunque no sea viernes.
+            if exp_min > 0:
+                salida_min = (13 * 60 + 30) if exp_min <= (6 * 60 + 35) else (16 * 60 + 30)
+            else:
+                salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
             if e_min < (ini - MARGEN_HORARIO_MIN):
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
@@ -658,7 +723,7 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
 
     umbral_inferior = float(min_h) - TOLERANCIA_HORAS
     if horas_val < umbral_inferior:
-        motivos.append(f"Horas insuficientes (mín {min_h}h)")
+        motivos.append(f"Horas insuficientes (mín {_format_hours_minimum(min_h)}h)")
 
     if num_fich < int(min_f):
         motivos.append(f"Fichajes insuficientes (mín {min_f})")
@@ -1661,6 +1726,19 @@ if consultar:
 
             resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
+            def _jornada_programada_min_row(r) -> int:
+                day_str = str(r.get("Fecha", "") or "")
+                nif_str = str(r.get("nif", "") or "").upper().strip()
+                try:
+                    return int((horas_prog_map_incid or {}).get((nif_str, day_str), 0) or 0)
+                except Exception:
+                    return 0
+
+            # ✅ Jornada laboral real del día, igual que en Excesos:
+            # se toma de horas_programadas de /api/informes/empleados.
+            # Esto corrige festivos, previos a festivo y excepciones de calendario/turno.
+            resumen["jornada_programada_min"] = resumen.apply(_jornada_programada_min_row, axis=1)
+
             def _max_ok(r):
                 sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
                 if sp and "max_fichajes_ok" in sp:
@@ -1670,18 +1748,21 @@ if consultar:
             resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
 
             resumen[["min_horas", "min_fichajes"]] = resumen.apply(
-                lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
+                lambda r: pd.Series(
+                    calcular_minimos_por_jornada_programada(
+                        r.get("Departamento"),
+                        r.get("Nombre"),
+                        r.get("jornada_programada_min"),
+                    )
+                ),
                 axis=1,
             )
+
             def build_incidencia(r) -> str:
                 motivos = []
 
-                day_str = str(r.get("Fecha", "") or "")
-                nif_str = str(r.get("nif", "") or "").upper().strip()
-
-                exp_min = 0
                 try:
-                    exp_min = int((horas_prog_map_incid or {}).get((nif_str, day_str), 0) or 0)
+                    exp_min = int(r.get("jornada_programada_min", 0) or 0)
                 except Exception:
                     exp_min = 0
 
@@ -1689,13 +1770,8 @@ if consultar:
                     int(r.get("Numero de fichajes", 0) or 0) > 0
                 )
 
-                if exp_min == 0 and worked:
-                    return "Trabajado en día no laborable"
-
-                if int(r.get("dia", 0)) in [5, 6]:
-                    if worked:
-                        motivos.append("Trabajo en fin de semana")
-                    return "; ".join(motivos)
+                if exp_min <= 0:
+                    return "Trabajado en día no laborable" if worked else ""
 
                 motivos += validar_incidencia_horas_fichajes(r)
                 motivos += validar_horario(
@@ -1704,6 +1780,7 @@ if consultar:
                     int(r.get("dia", 0)),
                     r.get("Primera entrada", ""),
                     r.get("Última salida", ""),
+                    exp_min,
                 )
                 return "; ".join(motivos)
 
