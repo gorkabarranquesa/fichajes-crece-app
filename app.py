@@ -510,6 +510,7 @@ N_ETOR = norm_name("Etor Alegria Reparaz")
 N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
 N_MIRIAM = norm_name("Miriam Martin Muñoz")
 N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
+N_MIKEL = norm_name("Mikel Arzallus Marco")
 
 SPECIAL_RULES_PREFIX = [
     ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
@@ -523,6 +524,15 @@ SCHEDULE_EXEMPT_PREFIX = [
     ("MOD", N_DAVID),
     ("MOI", N_MIRIAM),
 ]
+
+# Empleados para los que RRHH pide no generar incidencias de:
+# - Entrada temprana
+# - Salida temprana
+# Se mantienen el resto de controles: horas, fichajes, día no laborable
+# y, si aplicase, entrada tarde / entrada fuera de rango.
+EARLY_SCHEDULE_EXEMPT_NAMES_NORM = {
+    N_MIKEL,
+}
 
 FLEX_BY_DEPTO = {
     "ESTRUCTURA": [N_FRAN],
@@ -542,6 +552,10 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
         if depto_norm == d and name_startswith(nombre_norm, pref):
             return True
     return False
+
+
+def _is_early_schedule_exempt(nombre_norm: str) -> bool:
+    return any(name_startswith(nombre_norm, pref) for pref in EARLY_SCHEDULE_EXEMPT_NAMES_NORM)
 
 
 def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
@@ -640,6 +654,7 @@ def calcular_minimos_por_jornada_programada(depto: str, nombre: str, jornada_pro
 def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str, jornada_programada_min: int | None = None) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
+    early_exempt = _is_early_schedule_exempt(nombre_norm)
 
     if dia not in [0, 1, 2, 3, 4]:
         return []
@@ -661,7 +676,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
             ini_ok, fin_ok = 5 * 60 + 30, 6 * 60
             fin_turno = 14 * 60
             if e_min < ini_ok:
-                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                if not early_exempt:
+                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
                 pass
             elif e_min <= fin_turno:
@@ -672,7 +688,8 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
             ini_ok, fin_ok = 13 * 60, 14 * 60
             fin_turno = 22 * 60
             if e_min < ini_ok:
-                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                if not early_exempt:
+                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
                 pass
             elif e_min <= fin_turno:
@@ -700,12 +717,14 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
                 salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
             if e_min < (ini - MARGEN_HORARIO_MIN):
-                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                if not early_exempt:
+                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
             if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
-                incid.append(f"Salida temprana ({ultima_salida_hhmm})")
+                if not early_exempt:
+                    incid.append(f"Salida temprana ({ultima_salida_hhmm})")
         return incid
 
     return incid
