@@ -96,14 +96,10 @@ _SESSION.headers.update(
 )
 
 # ============================================================
-# EXCLUSIONES RRHH (Sin fichajes) -> POR NOMBRE (NO POR NIF)
+# SIN FICHAJES
 # ============================================================
-
-EXCLUDE_SIN_FICHAJES_NAMES_NORM = {
-    "MIKEL ARZALLUS MARCO",
-    "JOSE ANGEL OCHAGAVIA SATRUSTEGUI",
-    "BENITO MENDINUETA ANDUEZA",
-}
+# No hay exclusiones nominales hardcodeadas. La pestaña usa empleados activos
+# según la información disponible en CRECE.
 
 # ============================================================
 # - Upload en la app (prioridad)
@@ -536,7 +532,12 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
     return False
 
 
-def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
+def _is_flex(depto_norm: str, nombre_norm: str, sede: str = "") -> bool:
+    # Regla RRHH: todos los empleados MOI de P1 LAKUNTZA tienen horario flexible
+    # para entrada/salida. Se mantienen horas y controles de fichajes.
+    if depto_norm == "MOI" and _sede_code(sede) == "P1":
+        return True
+
     for pref in FLEX_BY_DEPTO.get(depto_norm, []):
         if name_startswith(nombre_norm, pref):
             return True
@@ -575,7 +576,15 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
 
 
 
-def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
+def validar_horario(
+    depto: str,
+    nombre: str,
+    dia: int,
+    primera_entrada_hhmm: str,
+    ultima_salida_hhmm: str,
+    expected_minutes=None,
+    sede: str = "",
+) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
@@ -620,11 +629,24 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
         return incid
 
     if depto_norm in ["MOI", "ESTRUCTURA"]:
-        flex = _is_flex(depto_norm, nombre_norm)
+        flex = _is_flex(depto_norm, nombre_norm, sede)
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
-            salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
+
+            # La jornada reducida/completa se decide por Horas programadas de CRECE,
+            # no por el día de la semana. Así verano, previos a festivo y jornadas
+            # especiales se comportan correctamente.
+            try:
+                exp_m = int(expected_minutes) if expected_minutes is not None else None
+            except Exception:
+                exp_m = None
+
+            if exp_m is not None and exp_m > 0:
+                salida_min = (13 * 60 + 30) if exp_m <= (6 * 60 + 35) else (16 * 60 + 30)
+            else:
+                # Fallback únicamente cuando CRECE no devuelve Horas programadas.
+                salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
             if e_min < (ini - MARGEN_HORARIO_MIN):
                 incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
@@ -1807,9 +1829,24 @@ if consultar:
                 if exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - 5):
                     motivos.append(f"Horas insuficientes (mín {segundos_a_hhmm(exp_min * 60)})")
 
-                # Reglas de cantidad de fichajes (sin volver a comparar horas contra una
-                # jornada fija, para no contradecir Horas programadas).
+                # Reglas de cantidad de fichajes. Para MOI/ESTRUCTURA, el mínimo
+                # también depende de Horas programadas (no del lunes/viernes):
+                #   <= 6h35 -> 2 fichajes
+                #   >  6h35 -> 4 fichajes
+                # Esto cubre jornada de verano, previos a festivo y otras reducciones.
                 min_f = r.get("min_fichajes")
+                depto_norm = (r.get("Departamento") or "").upper().strip()
+                if exp_known and exp_min is not None and exp_min > 0:
+                    if depto_norm in ["MOI", "ESTRUCTURA"]:
+                        min_f = 2 if exp_min <= (6 * 60 + 35) else 4
+                    elif depto_norm == "MOD":
+                        min_f = 2
+
+                    # Las reglas especiales por persona siguen teniendo prioridad.
+                    sp = _lookup_special(depto_norm, norm_name(r.get("Nombre")))
+                    if sp and "min_fichajes" in sp:
+                        min_f = int(sp["min_fichajes"])
+
                 if pd.notna(min_f):
                     try:
                         min_f_i = int(min_f)
@@ -1831,6 +1868,8 @@ if consultar:
                     int(r.get("dia", 0)),
                     r.get("Primera entrada", ""),
                     r.get("Última salida", ""),
+                    expected_minutes=(exp_min if exp_known else None),
+                    sede=r.get("Sede", ""),
                 )
                 return "; ".join(motivos)
 
@@ -1934,10 +1973,6 @@ if consultar:
         base_emp_sin = base_emp.copy()
         mask_activo = empleado_activo_o_contrato(base_emp_sin)
         base_emp_sin = base_emp_sin[mask_activo].copy()
-
-        # ✅ Excluir por NOMBRE (no por NIF)
-        base_emp_sin["nombre_excl_norm"] = base_emp_sin["nombre_completo"].apply(norm_name)
-        base_emp_sin = base_emp_sin[~base_emp_sin["nombre_excl_norm"].isin(EXCLUDE_SIN_FICHAJES_NAMES_NORM)].copy()
 
         empleados_nifs = base_emp_sin["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
 
