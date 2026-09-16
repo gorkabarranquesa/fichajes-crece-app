@@ -843,22 +843,28 @@ def _normalize_tipos_fichaje_payload(data_dec) -> dict:
 
 @st.cache_data(show_spinner=False, ttl=21600)
 def api_exportar_tipos_fichaje() -> dict:
-    """Obtiene tipos de fichaje. Metadato estable: cache 6 h, sin PII."""
-    url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
-    # El manual no exige parámetros POST. Enviar data={} conserva una petición
-    # POST vacía explícita y es compatible con las distintas versiones del WS.
-    resp = safe_request("POST", url, data={})
-    if resp is None:
-        raise RuntimeError("No se pudieron consultar los tipos de fichaje")
-    try:
-        resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(
-            f"No se pudieron consultar los tipos de fichaje (HTTP {getattr(resp, 'status_code', 'desconocido')})"
-        ) from exc
+    """Obtiene tipos de fichaje cuando el servicio está disponible.
 
-    data_dec = _try_parse_encrypted_response(resp)
-    return _normalize_tipos_fichaje_payload(data_dec)
+    Este catálogo es auxiliar: CRECE puede no habilitarlo para un token/intranet
+    aunque sí permita exportar fichajes. Por eso un fallo aquí NO invalida la
+    consulta principal. Se devuelve {} y la app continúa con tiempoContabilizado
+    y horas_programadas, que son las fuentes de verdad de las validaciones.
+    """
+    url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
+    try:
+        # Mantener exactamente la forma histórica que ya usaba la app: POST sin cuerpo.
+        resp = safe_request("POST", url)
+        if resp is None:
+            return {}
+        resp.raise_for_status()
+        data_dec = _try_parse_encrypted_response(resp)
+        try:
+            return _normalize_tipos_fichaje_payload(data_dec)
+        except Exception:
+            return {}
+    except Exception as exc:
+        _safe_fail(exc)
+        return {}
 
 
 @st.cache_resource
@@ -870,32 +876,31 @@ def _tipos_fichaje_last_good_holder():
 def get_tipos_fichaje_resiliente() -> tuple[dict, bool]:
     """Devuelve (mapa, usando_fallback).
 
-    Si CRECE falla puntualmente, reutiliza la última lectura válida del proceso.
-    Nunca sustituye silenciosamente los tipos por un mapa vacío.
+    Si el endpoint auxiliar no está disponible, usa la última lectura válida;
+    si tampoco existe, devuelve {} sin bloquear la aplicación. Esto replica el
+    comportamiento estable histórico de la app y evita convertir un endpoint
+    auxiliar en un punto único de fallo.
     """
     holder = _tipos_fichaje_last_good_holder()
-    last_exc = None
 
-    # Dos intentos funcionales; safe_request ya gestiona retries HTTP 429/5xx.
-    for attempt in range(2):
-        try:
-            tipos = api_exportar_tipos_fichaje()
-            if tipos:
-                with holder["lock"]:
-                    holder["map"] = dict(tipos)
-                    holder["ts"] = time.time()
-                return tipos, False
-        except Exception as exc:
-            last_exc = exc
-            if attempt == 0:
-                time.sleep(0.25)
+    try:
+        tipos = api_exportar_tipos_fichaje()
+    except Exception as exc:
+        _safe_fail(exc)
+        tipos = {}
+
+    if tipos:
+        with holder["lock"]:
+            holder["map"] = dict(tipos)
+            holder["ts"] = time.time()
+        return tipos, False
 
     with holder["lock"]:
         fallback = dict(holder.get("map") or {})
     if fallback:
         return fallback, True
 
-    raise RuntimeError("No hay una lectura válida de tipos de fichaje disponible") from last_exc
+    return {}, False
 
 
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list | None:
@@ -1769,19 +1774,16 @@ if consultar:
         full_weeks = []
 
     with st.spinner("Procesando…"):
-        try:
-            tipos_map, tipos_fallback = get_tipos_fichaje_resiliente()
-            if tipos_fallback:
-                st.warning(
-                    "CRECE no ha respondido al catálogo de tipos de fichaje en esta consulta. "
-                    "Se está usando la última lectura válida disponible."
-                )
-        except Exception:
-            st.error(
-                "No se han podido consultar los tipos de fichaje de CRECE y no existe "
-                "una lectura válida anterior. Reintenta la consulta."
+        tipos_map, tipos_fallback = get_tipos_fichaje_resiliente()
+        if tipos_fallback:
+            st.warning(
+                "CRECE no ha respondido al catálogo de tipos de fichaje en esta consulta. "
+                "Se está usando la última lectura válida disponible."
             )
-            st.stop()
+        # Si el endpoint de tipos no está habilitado para este token/intranet, no
+        # bloqueamos la consulta. Las reglas principales siguen basándose en
+        # tiempoContabilizado y horas_programadas. El mapa vacío conserva el
+        # comportamiento histórico de la app para este endpoint auxiliar.
 
         # --------- FICHAJES ----------
         fichajes_rows = []
