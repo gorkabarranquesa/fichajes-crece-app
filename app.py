@@ -1000,8 +1000,15 @@ def _cached_tiempo_contabilizado_map(
     nifs_fingerprint: str,
     _nifs: tuple[str, ...],
 ) -> dict:
-    """Cache seguro (TTL corto): devuelve {(NIF, YYYY-MM-DD): minutos_contabilizados}.
-    Solo cachea minutos (int), no payloads ni datos sensibles extra.
+    """Cache seguro del tiempo contabilizado diario.
+
+    Estrategia resiliente para rangos largos:
+    1) primera pasada paralela conservadora;
+    2) cualquier fecha fallida se reintenta secuencialmente;
+    3) solo se aborta si, tras esos reintentos, sigue faltando alguna fecha.
+
+    Así evitamos que un 429/timeout puntual de una única fecha invalide un rango
+    completo, pero tampoco presentamos datos parciales como válidos.
     """
     try:
         d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
@@ -1017,40 +1024,66 @@ def _cached_tiempo_contabilizado_map(
     if not days:
         return {}
 
-    max_workers = _max_workers_days(len(days))
-    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutos}
+    out: dict[tuple[str, str], int] = {}
 
     def _fetch_day(day: str):
         df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs)
+        if df_tc is None:
+            raise RuntimeError("Fallo en tiempo trabajado")
         return day, df_tc
 
-    had_failure = False
-    with ThreadPoolExecutor(max_workers=max_workers) as exe:
-        futs = [exe.submit(_fetch_day, day) for day in days]
-        for fut in as_completed(futs):
+    def _consume(day: str, df_tc: pd.DataFrame):
+        if df_tc is None or df_tc.empty:
+            return
+        for _, rr in df_tc.iterrows():
+            nif_tc = str(rr.get("nif") or "").upper().strip()
+            if not nif_tc:
+                continue
+            seg = rr.get("tiempoContabilizado_seg")
             try:
-                day, df_tc = fut.result()
+                mins = int(max(0.0, float(seg or 0)) // 60)
             except Exception:
-                had_failure = True
-                continue
-            if df_tc is None:
-                had_failure = True
-                continue
-            if df_tc.empty:
-                continue
-            for _, rr in df_tc.iterrows():
-                nif_tc = str(rr.get("nif") or "").upper().strip()
-                if not nif_tc:
-                    continue
-                seg = rr.get("tiempoContabilizado_seg")
-                try:
-                    mins = int(max(0.0, float(seg or 0)) // 60)
-                except Exception:
-                    mins = 0
-                out[(_hash_nif(nif_tc), day)] = max(0, mins)
+                mins = 0
+            out[(_hash_nif(nif_tc), day)] = max(0, mins)
 
-    if had_failure:
+    # No conviene golpear este endpoint con demasiadas fechas simultáneas.
+    # 4 workers mantiene buena velocidad y reduce mucho los 429/timeouts.
+    workers = max(1, min(4, len(days)))
+    failed_days: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futs = {exe.submit(_fetch_day, day): day for day in days}
+        for fut in as_completed(futs):
+            day = futs[fut]
+            try:
+                day_r, df_tc = fut.result()
+                _consume(day_r, df_tc)
+            except Exception as exc:
+                _safe_fail(exc)
+                failed_days.append(day)
+
+    # Segunda oportunidad secuencial: evita que una sola fecha transitoria tumbe
+    # todo el rango. safe_request ya hace su propio backoff; aquí añadimos una
+    # pequeña pausa entre fechas para no volver a saturar CRECE.
+    unresolved: list[str] = []
+    for day in sorted(set(failed_days)):
+        ok = False
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.6 * attempt)
+            try:
+                day_r, df_tc = _fetch_day(day)
+                _consume(day_r, df_tc)
+                ok = True
+                break
+            except Exception as exc:
+                _safe_fail(exc)
+        if not ok:
+            unresolved.append(day)
+
+    if unresolved:
         raise RuntimeError("Consulta incompleta de tiempo contabilizado")
+
     return out
 
 
@@ -1078,14 +1111,21 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
+    """Consulta /informes/empleados con un timeout algo mayor.
+
+    Este endpoint puede tardar más que los catálogos/exportaciones, especialmente
+    cuando se lanzan varias fechas seguidas. Un fallo puntual devuelve None y el
+    builder diario se encarga de reintentar de forma secuencial antes de abortar.
+    """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
     try:
-        resp = safe_request("POST", url, json_body=body)
+        resp = safe_request("POST", url, json_body=body, timeout=(5, 45))
         if resp is None:
             return None
         resp.raise_for_status()
-        return _try_parse_encrypted_response(resp)
+        parsed = _try_parse_encrypted_response(resp)
+        return parsed if parsed is not None else None
     except Exception as e:
         _safe_fail(e)
         return None
@@ -1395,14 +1435,12 @@ def _cached_informe_diario_maps(
     numhash_to_nifhash_items: tuple[tuple[str, str], ...],
     allowed_nif_hashes: tuple[str, ...],
 ) -> dict:
-    """Una sola pasada diaria por /informes/empleados.
+    """Construye horas programadas y bajas por día con tolerancia a fallos transitorios.
 
-    Devuelve únicamente mapas numéricos pseudonimizados para:
-      - hp: Horas programadas en minutos (incluye 0 explícito)
-      - baja: Horas de baja laboral en minutos (solo > 0)
-
-    Así Fichajes, Bajas, Sin fichajes y Exceso comparten exactamente la misma
-    lectura diaria del informe y evitamos duplicar peticiones al API.
+    Para rangos largos CRECE puede responder con 429/timeout en alguna fecha si
+    lanzamos demasiadas consultas simultáneas. Hacemos una primera pasada con
+    concurrencia moderada y reintentamos secuencialmente solo las fechas fallidas.
+    Nunca devolvemos un mapa parcial: si una fecha sigue fallando, se aborta.
     """
     try:
         d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
@@ -1428,49 +1466,70 @@ def _cached_informe_diario_maps(
             raise RuntimeError("Fallo en informe de empleados")
         return day, _extract_rows_from_informe(rep)
 
-    had_failure = False
-    with ThreadPoolExecutor(max_workers=_max_workers_days(len(days))) as exe:
-        futs = [exe.submit(_fetch_day, day) for day in days]
-        for fut in as_completed(futs):
-            try:
-                day, rows = fut.result()
-            except Exception as _e:
-                _safe_fail(_e)
-                had_failure = True
+    def _consume(day: str, rows):
+        for r in rows or []:
+            if not isinstance(r, dict):
                 continue
 
-            for r in rows or []:
-                if not isinstance(r, dict):
-                    continue
+            found_nif, nif_value = _row_get_alias(r, ["nif", "NIF", "dni", "DNI"])
+            hn = ""
+            if found_nif and _text(nif_value):
+                candidate = _hash_nif(_text(nif_value).upper())
+                if candidate in allowed_hashes:
+                    hn = candidate
 
-                # El manual documenta Nº empleado; admitimos NIF directo si la
-                # instalación lo incluye en el informe.
-                found_nif, nif_value = _row_get_alias(r, ["nif", "NIF", "dni", "DNI"])
-                hn = ""
-                if found_nif and _text(nif_value):
-                    candidate = _hash_nif(_text(nif_value).upper())
-                    if candidate in allowed_hashes:
-                        hn = candidate
+            if not hn:
+                num = _get_employee_number_from_row(r)
+                if num:
+                    hn = map_numhash_to_nifhash.get(_hash_emp_code(num), "")
 
-                if not hn:
-                    num = _get_employee_number_from_row(r)
-                    if num:
-                        hn = map_numhash_to_nifhash.get(_hash_emp_code(num), "")
+            if not hn:
+                continue
 
-                if not hn:
-                    continue
+            found_hp, hp_mins = _get_horas_programadas_minutes_from_row(r)
+            if found_hp and hp_mins is not None:
+                hp_out[(hn, day)] = max(0, int(hp_mins))
 
-                found_hp, hp_mins = _get_horas_programadas_minutes_from_row(r)
-                if found_hp and hp_mins is not None:
-                    # El cero real es dato válido: día no laborable.
-                    hp_out[(hn, day)] = max(0, int(hp_mins))
+            baja_h = _get_horas_baja_from_row(r)
+            if baja_h > 0:
+                baja_out[(hn, day)] = max(0, int(round(float(baja_h) * 60.0)))
 
-                baja_h = _get_horas_baja_from_row(r)
-                if baja_h > 0:
-                    baja_out[(hn, day)] = max(0, int(round(float(baja_h) * 60.0)))
+    # /informes/empleados es más pesado que los catálogos. 3 workers es un
+    # compromiso mejor para rangos de varias semanas que los 8 anteriores.
+    workers = max(1, min(3, len(days)))
+    failed_days: list[str] = []
 
-    if had_failure:
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futs = {exe.submit(_fetch_day, day): day for day in days}
+        for fut in as_completed(futs):
+            day = futs[fut]
+            try:
+                day_r, rows = fut.result()
+                _consume(day_r, rows)
+            except Exception as exc:
+                _safe_fail(exc)
+                failed_days.append(day)
+
+    unresolved: list[str] = []
+    for day in sorted(set(failed_days)):
+        ok = False
+        for attempt in range(3):
+            if attempt:
+                time.sleep(0.75 * attempt)
+            try:
+                day_r, rows = _fetch_day(day)
+                _consume(day_r, rows)
+                ok = True
+                break
+            except Exception as exc:
+                _safe_fail(exc)
+        if not ok:
+            unresolved.append(day)
+
+    if unresolved:
+        # No incluimos payloads, NIFs ni respuestas en el error.
         raise RuntimeError("Consulta incompleta del informe de empleados")
+
     return {"hp": hp_out, "baja": baja_out}
 
 
