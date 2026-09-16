@@ -336,6 +336,12 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
 
 def _try_parse_encrypted_response(resp: requests.Response):
+    """Parsea respuestas CRECE sin asumir una única representación HTTP.
+
+    CRECE documenta una cadena cifrada, pero algunos proxies/versiones pueden
+    materializar JSON antes de llegar aquí. Se aceptan ambos casos sin exponer
+    el contenido en logs/UI.
+    """
     if resp is None:
         return None
 
@@ -347,34 +353,52 @@ def _try_parse_encrypted_response(resp: requests.Response):
     except Exception:
         pass
 
-    candidates.append(raw_text)
+    if raw_text:
+        candidates.append(raw_text)
 
     for c in candidates:
         try:
-            if isinstance(c, dict) and "iv" in c and "value" in c:
-                payload_obj = {"iv": c["iv"], "value": c["value"]}
-                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
-                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                return json.loads(dec)
+            # JSON ya materializado (respuesta plana o wrapper).
+            if isinstance(c, (list, dict)):
+                if isinstance(c, dict) and "iv" in c and "value" in c:
+                    payload_obj = {k: c[k] for k in ("iv", "value", "mac") if k in c}
+                    payload_b64 = base64.b64encode(
+                        json.dumps(payload_obj).encode("utf-8")
+                    ).decode("utf-8")
+                    dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                    return json.loads(dec)
+                return c
 
-            if isinstance(c, str):
-                s = c.strip().strip('"').strip()
+            if not isinstance(c, str):
+                continue
 
-                if s.startswith("{") and s.endswith("}"):
-                    obj = json.loads(s)
-                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
-                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                        return json.loads(dec)
+            s = c.strip().strip('"').strip()
+            if not s:
+                continue
 
-                try:
-                    dec_json_raw = base64.b64decode(s).decode("utf-8")
-                    obj = json.loads(dec_json_raw)
-                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                        dec = decrypt_crece_payload(s, APP_KEY_B64)
-                        return json.loads(dec)
-                except Exception:
-                    pass
+            # JSON textual: puede ser el sobre cifrado o el resultado ya descifrado.
+            if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+                obj = json.loads(s)
+                if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                    payload_b64 = base64.b64encode(
+                        json.dumps(obj).encode("utf-8")
+                    ).decode("utf-8")
+                    dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                    return json.loads(dec)
+                return obj
+
+            # Formato habitual: base64(JSON{iv,value,mac}).
+            try:
+                dec_json_raw = base64.b64decode(s).decode("utf-8")
+                obj = json.loads(dec_json_raw)
+                if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                    dec = decrypt_crece_payload(s, APP_KEY_B64)
+                    return json.loads(dec)
+                # Compatibilidad defensiva con respuestas base64 de JSON plano.
+                if isinstance(obj, (list, dict)):
+                    return obj
+            except Exception:
+                pass
 
         except Exception:
             continue
@@ -754,35 +778,124 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+def _normalize_tipos_fichaje_payload(data_dec) -> dict:
+    """Normaliza las variantes plausibles del payload de tipos de fichaje."""
+    rows = None
+
+    if isinstance(data_dec, list):
+        rows = data_dec
+    elif isinstance(data_dec, dict):
+        # Wrappers habituales en APIs/proxies.
+        for key in ("data", "results", "resultado", "items", "tipos_fichaje", "tipos"):
+            value = data_dec.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+        if rows is None:
+            # También admitimos un objeto asociativo id -> tipo.
+            vals = list(data_dec.values())
+            if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
+                rows = vals
+
+    if not isinstance(rows, list):
+        raise RuntimeError("Respuesta inválida al consultar los tipos de fichaje")
+
+    out = {}
+    for t in rows:
+        if isinstance(t, dict):
+            tid = t.get("id")
+            desc = t.get("descuenta_tiempo", 0)
+            noct = t.get("turno_nocturno", 0)
+        elif isinstance(t, (list, tuple)):
+            # Orden documentado: id, nombre, descripcion, descuenta_tiempo,
+            # entrada, turno_nocturno, fichador.
+            if not t:
+                continue
+            tid = t[0] if len(t) > 0 else None
+            desc = t[3] if len(t) > 3 else 0
+            noct = t[5] if len(t) > 5 else 0
+        else:
+            continue
+
+        try:
+            tid_i = int(tid)
+        except Exception:
+            continue
+
+        try:
+            desc_i = int(desc or 0)
+        except Exception:
+            desc_i = 0
+        try:
+            noct_i = int(noct or 0)
+        except Exception:
+            noct_i = 0
+
+        out[tid_i] = {
+            "descuenta_tiempo": 1 if desc_i == 1 else 0,
+            "turno_nocturno": 1 if noct_i == 1 else 0,
+        }
+
+    if not out:
+        raise RuntimeError("CRECE no ha devuelto tipos de fichaje utilizables")
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
 def api_exportar_tipos_fichaje() -> dict:
+    """Obtiene tipos de fichaje. Metadato estable: cache 6 h, sin PII."""
     url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
-    resp = safe_request("POST", url)
+    # El manual no exige parámetros POST. Enviar data={} conserva una petición
+    # POST vacía explícita y es compatible con las distintas versiones del WS.
+    resp = safe_request("POST", url, data={})
     if resp is None:
         raise RuntimeError("No se pudieron consultar los tipos de fichaje")
     try:
         resp.raise_for_status()
     except Exception as exc:
-        raise RuntimeError("No se pudieron consultar los tipos de fichaje") from exc
+        raise RuntimeError(
+            f"No se pudieron consultar los tipos de fichaje (HTTP {getattr(resp, 'status_code', 'desconocido')})"
+        ) from exc
 
     data_dec = _try_parse_encrypted_response(resp)
-    if not isinstance(data_dec, list):
-        raise RuntimeError("Respuesta inválida al consultar los tipos de fichaje")
+    return _normalize_tipos_fichaje_payload(data_dec)
 
-    out = {}
-    for t in data_dec:
-        tid = t.get("id")
-        if tid is None:
-            continue
+
+@st.cache_resource
+def _tipos_fichaje_last_good_holder():
+    # Solo guarda metadatos no personales durante la vida del proceso.
+    return {"map": {}, "ts": 0.0, "lock": threading.Lock()}
+
+
+def get_tipos_fichaje_resiliente() -> tuple[dict, bool]:
+    """Devuelve (mapa, usando_fallback).
+
+    Si CRECE falla puntualmente, reutiliza la última lectura válida del proceso.
+    Nunca sustituye silenciosamente los tipos por un mapa vacío.
+    """
+    holder = _tipos_fichaje_last_good_holder()
+    last_exc = None
+
+    # Dos intentos funcionales; safe_request ya gestiona retries HTTP 429/5xx.
+    for attempt in range(2):
         try:
-            tid_i = int(tid)
-        except Exception:
-            continue
-        out[tid_i] = {
-            "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
-            "turno_nocturno": int(t.get("turno_nocturno") or 0),
-        }
-    return out
+            tipos = api_exportar_tipos_fichaje()
+            if tipos:
+                with holder["lock"]:
+                    holder["map"] = dict(tipos)
+                    holder["ts"] = time.time()
+                return tipos, False
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(0.25)
+
+    with holder["lock"]:
+        fallback = dict(holder.get("map") or {})
+    if fallback:
+        return fallback, True
+
+    raise RuntimeError("No hay una lectura válida de tipos de fichaje disponible") from last_exc
 
 
 def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list | None:
@@ -1657,9 +1770,17 @@ if consultar:
 
     with st.spinner("Procesando…"):
         try:
-            tipos_map = api_exportar_tipos_fichaje()
+            tipos_map, tipos_fallback = get_tipos_fichaje_resiliente()
+            if tipos_fallback:
+                st.warning(
+                    "CRECE no ha respondido al catálogo de tipos de fichaje en esta consulta. "
+                    "Se está usando la última lectura válida disponible."
+                )
         except Exception:
-            st.error("No se han podido consultar los tipos de fichaje de CRECE. Reintenta la consulta.")
+            st.error(
+                "No se han podido consultar los tipos de fichaje de CRECE y no existe "
+                "una lectura válida anterior. Reintenta la consulta."
+            )
             st.stop()
 
         # --------- FICHAJES ----------
