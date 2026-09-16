@@ -334,14 +334,6 @@ ALLOWED_SEDES = [
 ALLOWED_EMPRESAS_N = {_norm_key(x) for x in ALLOWED_EMPRESAS}
 ALLOWED_SEDES_N = {_norm_key(x) for x in ALLOWED_SEDES}
 
-# Empresa exenta de validación horaria en la pestaña Fichajes:
-# - No generar incidencias por entrada temprana/tarde/fuera de rango.
-# - No generar incidencias por salida temprana.
-# - Mantener validaciones de horas, número de fichajes y día no laborable.
-HORARIO_EXEMPT_EMPRESAS_N = {
-    _norm_key("Barranquesa Tower Flanges, S.L."),
-}
-
 
 # ============================================================
 # DESCIFRADO CRECE (AES-CBC)
@@ -510,7 +502,6 @@ N_ETOR = norm_name("Etor Alegria Reparaz")
 N_FRAN = norm_name("Francisco Javier Diaz Arozarena")
 N_MIRIAM = norm_name("Miriam Martin Muñoz")
 N_BEATRIZ = norm_name("Beatriz Andueza Roncal")
-N_MIKEL = norm_name("Mikel Arzallus Marco")
 
 SPECIAL_RULES_PREFIX = [
     ("MOD", N_DAVID, {"min_horas": 4.5, "min_fichajes": 2}),
@@ -524,15 +515,6 @@ SCHEDULE_EXEMPT_PREFIX = [
     ("MOD", N_DAVID),
     ("MOI", N_MIRIAM),
 ]
-
-# Empleados para los que RRHH pide no generar incidencias de:
-# - Entrada temprana
-# - Salida temprana
-# Se mantienen el resto de controles: horas, fichajes, día no laborable
-# y, si aplicase, entrada tarde / entrada fuera de rango.
-EARLY_SCHEDULE_EXEMPT_NAMES_NORM = {
-    N_MIKEL,
-}
 
 FLEX_BY_DEPTO = {
     "ESTRUCTURA": [N_FRAN],
@@ -554,10 +536,6 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
     return False
 
 
-def _is_early_schedule_exempt(nombre_norm: str) -> bool:
-    return any(name_startswith(nombre_norm, pref) for pref in EARLY_SCHEDULE_EXEMPT_NAMES_NORM)
-
-
 def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
     for pref in FLEX_BY_DEPTO.get(depto_norm, []):
         if name_startswith(nombre_norm, pref):
@@ -565,24 +543,7 @@ def _is_flex(depto_norm: str, nombre_norm: str) -> bool:
     return False
 
 
-def _format_hours_minimum(hours_value: float) -> str:
-    """Formatea mínimos de horas sin decimales innecesarios."""
-    try:
-        v = float(hours_value)
-    except Exception:
-        return str(hours_value)
-    if abs(v - int(v)) < 0.001:
-        return str(int(v))
-    return f"{v:.2f}".rstrip("0").rstrip(".")
-
-
 def calcular_minimos(depto: str, dia: int, nombre: str):
-    """
-    Fallback histórico.
-
-    Se mantiene por compatibilidad, pero en el apartado Fichajes la jornada válida
-    debe salir de horas_programadas de /api/informes/empleados, igual que en Excesos.
-    """
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
@@ -612,49 +573,11 @@ def calcular_minimos(depto: str, dia: int, nombre: str):
     return min_h, min_f
 
 
-def calcular_minimos_por_jornada_programada(depto: str, nombre: str, jornada_programada_min: int):
-    """
-    Mínimos para Fichajes basados en horas_programadas.
 
-    Motivo:
-    - Un jueves normal puede ser 8,5h.
-    - Un jueves previo a festivo puede ser 6,5h.
-    - Un festivo o no laborable debe tener 0h.
-    Por tanto, no se debe inferir la jornada solo por día de semana.
-    """
-    try:
-        exp_min = int(jornada_programada_min or 0)
-    except Exception:
-        exp_min = 0
 
-    if exp_min <= 0:
-        return None, None
-
+def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
-    min_h = round(exp_min / 60.0, 2)
-    min_f = None
-
-    if depto_norm in ["ESTRUCTURA", "MOI"]:
-        # Jornada reducida / previa a festivo: 2 fichajes.
-        # Jornada partida normal: 4 fichajes.
-        min_f = 2 if exp_min <= (6 * 60 + 35) else 4
-    elif depto_norm == "MOD":
-        min_f = 2
-
-    special = _lookup_special(depto_norm, nombre_norm)
-    if special and "min_fichajes" in special and min_f is not None:
-        min_f = int(special["min_fichajes"])
-
-    return min_h, min_f
-
-
-
-
-def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str, ultima_salida_hhmm: str, jornada_programada_min: int | None = None) -> list[str]:
-    depto_norm = (depto or "").upper().strip()
-    nombre_norm = norm_name(nombre)
-    early_exempt = _is_early_schedule_exempt(nombre_norm)
 
     if dia not in [0, 1, 2, 3, 4]:
         return []
@@ -676,8 +599,7 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
             ini_ok, fin_ok = 5 * 60 + 30, 6 * 60
             fin_turno = 14 * 60
             if e_min < ini_ok:
-                if not early_exempt:
-                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
                 pass
             elif e_min <= fin_turno:
@@ -688,8 +610,7 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
             ini_ok, fin_ok = 13 * 60, 14 * 60
             fin_turno = 22 * 60
             if e_min < ini_ok:
-                if not early_exempt:
-                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif ini_ok <= e_min <= fin_ok:
                 pass
             elif e_min <= fin_turno:
@@ -703,28 +624,15 @@ def validar_horario(depto: str, nombre: str, dia: int, primera_entrada_hhmm: str
 
         if not flex:
             ini, fin = 7 * 60, 9 * 60
-
-            try:
-                exp_min = int(jornada_programada_min or 0)
-            except Exception:
-                exp_min = 0
-
-            # Si CRECE dice que la jornada programada es reducida (por ejemplo previo a festivo),
-            # la salida mínima pasa a 13:30 aunque no sea viernes.
-            if exp_min > 0:
-                salida_min = (13 * 60 + 30) if exp_min <= (6 * 60 + 35) else (16 * 60 + 30)
-            else:
-                salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
+            salida_min = (13 * 60 + 30) if dia == 4 else (16 * 60 + 30)
 
             if e_min < (ini - MARGEN_HORARIO_MIN):
-                if not early_exempt:
-                    incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
+                incid.append(f"Entrada temprana ({primera_entrada_hhmm})")
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
             if s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
-                if not early_exempt:
-                    incid.append(f"Salida temprana ({ultima_salida_hhmm})")
+                incid.append(f"Salida temprana ({ultima_salida_hhmm})")
         return incid
 
     return incid
@@ -750,7 +658,7 @@ def validar_incidencia_horas_fichajes(r) -> list[str]:
 
     umbral_inferior = float(min_h) - TOLERANCIA_HORAS
     if horas_val < umbral_inferior:
-        motivos.append(f"Horas insuficientes (mín {_format_hours_minimum(min_h)}h)")
+        motivos.append(f"Horas insuficientes (mín {min_h}h)")
 
     if num_fich < int(min_f):
         motivos.append(f"Fichajes insuficientes (mín {min_f})")
@@ -1123,6 +1031,101 @@ def _to_float_any(x) -> float:
         return 0.0
 
 
+def _field_key_norm(value) -> str:
+    """Normaliza nombres de campos del informe CRECE.
+
+    El API de informes documenta etiquetas legibles (p. ej. "Nº empleado",
+    "Horas programadas"), mientras que algunas instalaciones/versiones pueden
+    devolver snake_case/camelCase. Esta normalización permite soportar ambos
+    formatos sin depender de una etiqueta exacta.
+    """
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().replace("º", "o").replace("°", "o")
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _row_get_alias(row: dict, aliases: list[str]):
+    """Devuelve (encontrado, valor) buscando por alias normalizados."""
+    if not isinstance(row, dict):
+        return False, None
+    wanted = {_field_key_norm(a) for a in aliases}
+    for key, value in row.items():
+        if _field_key_norm(key) in wanted:
+            return True, value
+    return False, None
+
+
+def _canonical_emp_code(value) -> str:
+    """Código de empleado estable: ignora ceros a la izquierda si es numérico."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return s.lstrip("0") or "0"
+    return s.upper()
+
+
+def _get_employee_number_from_row(row: dict) -> str:
+    found, value = _row_get_alias(
+        row,
+        [
+            "Nº empleado", "N° empleado", "N. empleado", "N empleado",
+            "Numero empleado", "Número empleado", "num_empleado", "numEmpleado",
+            "employee_number", "employeeNumber", "id_empleado", "idEmpleado",
+        ],
+    )
+    return _canonical_emp_code(value) if found else ""
+
+
+def _duration_value_to_minutes(value):
+    """Convierte una duración diaria del informe a minutos.
+
+    Soporta horas decimales (8 / 8,5), HH:MM[:SS], minutos y, como último
+    recurso, segundos. Devuelve None si no puede interpretarse.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if ":" in raw:
+            parts = raw.split(":")
+            try:
+                if len(parts) == 2:
+                    h, m = int(parts[0]), int(parts[1])
+                    return max(0, h * 60 + m)
+                if len(parts) == 3:
+                    h, m, sec = int(parts[0]), int(parts[1]), float(parts[2].replace(",", "."))
+                    return max(0, int(round(h * 60 + m + sec / 60.0)))
+            except Exception:
+                return None
+        raw = raw.replace(",", ".")
+        try:
+            num = float(raw)
+        except Exception:
+            return None
+    else:
+        try:
+            num = float(value)
+        except Exception:
+            return None
+
+    if pd.isna(num) or num < 0:
+        return None
+    # En consultas de un día: <=24 suele ser horas decimales; <=1440 minutos;
+    # valores superiores se interpretan como segundos.
+    if num <= 24:
+        return int(round(num * 60))
+    if num <= 24 * 60:
+        return int(round(num))
+    return int(round(num / 60.0))
+
+
 def _extract_rows_from_informe(rep):
     if rep is None:
         return []
@@ -1147,29 +1150,22 @@ def _get_horas_baja_from_row(row: dict) -> float:
     if not isinstance(row, dict):
         return 0.0
 
-    candidates = [
-        "horas_baja",
-        "horasBaja",
-        "horas_de_baja",
-        "horas_baja_total",
-        "total_horas_baja",
-        "horas_baja_dia",
-        "horas_baja_diarias",
-        "horas_baja_hoy",
-        "horas_baja_parte",
+    aliases = [
+        "Horas de baja laboral (laborables, no naturales)",
+        "horas_baja", "horasBaja", "horas_de_baja", "horas_baja_total",
+        "total_horas_baja", "horas_baja_dia", "horas_baja_diarias",
+        "horas_baja_hoy", "horas_baja_parte",
     ]
-    for c in candidates:
-        if c in row:
-            return _to_float_any(row.get(c))
+    found, value = _row_get_alias(row, aliases)
+    if found:
+        return _to_float_any(value)
 
     for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
         v = row.get(k)
         if isinstance(v, dict):
-            for c in candidates:
-                if c in v:
-                    return _to_float_any(v.get(c))
-            if "horas" in v:
-                return _to_float_any(v.get("horas"))
+            found, value = _row_get_alias(v, aliases + ["horas"])
+            if found:
+                return _to_float_any(value)
         elif isinstance(v, list):
             best = 0.0
             for it in v:
@@ -1187,6 +1183,10 @@ def _pick_key(df: pd.DataFrame, names: list[str]):
     for n in names:
         if n in df.columns:
             return n
+    wanted = {_field_key_norm(n) for n in names}
+    for col in df.columns:
+        if _field_key_norm(col) in wanted:
+            return col
     return None
 
 
@@ -1282,33 +1282,36 @@ def _normalize_emp_code(x: str, pad: int = 10) -> str:
     return s
 
 
-def _get_horas_programadas_from_row(row: dict) -> float:
-    """Extrae horas_programadas del row del informe empleados. Devuelve horas (float)."""
+def _get_horas_programadas_minutes_from_row(row: dict):
+    """Devuelve (campo_encontrado, minutos_programados).
+
+    Según el manual del informe de empleados, el campo se denomina
+    "Horas programadas". También se admiten variantes históricas.
+    Es importante distinguir un 0 real (día no laborable) de un campo ausente.
+    """
     if not isinstance(row, dict):
-        return 0.0
+        return False, None
 
-    candidates = [
-        'horas_programadas', 'horasProgramadas', 'horas_programadas_dia', 'horasProgramadasDia',
-        'horas_programadas_hoy', 'horasProgramadasHoy', 'horas_jornada', 'horasJornada',
-        'jornada', 'jornada_horas', 'jornadaHoras'
+    aliases = [
+        "Horas programadas",
+        "horas_programadas", "horasProgramadas",
+        "horas_programadas_dia", "horasProgramadasDia",
+        "horas_programadas_hoy", "horasProgramadasHoy",
     ]
-    for c in candidates:
-        if c in row and row.get(c) is not None:
-            try:
-                return float(str(row.get(c)).replace(',', '.'))
-            except Exception:
-                pass
+    found, value = _row_get_alias(row, aliases)
+    if found:
+        mins = _duration_value_to_minutes(value)
+        return (mins is not None), mins
 
-    for k in ['contrato', 'jornada', 'horario', 'turno']:
-        v = row.get(k)
-        if isinstance(v, dict):
-            for c in candidates:
-                if c in v and v.get(c) is not None:
-                    try:
-                        return float(str(v.get(c)).replace(',', '.'))
-                    except Exception:
-                        pass
-    return 0.0
+    for nested_key in ["contrato", "jornada", "horario", "turno"]:
+        nested = row.get(nested_key)
+        if isinstance(nested, dict):
+            found, value = _row_get_alias(nested, aliases)
+            if found:
+                mins = _duration_value_to_minutes(value)
+                return (mins is not None), mins
+
+    return False, None
 
 
 
@@ -1317,11 +1320,12 @@ def _cached_horas_programadas_map(
     d0_iso: str,
     d1_iso: str,
     nifs_fingerprint: str,
-    num_map_items: tuple[tuple[str, str], ...],
-    pad: int,
+    num_to_hash_items: tuple[tuple[str, str], ...],
 ) -> dict:
-    """Cache seguro (TTL corto): {(hash_nif, YYYY-MM-DD): minutos_programados}.
-    Cachea solo minutos (int), sin NIFs en claro.
+    """Cache seguro: {(hash_nif, YYYY-MM-DD): minutos_programados}.
+
+    El informe de empleados identifica al trabajador por "Nº empleado"; por
+    ello se traduce ese código al hash del NIF fuera de la respuesta cacheada.
     """
     try:
         d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
@@ -1329,25 +1333,22 @@ def _cached_horas_programadas_map(
     except Exception:
         return {}
 
-    nifs = [str(x).upper().strip() for x in (_NIFS_REGISTRY.get(nifs_fingerprint, ()) or ()) if str(x).strip()]
-    if not nifs:
+    map_num_to_hash = {k: v for k, v in (num_to_hash_items or ()) if k and v}
+    allowed_hashes = set(map_num_to_hash.values())
+    if not allowed_hashes:
         return {}
-    nifs_set = set(nifs)
-    map_num_to_nif = {k: v for k, v in (num_map_items or ()) if k and v}
 
     days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
     if not days:
         return {}
 
-    max_workers = _max_workers_days(len(days))
     out: dict[tuple[str, str], int] = {}
 
     def _fetch_day(day: str):
         rep = api_informe_empleados(day, day)
-        rows = _extract_rows_from_informe(rep)
-        return day, rows
+        return day, _extract_rows_from_informe(rep)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+    with ThreadPoolExecutor(max_workers=_max_workers_days(len(days))) as exe:
         futs = [exe.submit(_fetch_day, day) for day in days]
         for fut in as_completed(futs):
             try:
@@ -1355,64 +1356,71 @@ def _cached_horas_programadas_map(
             except Exception as _e:
                 _safe_fail(_e)
                 continue
-            if not rows:
-                continue
-            for r in rows:
+            for r in rows or []:
                 if not isinstance(r, dict):
                     continue
 
-                nif = str(r.get("nif") or r.get("NIF") or "").upper().strip()
-                num = str(r.get("num_empleado") or r.get("numEmpleado") or "").strip()
-                if num:
-                    num = _normalize_emp_code(num, pad=pad)
-                if not nif and num:
-                    nif = map_num_to_nif.get(num, "")
+                # Algunas versiones pueden devolver NIF directamente; el manual actual
+                # documenta Nº empleado, por lo que esa es la vía principal.
+                found_nif, nif_value = _row_get_alias(r, ["nif", "NIF", "dni", "DNI"])
+                hn = ""
+                if found_nif and str(nif_value or "").strip():
+                    candidate = _hash_nif(str(nif_value).upper().strip())
+                    if candidate in allowed_hashes:
+                        hn = candidate
 
-                if not nif or nif not in nifs_set:
+                if not hn:
+                    num = _get_employee_number_from_row(r)
+                    if num:
+                        hn = map_num_to_hash.get(num, "")
+
+                if not hn:
                     continue
 
-                hp = _get_horas_programadas_from_row(r)
-                try:
-                    v = float(hp)
-                    mins = int(round(v)) if v >= 25 else int(round(v * 60))
-                except Exception:
-                    mins = 0
+                found_hp, mins = _get_horas_programadas_minutes_from_row(r)
+                if not found_hp or mins is None:
+                    continue
 
-                out[(_hash_nif(nif), day)] = max(0, int(mins))
+                # Guardamos también el cero real: es precisamente lo que identifica
+                # un día no laborable.
+                out[(hn, day)] = max(0, int(mins))
 
     return out
 
 
 def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> dict:
-    """Devuelve {(nif, YYYY-MM-DD): minutos_programados} para el rango [d0,d1].
+    """Devuelve {(nif, YYYY-MM-DD): minutos_programados} para [d0,d1].
 
-    Regla: SIEMPRE usamos horas_programadas del informe empleados.
-    Optimización: consulta día a día en paralelo + cache TTL corto (solo ints).
+    Fuente única: "Horas programadas" de /api/informes/empleados, consultado
+    día a día. Un valor 0 se conserva como dato válido; una ausencia de dato no
+    se convierte artificialmente en cero.
     """
     if base_emp is None or base_emp.empty:
         return {}
 
     be = base_emp.copy()
     be["nif"] = be["nif"].astype(str).str.upper().str.strip()
-    be["num_empleado"] = be.get("num_empleado", "").astype(str).str.strip()
+    if "num_empleado" not in be.columns:
+        be["num_empleado"] = ""
+    be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
 
-    pad_local = int(be["num_empleado"].astype(str).str.len().max() or 10)
-    be["num_empleado_norm"] = be["num_empleado"].apply(lambda x: _normalize_emp_code(x, pad=pad_local))
-
-    map_num_to_nif = dict(zip(be["num_empleado_norm"], be["nif"]))
     nifs_norm = tuple(sorted({x for x in be["nif"].tolist() if x}))
     if not nifs_norm:
         return {}
-    fp = _fingerprint_nifs(nifs_norm)
-    _registry_put(fp, nifs_norm)
 
-    num_items = tuple(sorted((k, v) for k, v in map_num_to_nif.items() if k and v))
+    fp = _fingerprint_nifs(nifs_norm)
+    num_to_hash = {}
+    for _, row in be.iterrows():
+        code = str(row.get("num_empleado_code") or "")
+        nif = str(row.get("nif") or "").upper().strip()
+        if code and nif:
+            num_to_hash[code] = _hash_nif(nif)
+
     hashed = _cached_horas_programadas_map(
         d0.strftime("%Y-%m-%d"),
         d1.strftime("%Y-%m-%d"),
         fp,
-        num_items,
-        int(pad_local),
+        tuple(sorted(num_to_hash.items())),
     )
     if not hashed:
         return {}
@@ -1421,9 +1429,8 @@ def build_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> d
     out: dict[tuple[str, str], int] = {}
     for (hn, day), mins in hashed.items():
         nif = hash_to_nif.get(hn)
-        if not nif:
-            continue
-        out[(nif, day)] = int(mins)
+        if nif:
+            out[(nif, day)] = int(mins)
     return out
 
 
@@ -1753,19 +1760,6 @@ if consultar:
 
             resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
-            def _jornada_programada_min_row(r) -> int:
-                day_str = str(r.get("Fecha", "") or "")
-                nif_str = str(r.get("nif", "") or "").upper().strip()
-                try:
-                    return int((horas_prog_map_incid or {}).get((nif_str, day_str), 0) or 0)
-                except Exception:
-                    return 0
-
-            # ✅ Jornada laboral real del día, igual que en Excesos:
-            # se toma de horas_programadas de /api/informes/empleados.
-            # Esto corrige festivos, previos a festivo y excepciones de calendario/turno.
-            resumen["jornada_programada_min"] = resumen.apply(_jornada_programada_min_row, axis=1)
-
             def _max_ok(r):
                 sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
                 if sp and "max_fichajes_ok" in sp:
@@ -1775,51 +1769,69 @@ if consultar:
             resumen["max_fichajes_ok"] = resumen.apply(_max_ok, axis=1)
 
             resumen[["min_horas", "min_fichajes"]] = resumen.apply(
-                lambda r: pd.Series(
-                    calcular_minimos_por_jornada_programada(
-                        r.get("Departamento"),
-                        r.get("Nombre"),
-                        r.get("jornada_programada_min"),
-                    )
-                ),
+                lambda r: pd.Series(calcular_minimos(r.get("Departamento"), int(r["dia"]), r.get("Nombre"))),
                 axis=1,
             )
-
-            def _empresa_exenta_horario(r) -> bool:
-                return _norm_key(r.get("Empresa", "")) in HORARIO_EXEMPT_EMPRESAS_N
-
             def build_incidencia(r) -> str:
                 motivos = []
 
-                try:
-                    exp_min = int(r.get("jornada_programada_min", 0) or 0)
-                except Exception:
-                    exp_min = 0
+                day_str = str(r.get("Fecha", "") or "")
+                nif_str = str(r.get("nif", "") or "").upper().strip()
 
-                worked = (float(r.get("horas_dec_validacion", 0.0) or 0.0) > 0.0) or (
-                    int(r.get("Numero de fichajes", 0) or 0) > 0
+                exp_key = (nif_str, day_str)
+                exp_known = exp_key in (horas_prog_map_incid or {})
+                exp_min = None
+                if exp_known:
+                    try:
+                        exp_min = int(horas_prog_map_incid[exp_key])
+                    except Exception:
+                        exp_known = False
+                        exp_min = None
+
+                worked_minutes = int(round(float(r.get("horas_dec_validacion", 0.0) or 0.0) * 60))
+                num_fich = int(r.get("Numero de fichajes", 0) or 0)
+                worked = worked_minutes > 0 or num_fich > 0
+
+                # Solo un cero EXPLÍCITO de Horas programadas significa no laborable.
+                # Si el informe no trae el dato, nunca lo convertimos por defecto en 0.
+                if exp_known and exp_min == 0 and worked:
+                    return "Trabajado en día no laborable"
+
+                if int(r.get("dia", 0)) in [5, 6]:
+                    if worked:
+                        motivos.append("Trabajo en fin de semana")
+                    return "; ".join(motivos)
+
+                # Horas insuficientes: la jornada esperada sale de Horas programadas,
+                # incluyendo jornadas reducidas/especiales. Tolerancia diaria: 5 min.
+                if exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - 5):
+                    motivos.append(f"Horas insuficientes (mín {segundos_a_hhmm(exp_min * 60)})")
+
+                # Reglas de cantidad de fichajes (sin volver a comparar horas contra una
+                # jornada fija, para no contradecir Horas programadas).
+                min_f = r.get("min_fichajes")
+                if pd.notna(min_f):
+                    try:
+                        min_f_i = int(min_f)
+                        if num_fich < min_f_i:
+                            motivos.append(f"Fichajes insuficientes (mín {min_f_i})")
+                        max_ok = r.get("max_fichajes_ok")
+                        if pd.notna(max_ok):
+                            max_ok_i = int(max_ok)
+                            if num_fich > max_ok_i:
+                                motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
+                        elif exp_known and exp_min is not None and worked_minutes >= max(0, exp_min - 5) and num_fich > min_f_i:
+                            motivos.append(f"Fichajes excesivos (mín {min_f_i})")
+                    except Exception:
+                        pass
+
+                motivos += validar_horario(
+                    r.get("Departamento"),
+                    r.get("Nombre"),
+                    int(r.get("dia", 0)),
+                    r.get("Primera entrada", ""),
+                    r.get("Última salida", ""),
                 )
-
-                if exp_min <= 0:
-                    return "Trabajado en día no laborable" if worked else ""
-
-                motivos += validar_incidencia_horas_fichajes(r)
-
-                # Para Barranquesa Tower Flanges, S.L. se elimina la validación horaria
-                # de entrada/salida en la pestaña Fichajes. Se mantienen:
-                # - horas mínimas según horas_programadas,
-                # - número de fichajes,
-                # - trabajo en día no laborable.
-                if not _empresa_exenta_horario(r):
-                    motivos += validar_horario(
-                        r.get("Departamento"),
-                        r.get("Nombre"),
-                        int(r.get("dia", 0)),
-                        r.get("Primera entrada", ""),
-                        r.get("Última salida", ""),
-                        exp_min,
-                    )
-
                 return "; ".join(motivos)
 
             resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
@@ -1888,15 +1900,17 @@ if consultar:
                     continue
 
                 key_nif = _pick_key(df_rep, ["nif", "NIF", "dni", "DNI"])
-                key_num = _pick_key(df_rep, ["num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
+                key_num = _pick_key(df_rep, ["Nº empleado", "N° empleado", "Número empleado", "Numero empleado", "num_empleado", "numEmpleado", "employee_number", "employeeNumber", "id_empleado", "idEmpleado"])
 
                 merged = None
                 if key_nif is not None:
                     df_rep["nif_join"] = df_rep[key_nif].astype(str).str.upper().str.strip()
                     merged = df_rep.merge(base_emp, left_on="nif_join", right_on="nif", how="inner")
                 elif key_num is not None:
-                    df_rep["num_join"] = df_rep[key_num].astype(str).str.strip()
-                    merged = df_rep.merge(base_emp, left_on="num_join", right_on="num_empleado", how="inner")
+                    df_rep["num_join"] = df_rep[key_num].apply(_canonical_emp_code)
+                    base_emp_join = base_emp.copy()
+                    base_emp_join["num_join"] = base_emp_join["num_empleado"].apply(_canonical_emp_code)
+                    merged = df_rep.merge(base_emp_join, on="num_join", how="inner")
 
                 if merged is None or merged.empty:
                     continue
@@ -1975,8 +1989,11 @@ if consultar:
                 _safe_fail(_e)
                 horas_prog_map = {}
 
-            def expected_day_minutes(nif: str, day: date) -> int:
-                return int(horas_prog_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
+            def expected_day_minutes(nif: str, day: date):
+                key = (str(nif).upper().strip(), day.strftime("%Y-%m-%d"))
+                if key not in horas_prog_map:
+                    return None
+                return int(horas_prog_map[key])
 
             # 2) tiempoContabilizado (minutos) para TODOS los empleados del filtro, día a día
             nifs_all = base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -2018,9 +2035,13 @@ if consultar:
                         jornada_sem_min = 0
 
                         cur_day = wk_start
+                        expected_complete = True
                         while cur_day <= wk_end_incl:
                             mins_tc = worked_day_minutes(nif, cur_day)
                             exp_day = expected_day_minutes(nif, cur_day)
+                            if exp_day is None:
+                                expected_complete = False
+                                break
 
                             trabajado_sem_min += int(mins_tc)
                             jornada_sem_min += int(exp_day)
@@ -2028,8 +2049,12 @@ if consultar:
                             diff_day = int(mins_tc) - int(exp_day)
                             bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
                             exceso_sem_min += int(bal_day_q)
-
                             cur_day += timedelta(days=1)
+
+                        # No fabricamos un esperado=0 si el informe no devuelve Horas programadas.
+                        # Es más seguro omitir ese empleado/semana que calcular un exceso falso.
+                        if not expected_complete:
+                            continue
 
                         # Mostrar solo si hay exceso semanal != 0
                         if exceso_sem_min == 0:
@@ -2233,7 +2258,7 @@ if "tab_fich" in tab_map:
     with tab_map["tab_fich"]:
         incid = res_incid
         if not incid:
-            st.info("No hay incidencias en el rango seleccionado.")
+            st.success("🎉 No hay incidencias en el rango seleccionado.")
         else:
             for day in sorted(incid.keys()):
                 view_df = _df_view(incid[day])
@@ -2265,13 +2290,13 @@ if "tab_sin" in tab_map:
     with tab_map["tab_sin"]:
         sinf = res_sin
         if not sinf:
-            st.info("No hay empleados sin fichajes en el rango seleccionado.")
+            st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
         else:
             for day in sorted(sinf.keys()):
                 view_df = _df_view(sinf.get(day))
                 if view_df is None or (hasattr(view_df, 'empty') and view_df.empty):
                     continue
-                st.markdown(f"### ⛔ Empleados sin fichajes — {day}")
+                st.markdown(f"### ⛔ Empleados sin fichajes (activos/contrato) — {day}")
                 st.data_editor(view_df, use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('sinf', day, current_sig))
             csv_s = st.session_state.get("result_csv_sin", b"") or b""
             if csv_s:
