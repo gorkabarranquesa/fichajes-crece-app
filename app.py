@@ -152,6 +152,21 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
 # NORMALIZACIÓN
 # ============================================================
 
+def _text(value) -> str:
+    """Convierte valores API/DataFrame a texto de forma segura.
+
+    Evita que None/NaN rompan comparaciones y, sobre todo, centraliza la
+    normalización usada por los mapas de Horas programadas/Bajas.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
 def norm_name(s: str) -> str:
     """Normaliza nombres ignorando tildes, mayúsculas y espacios."""
     raw = unicodedata.normalize("NFKD", str(s or "").strip())
@@ -360,6 +375,12 @@ def _try_parse_encrypted_response(resp: requests.Response):
 
     for c in candidates:
         try:
+            # Compatibilidad con proxies/versiones que ya materializan el JSON.
+            if isinstance(c, list):
+                return c
+            if isinstance(c, dict) and not ("iv" in c and "value" in c):
+                return c
+
             if isinstance(c, dict) and "iv" in c and "value" in c:
                 payload_obj = {"iv": c["iv"], "value": c["value"]}
                 payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
@@ -734,7 +755,20 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa") or e.get("company_id")
         sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
-        num_empleado = e.get("num_empleado") or e.get("employee_number") or e.get("id_empleado") or e.get("id")
+        # Nº empleado y ID interno de CRECE NO son lo mismo. /informes/empleados
+        # enlaza por "Nº empleado", por lo que nunca usamos e["id"] como sustituto.
+        num_empleado = (
+            e.get("num_empleado")
+            or e.get("Num_empleado")
+            or e.get("numEmpleado")
+            or e.get("numero_empleado")
+            or e.get("Numero_empleado")
+            or e.get("numeroEmpleado")
+            or e.get("employee_number")
+            or e.get("employeeNumber")
+            or e.get("id_empleado")
+            or e.get("idEmpleado")
+        )
 
         row = {
             "nif": e.get("nif"),
@@ -949,17 +983,36 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
+    """Consulta el informe de empleados sin asumir un único encoding POST.
+
+    En este entorno CRECE ha funcionado históricamente con JSON. El manual
+    documenta parámetros POST sin fijar Content-Type, así que mantenemos JSON
+    como primera opción y form-urlencoded como fallback. Nunca se registran
+    payloads, tokens ni PII.
+    """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-    try:
-        resp = safe_request("POST", url, json_body=body)
-        if resp is None:
-            return None
-        resp.raise_for_status()
-        return _try_parse_encrypted_response(resp)
-    except Exception as e:
-        _safe_fail(e)
-        return None
+
+    for as_json in (True, False):
+        try:
+            resp = safe_request(
+                "POST",
+                url,
+                json_body=body if as_json else None,
+                data=None if as_json else body,
+                timeout=(5, 60),
+            )
+            if resp is None:
+                continue
+            resp.raise_for_status()
+            parsed = _try_parse_encrypted_response(resp)
+            if parsed is not None:
+                return parsed
+        except Exception as e:
+            _safe_fail(e)
+            continue
+
+    return None
 
 
 # ============================================================
@@ -1287,7 +1340,10 @@ def _parse_date_any(x):
         except Exception:
             pass
     try:
-        return pd.to_datetime(s, errors="coerce").date()
+        dt = pd.to_datetime(s, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.date()
     except Exception:
         return None
 
@@ -1475,15 +1531,15 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
     if "deleted_at" in df_emp.columns:
         deleted = df_emp["deleted_at"].notna() & df_emp["deleted_at"].astype(str).str.strip().ne("") & df_emp["deleted_at"].astype(str).str.lower().ne("null")
     else:
-        deleted = pd.Series([False] * len(df_emp))
+        deleted = pd.Series(False, index=df_emp.index, dtype=bool)
 
-    flags_true = pd.Series([False] * len(df_emp))
+    flags_true = pd.Series(False, index=df_emp.index, dtype=bool)
     for col in ["activo", "en_activo", "contrato_activo"]:
         if col in df_emp.columns:
             s = df_emp[col]
             flags_true = flags_true | s.astype(str).str.strip().str.lower().isin(["1", "true", "t", "si", "sí", "yes", "y"])
 
-    estado_ok = pd.Series([False] * len(df_emp))
+    estado_ok = pd.Series(False, index=df_emp.index, dtype=bool)
     for col in ["estado", "situacion"]:
         if col in df_emp.columns:
             s = df_emp[col].astype(str).str.strip().str.upper()
@@ -1495,9 +1551,9 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
         fb_past = fb_has & (fb <= date.today())
         baja = fb_past
     else:
-        baja = pd.Series([False] * len(df_emp))
+        baja = pd.Series(False, index=df_emp.index, dtype=bool)
 
-    fin_ok = pd.Series([False] * len(df_emp))
+    fin_ok = pd.Series(False, index=df_emp.index, dtype=bool)
     for col in ["fecha_fin_contrato", "fin_contrato"]:
         if col in df_emp.columns:
             fc = df_emp[col].apply(_parse_date_any)
