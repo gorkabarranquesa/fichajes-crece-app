@@ -744,7 +744,8 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
         empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa") or e.get("company_id")
         sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
-        num_empleado = e.get("num_empleado") or e.get("employee_number") or e.get("id_empleado") or e.get("id")
+        empleado_id = e.get("id") or e.get("empleado_id") or e.get("employee_id")
+        num_empleado = e.get("num_empleado") or e.get("employee_number") or e.get("numero_empleado")
 
         row = {
             "nif": e.get("nif"),
@@ -752,6 +753,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             "departamento_id": e.get("departamento"),
             "empresa_id": empresa_id,
             "sede_id": sede_id,
+            "empleado_id": str(empleado_id).strip() if empleado_id is not None else "",
             "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
         }
 
@@ -1111,54 +1113,185 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """Consulta /informes/empleados de forma compatible y robusta.
+    """Consulta /informes/empleados sin cambiar el formato que históricamente
+    ha funcionado en esta intranet.
 
-    El manual documenta fecha_desde/fecha_hasta como parámetros POST. La forma
-    principal se envía como application/x-www-form-urlencoded (data=...), igual
-    que el resto de endpoints de CRECE. Se mantiene un fallback JSON únicamente
-    por compatibilidad con instalaciones/proxies que lo acepten así.
-
-    Devuelve el payload descifrado (lista/dict) o None si ambas variantes fallan.
-    Nunca registra payloads, NIFs ni tokens.
+    La aplicación original enviaba fecha_desde/fecha_hasta como JSON. Se mantiene
+    JSON como primera opción y se usa form-data únicamente como fallback.
+    No se registran payloads, tokens ni datos personales.
     """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
 
-    def _one(*, as_json: bool):
+    for mode in ("json", "form"):
         try:
             resp = safe_request(
                 "POST",
                 url,
-                data=None if as_json else body,
-                json_body=body if as_json else None,
+                json_body=body if mode == "json" else None,
+                data=body if mode == "form" else None,
                 timeout=(5, 60),
             )
             if resp is None:
-                return None
+                continue
             resp.raise_for_status()
-
-            # Respuesta normal CRECE: cadena cifrada.
             parsed = _try_parse_encrypted_response(resp)
-            if parsed is not None:
+            if isinstance(parsed, (list, dict)):
                 return parsed
-
-            # Compatibilidad defensiva: algunos proxies pueden devolver JSON ya
-            # materializado. Solo aceptamos list/dict; nunca exponemos el cuerpo.
-            try:
-                direct = resp.json()
-            except Exception:
-                direct = None
-            if isinstance(direct, (list, dict)):
-                return direct
-            return None
         except Exception as exc:
             _safe_fail(exc)
-            return None
+            continue
+    return None
 
-    parsed = _one(as_json=False)
-    if parsed is not None:
-        return parsed
-    return _one(as_json=True)
+
+def api_informe_turnos(fecha_desde: str, fecha_hasta: str, empleado_ids=None):
+    """Fallback oficial para jornada diaria.
+
+    /informes/turnos devuelve Fecha + Número de empleado + Horario duración
+    computada. Se consulta una sola vez para todo el rango, evitando depender de
+    una petición pesada de /informes/empleados por cada fecha.
+    """
+    url = f"{API_URL_BASE}/informes/turnos"
+
+    def _payload():
+        p = [("fecha_desde", fecha_desde), ("fecha_hasta", fecha_hasta)]
+        for eid in empleado_ids or []:
+            s = _text(eid)
+            if s:
+                p.append(("empleados[]", s))
+        return p
+
+    # El manual describe parámetros POST; probamos form primero y JSON después.
+    for mode in ("form", "json"):
+        try:
+            if mode == "form":
+                resp = safe_request("POST", url, data=_payload(), timeout=(5, 60))
+            else:
+                body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+                ids = [str(x).strip() for x in (empleado_ids or []) if str(x).strip()]
+                if ids:
+                    body["empleados"] = ids
+                resp = safe_request("POST", url, json_body=body, timeout=(5, 60))
+            if resp is None:
+                continue
+            resp.raise_for_status()
+            parsed = _try_parse_encrypted_response(resp)
+            if isinstance(parsed, (list, dict)):
+                return parsed
+        except Exception as exc:
+            _safe_fail(exc)
+            continue
+    return None
+
+
+def _extract_turnos_rows(rep):
+    """Normaliza /informes/turnos a dicts mínimos.
+
+    Orden documentado: Turno ID, Empleado ID, Número de empleado, Nombre, Fecha,
+    Horario ID, Abreviatura, Color, Duración computada, Horario texto.
+    """
+    if rep is None:
+        return []
+    raw = rep
+    if isinstance(rep, dict):
+        for key in ("data", "turnos", "results", "resultado", "items"):
+            if isinstance(rep.get(key), list):
+                raw = rep[key]
+                break
+        else:
+            vals = list(rep.values())
+            raw = vals if vals and all(isinstance(v, (dict, list, tuple)) for v in vals) else []
+    if not isinstance(raw, list):
+        return []
+
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            found_num, num = _row_get_alias(item, [
+                "Número de empleado", "Numero de empleado", "Nº empleado",
+                "num_empleado", "numEmpleado", "employee_number"
+            ])
+            found_date, fecha = _row_get_alias(item, ["Fecha", "fecha", "date"])
+            found_dur, dur = _row_get_alias(item, [
+                "Horario duración computada", "Horario duracion computada",
+                "duracion_computada", "duracionComputada", "horario_duracion_computada"
+            ])
+            found_eid, eid = _row_get_alias(item, ["Empleado ID", "empleado_id", "empleadoId", "employee_id"])
+            if found_num or found_date or found_dur:
+                out.append({
+                    "num_empleado": num if found_num else None,
+                    "fecha": fecha if found_date else None,
+                    "duracion": dur if found_dur else None,
+                    "empleado_id": eid if found_eid else None,
+                })
+        elif isinstance(item, (list, tuple)) and len(item) >= 9:
+            out.append({
+                "empleado_id": item[1] if len(item) > 1 else None,
+                "num_empleado": item[2] if len(item) > 2 else None,
+                "fecha": item[4] if len(item) > 4 else None,
+                "duracion": item[8] if len(item) > 8 else None,
+            })
+    return out
+
+
+def _turnos_horas_programadas_map(d0: date, d1: date, base_emp: pd.DataFrame) -> dict:
+    """Obtiene jornada diaria desde /informes/turnos como fallback.
+
+    Solo materializa filas explícitas del informe; la ausencia de turno NO se
+    convierte automáticamente en 0, para evitar falsos días no laborables.
+    """
+    if base_emp is None or base_emp.empty:
+        return {}
+
+    be = base_emp.copy()
+    if "num_empleado" not in be.columns:
+        be["num_empleado"] = ""
+    if "empleado_id" not in be.columns:
+        be["empleado_id"] = ""
+    be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
+    be["num_code"] = be["num_empleado"].apply(_canonical_emp_code)
+    by_num = {
+        _text(r.get("num_code")): _text(r.get("nif")).upper()
+        for _, r in be.iterrows() if _text(r.get("num_code")) and _text(r.get("nif"))
+    }
+    by_eid = {
+        _canonical_emp_code(r.get("empleado_id")): _text(r.get("nif")).upper()
+        for _, r in be.iterrows() if _text(r.get("empleado_id")) and _text(r.get("nif"))
+    }
+    ids = [_text(x) for x in be["empleado_id"].tolist() if _text(x)]
+
+    rep = api_informe_turnos(d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"), ids)
+    # Algunas instalaciones pueden rechazar el filtro de empleados; reintento sin él.
+    if rep is None and ids:
+        rep = api_informe_turnos(d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d"), None)
+    if rep is None:
+        return {}
+
+    out = {}
+    for row in _extract_turnos_rows(rep):
+        nif = ""
+        num = _canonical_emp_code(row.get("num_empleado"))
+        if num:
+            nif = by_num.get(num, "")
+        if not nif:
+            eid = _canonical_emp_code(row.get("empleado_id"))
+            if eid:
+                nif = by_eid.get(eid, "")
+        if not nif:
+            continue
+
+        try:
+            dt = pd.to_datetime(row.get("fecha"), errors="coerce")
+            if pd.isna(dt):
+                continue
+            day = dt.date().strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        mins = _duration_value_to_minutes(row.get("duracion"))
+        if mins is None:
+            continue
+        out[(nif, day)] = max(0, int(mins))
+    return out
 
 
 # ============================================================
@@ -1576,21 +1709,20 @@ def build_informe_diario_maps(
     d0: date,
     d1: date,
     base_emp: pd.DataFrame,
-) -> tuple[dict, dict]:
-    """Devuelve (horas_programadas_map, horas_baja_map) por (NIF, fecha).
+) -> tuple[dict, dict, list[str]]:
+    """Devuelve (horas_programadas_map, horas_baja_map, dias_informe_fallidos).
 
-    Estrategia robusta:
-      1) una consulta por día, con caché individual y máximo 2 workers;
-      2) reintento secuencial de días fallidos;
-      3) si un día aislado sigue fallando, se recupera mediante un informe de
-         dos días y resta del día vecino ya conocido (las métricas del manual
-         son acumulativas "en el periodo").
+    Prioridad:
+      1) /informes/empleados día a día (fuente exacta de Horas programadas y Bajas);
+      2) si algún día falla, /informes/turnos rellena únicamente Horas programadas
+         mediante la duración computada explícita del turno.
 
-    Nunca convierte un dato ausente en 0; solo un 0 explícito de CRECE se usa
-    como jornada no laborable.
+    Un fallo puntual del informe ya NO bloquea Fichajes, Sin fichajes ni Excesos.
+    Donde no haya jornada fiable, las reglas dependientes de jornada se omiten y
+    Excesos omite esa persona/semana, evitando falsos positivos.
     """
     if base_emp is None or base_emp.empty:
-        return {}, {}
+        return {}, {}, []
 
     be = base_emp.copy()
     be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
@@ -1598,7 +1730,6 @@ def build_informe_diario_maps(
         be["num_empleado"] = ""
     be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
 
-    # Mapa pseudónimo -> NIF solo en memoria de esta ejecución (no cacheado).
     emp_hash_to_nif: dict[str, str] = {}
     for _, row in be.iterrows():
         code = _text(row.get("num_empleado_code"))
@@ -1607,78 +1738,35 @@ def build_informe_diario_maps(
             emp_hash_to_nif[_hash_emp_code(code)] = nif
 
     if not emp_hash_to_nif:
-        return {}, {}
+        return {}, {}, []
 
-    day_dates = list(_iter_days(d0, d1))
-    day_isos = [d.strftime("%Y-%m-%d") for d in day_dates]
-    if not day_isos:
-        return {}, {}
-
+    day_isos = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
     metrics_by_day: dict[str, dict] = {}
     failed_days: list[str] = []
 
-    # Concurrencia baja deliberadamente: /informes/empleados es un endpoint
-    # pesado y CRECE puede limitar solicitudes simultáneas.
-    workers = min(2, len(day_isos))
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as exe:
-        futs = {exe.submit(_cached_informe_one_day_metrics, day): day for day in day_isos}
-        for fut in as_completed(futs):
-            day = futs[fut]
+    # Este endpoint es pesado y no admite filtro de empleados. Para estabilidad
+    # lo consultamos secuencialmente; la caché por fecha evita repetir trabajo.
+    for day in day_isos:
+        metrics = None
+        try:
+            metrics = _cached_informe_one_day_metrics(day)
+        except Exception as exc:
+            _safe_fail(exc)
+
+        # Reintento directo histórico (JSON-first) para evitar que una entrada
+        # de caché/proxy puntual invalide el día.
+        if metrics is None:
             try:
-                metrics_by_day[day] = fut.result()
+                rep = api_informe_empleados(day, day)
+                if rep is not None:
+                    metrics = _metrics_from_informe_payload(rep)
             except Exception as exc:
                 _safe_fail(exc)
-                failed_days.append(day)
 
-    # Reintento secuencial para evitar 429/timeout por concurrencia.
-    unresolved: list[str] = []
-    for day in sorted(set(failed_days)):
-        ok = False
-        for attempt in range(3):
-            if attempt:
-                time.sleep(1.0 * attempt)
-            try:
-                metrics_by_day[day] = _cached_informe_one_day_metrics(day)
-                ok = True
-                break
-            except Exception as exc:
-                _safe_fail(exc)
-        if not ok:
-            unresolved.append(day)
-
-    # Fallback exacto por diferencia de periodo de dos días. El manual define
-    # Horas programadas y Horas de baja como magnitudes del periodo, por lo que
-    # son aditivas y se puede recuperar el día fallido sin inventar datos.
-    still_unresolved: list[str] = []
-    day_pos = {day: i for i, day in enumerate(day_isos)}
-    for day in unresolved:
-        i = day_pos[day]
-        recovered = None
-
-        # Preferimos vecino anterior ya conocido.
-        if i > 0:
-            prev_day = day_isos[i - 1]
-            if prev_day in metrics_by_day:
-                total = _informe_range_metrics(prev_day, day)
-                if total is not None:
-                    recovered = _subtract_metrics(total, metrics_by_day[prev_day])
-
-        # Si no, usamos vecino siguiente conocido.
-        if recovered is None and i + 1 < len(day_isos):
-            next_day = day_isos[i + 1]
-            if next_day in metrics_by_day:
-                total = _informe_range_metrics(day, next_day)
-                if total is not None:
-                    recovered = _subtract_metrics(total, metrics_by_day[next_day])
-
-        if recovered is None:
-            still_unresolved.append(day)
+        if metrics is None:
+            failed_days.append(day)
         else:
-            metrics_by_day[day] = recovered
-
-    if still_unresolved:
-        # No mostramos datos parciales como si fueran completos.
-        raise RuntimeError("Consulta incompleta del informe de empleados")
+            metrics_by_day[day] = metrics
 
     hp_out: dict[tuple[str, str], int] = {}
     baja_out: dict[tuple[str, str], int] = {}
@@ -1693,7 +1781,20 @@ def build_informe_diario_maps(
             if nif:
                 baja_out[(nif, day)] = int(mins)
 
-    return hp_out, baja_out
+    # Fallback de jornada diario: una sola llamada al informe de turnos para todo
+    # el rango. Solo rellena valores explícitos; nunca inventa ceros.
+    if failed_days:
+        try:
+            turnos_hp = _turnos_horas_programadas_map(d0, d1, be)
+        except Exception as exc:
+            _safe_fail(exc)
+            turnos_hp = {}
+        failed_set = set(failed_days)
+        for (nif, day), mins in turnos_hp.items():
+            if day in failed_set and (nif, day) not in hp_out:
+                hp_out[(nif, day)] = int(mins)
+
+    return hp_out, baja_out, sorted(set(failed_days))
 
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
@@ -2012,11 +2113,22 @@ if consultar:
         # Regla de negocio: horas_programadas y tiempoContabilizado se consultan siempre,
         # haya o no fichajes. El mismo dato alimenta Fichajes, Bajas, Sin fichajes y Exceso.
         try:
-            horas_prog_map_query, bajas_min_map_query = build_informe_diario_maps(d0, d1, base_emp)
+            horas_prog_map_query, bajas_min_map_query, informe_missing_days = build_informe_diario_maps(d0, d1, base_emp)
         except Exception as _e:
             _safe_fail(_e)
-            st.error("No se ha podido completar el informe diario de CRECE. Reintenta la consulta para evitar resultados parciales.")
-            st.stop()
+            # El informe de empleados es auxiliar para varias validaciones. No
+            # bloqueamos toda la app: sin datos fiables, esas reglas se omiten.
+            horas_prog_map_query, bajas_min_map_query, informe_missing_days = {}, {}, [
+                d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)
+            ]
+
+        if informe_missing_days:
+            st.warning(
+                "CRECE no ha devuelto el informe de empleados para "
+                + ", ".join(informe_missing_days)
+                + ". La consulta continúa sin inventar datos: en esas fechas se omiten "
+                  "las validaciones que no puedan reconstruirse de forma fiable."
+            )
 
         nifs_tc = base_emp["nif"].dropna().astype(str).str.upper().str.strip()
         nifs_tc = [n for n in nifs_tc.unique().tolist() if n]
