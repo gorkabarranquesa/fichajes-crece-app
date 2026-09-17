@@ -78,7 +78,7 @@ MARGEN_HORARIO_MIN = 5
 
 USER_AGENT = "RRHH-Fichajes-Crece/1.0 (Streamlit)"
 
-RETRY_STATUS = {429, 502, 503, 504}
+RETRY_STATUS = {429, 500, 502, 503, 504}
 MAX_RETRIES = 4
 BACKOFF_BASE_SECONDS = 0.6
 BACKOFF_MAX_SECONDS = 6.0
@@ -1111,24 +1111,54 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """Consulta /informes/empleados con un timeout algo mayor.
+    """Consulta /informes/empleados de forma compatible y robusta.
 
-    Este endpoint puede tardar más que los catálogos/exportaciones, especialmente
-    cuando se lanzan varias fechas seguidas. Un fallo puntual devuelve None y el
-    builder diario se encarga de reintentar de forma secuencial antes de abortar.
+    El manual documenta fecha_desde/fecha_hasta como parámetros POST. La forma
+    principal se envía como application/x-www-form-urlencoded (data=...), igual
+    que el resto de endpoints de CRECE. Se mantiene un fallback JSON únicamente
+    por compatibilidad con instalaciones/proxies que lo acepten así.
+
+    Devuelve el payload descifrado (lista/dict) o None si ambas variantes fallan.
+    Nunca registra payloads, NIFs ni tokens.
     """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-    try:
-        resp = safe_request("POST", url, json_body=body, timeout=(5, 45))
-        if resp is None:
+
+    def _one(*, as_json: bool):
+        try:
+            resp = safe_request(
+                "POST",
+                url,
+                data=None if as_json else body,
+                json_body=body if as_json else None,
+                timeout=(5, 60),
+            )
+            if resp is None:
+                return None
+            resp.raise_for_status()
+
+            # Respuesta normal CRECE: cadena cifrada.
+            parsed = _try_parse_encrypted_response(resp)
+            if parsed is not None:
+                return parsed
+
+            # Compatibilidad defensiva: algunos proxies pueden devolver JSON ya
+            # materializado. Solo aceptamos list/dict; nunca exponemos el cuerpo.
+            try:
+                direct = resp.json()
+            except Exception:
+                direct = None
+            if isinstance(direct, (list, dict)):
+                return direct
             return None
-        resp.raise_for_status()
-        parsed = _try_parse_encrypted_response(resp)
-        return parsed if parsed is not None else None
-    except Exception as e:
-        _safe_fail(e)
-        return None
+        except Exception as exc:
+            _safe_fail(exc)
+            return None
+
+    parsed = _one(as_json=False)
+    if parsed is not None:
+        return parsed
+    return _one(as_json=True)
 
 
 # ============================================================
@@ -1237,24 +1267,70 @@ def _duration_value_to_minutes(value):
     return int(round(num / 60.0))
 
 
+# Posiciones documentadas por CRECE para /informes/empleados (v3.1+).
+# Solo materializamos los campos que utiliza esta app. El API puede devolver
+# filas como objetos con nombre de campo o como arrays posicionales.
+_INFORME_EMP_IDX_NUM = 0
+_INFORME_EMP_IDX_HORAS_PROGRAMADAS = 25
+_INFORME_EMP_IDX_HORAS_BAJA = 33
+
+
+def _normalize_informe_employee_row(item):
+    if isinstance(item, dict):
+        return item
+    if isinstance(item, (list, tuple)):
+        row = {}
+        if len(item) > _INFORME_EMP_IDX_NUM:
+            row["Nº empleado"] = item[_INFORME_EMP_IDX_NUM]
+        if len(item) > _INFORME_EMP_IDX_HORAS_PROGRAMADAS:
+            row["Horas programadas"] = item[_INFORME_EMP_IDX_HORAS_PROGRAMADAS]
+        if len(item) > _INFORME_EMP_IDX_HORAS_BAJA:
+            row["Horas de baja laboral (laborables, no naturales)"] = item[_INFORME_EMP_IDX_HORAS_BAJA]
+        return row if row else None
+    return None
+
+
 def _extract_rows_from_informe(rep):
+    """Extrae filas del informe soportando objetos y arrays posicionales.
+
+    El manual de CRECE describe el resultado como un array por empleado. Algunas
+    instalaciones devuelven objetos con etiquetas; otras, arrays en el orden
+    documentado. Ambas variantes son válidas aquí.
+    """
     if rep is None:
         return []
 
-    if isinstance(rep, list):
-        return [r for r in rep if isinstance(r, dict)]
+    raw_rows = None
 
-    if isinstance(rep, dict):
+    if isinstance(rep, list):
+        raw_rows = rep
+    elif isinstance(rep, dict):
+        # Wrapper habitual.
         for k in ["data", "empleados", "results", "resultado", "items"]:
             v = rep.get(k)
             if isinstance(v, list):
-                return [r for r in v if isinstance(r, dict)]
+                raw_rows = v
+                break
 
-        vals = list(rep.values())
-        if vals and all(isinstance(v, dict) for v in vals):
-            return vals
+        if raw_rows is None:
+            # Un único objeto fila.
+            if _get_employee_number_from_row(rep):
+                raw_rows = [rep]
+            else:
+                # Objeto asociativo: clave -> fila (dict o array posicional).
+                vals = list(rep.values())
+                if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
+                    raw_rows = vals
 
-    return []
+    if not isinstance(raw_rows, list):
+        return []
+
+    out = []
+    for item in raw_rows:
+        row = _normalize_informe_employee_row(item)
+        if isinstance(row, dict):
+            out.append(row)
+    return out
 
 
 def _get_horas_baja_from_row(row: dict) -> float:
@@ -1427,110 +1503,73 @@ def _get_horas_programadas_minutes_from_row(row: dict):
 
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def _cached_informe_diario_maps(
-    d0_iso: str,
-    d1_iso: str,
-    nifs_fingerprint: str,
-    numhash_to_nifhash_items: tuple[tuple[str, str], ...],
-    allowed_nif_hashes: tuple[str, ...],
-) -> dict:
-    """Construye horas programadas y bajas por día con tolerancia a fallos transitorios.
+def _metrics_from_informe_payload(rep) -> dict:
+    """Convierte un informe CRECE a métricas pseudonimizadas por Nº empleado.
 
-    Para rangos largos CRECE puede responder con 429/timeout en alguna fecha si
-    lanzamos demasiadas consultas simultáneas. Hacemos una primera pasada con
-    concurrencia moderada y reintentamos secuencialmente solo las fechas fallidas.
-    Nunca devolvemos un mapa parcial: si una fecha sigue fallando, se aborta.
+    Retorna hashes HMAC de Nº empleado -> minutos. No conserva nombres, NIFs ni
+    payloads en caché.
     """
-    try:
-        d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
-        d1 = datetime.strptime(d1_iso, "%Y-%m-%d").date()
-    except Exception:
-        return {"hp": {}, "baja": {}}
+    hp_by_emp: dict[str, int] = {}
+    baja_by_emp: dict[str, int] = {}
 
-    map_numhash_to_nifhash = {k: v for k, v in (numhash_to_nifhash_items or ()) if k and v}
-    allowed_hashes = set(allowed_nif_hashes or ())
-    if not allowed_hashes:
-        return {"hp": {}, "baja": {}}
+    rows = _extract_rows_from_informe(rep)
+    for row in rows:
+        code = _get_employee_number_from_row(row)
+        if not code:
+            continue
+        he = _hash_emp_code(code)
+        if not he:
+            continue
 
-    days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
-    if not days:
-        return {"hp": {}, "baja": {}}
+        found_hp, hp_mins = _get_horas_programadas_minutes_from_row(row)
+        if found_hp and hp_mins is not None:
+            hp_by_emp[he] = max(0, int(hp_mins))
 
-    hp_out: dict[tuple[str, str], int] = {}
-    baja_out: dict[tuple[str, str], int] = {}
+        baja_h = _get_horas_baja_from_row(row)
+        if baja_h > 0:
+            baja_by_emp[he] = max(0, int(round(float(baja_h) * 60.0)))
 
-    def _fetch_day(day: str):
-        rep = api_informe_empleados(day, day)
-        if rep is None:
-            raise RuntimeError("Fallo en informe de empleados")
-        return day, _extract_rows_from_informe(rep)
+    return {"hp": hp_by_emp, "baja": baja_by_emp}
 
-    def _consume(day: str, rows):
-        for r in rows or []:
-            if not isinstance(r, dict):
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _cached_informe_one_day_metrics(day_iso: str) -> dict:
+    """Métricas de un día, cacheadas sin PII.
+
+    La clave de caché solo contiene la fecha. Los valores usan HMAC del número de
+    empleado + minutos, por lo que no quedan NIFs/nombres en la caché global.
+    """
+    rep = api_informe_empleados(day_iso, day_iso)
+    if rep is None:
+        raise RuntimeError("Fallo en informe de empleados")
+    return _metrics_from_informe_payload(rep)
+
+
+def _informe_range_metrics(d0_iso: str, d1_iso: str) -> dict | None:
+    """Consulta agregada para recuperar un día mediante diferencia si hiciera falta."""
+    rep = api_informe_empleados(d0_iso, d1_iso)
+    if rep is None:
+        return None
+    return _metrics_from_informe_payload(rep)
+
+
+def _subtract_metrics(total: dict, known: dict) -> dict:
+    """Resta métricas agregadas: total(periodo 2 días) - día conocido."""
+    out = {"hp": {}, "baja": {}}
+    for key in ("hp", "baja"):
+        total_map = (total or {}).get(key, {}) or {}
+        known_map = (known or {}).get(key, {}) or {}
+        for he in set(total_map) | set(known_map):
+            # Si no aparece en ninguno, permanece desconocido. Si aparece en uno,
+            # la ausencia del otro equivale a 0 dentro del periodo agregado.
+            if he not in total_map and he not in known_map:
                 continue
-
-            found_nif, nif_value = _row_get_alias(r, ["nif", "NIF", "dni", "DNI"])
-            hn = ""
-            if found_nif and _text(nif_value):
-                candidate = _hash_nif(_text(nif_value).upper())
-                if candidate in allowed_hashes:
-                    hn = candidate
-
-            if not hn:
-                num = _get_employee_number_from_row(r)
-                if num:
-                    hn = map_numhash_to_nifhash.get(_hash_emp_code(num), "")
-
-            if not hn:
-                continue
-
-            found_hp, hp_mins = _get_horas_programadas_minutes_from_row(r)
-            if found_hp and hp_mins is not None:
-                hp_out[(hn, day)] = max(0, int(hp_mins))
-
-            baja_h = _get_horas_baja_from_row(r)
-            if baja_h > 0:
-                baja_out[(hn, day)] = max(0, int(round(float(baja_h) * 60.0)))
-
-    # /informes/empleados es más pesado que los catálogos. 3 workers es un
-    # compromiso mejor para rangos de varias semanas que los 8 anteriores.
-    workers = max(1, min(3, len(days)))
-    failed_days: list[str] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        futs = {exe.submit(_fetch_day, day): day for day in days}
-        for fut in as_completed(futs):
-            day = futs[fut]
-            try:
-                day_r, rows = fut.result()
-                _consume(day_r, rows)
-            except Exception as exc:
-                _safe_fail(exc)
-                failed_days.append(day)
-
-    unresolved: list[str] = []
-    for day in sorted(set(failed_days)):
-        ok = False
-        for attempt in range(3):
-            if attempt:
-                time.sleep(0.75 * attempt)
-            try:
-                day_r, rows = _fetch_day(day)
-                _consume(day_r, rows)
-                ok = True
-                break
-            except Exception as exc:
-                _safe_fail(exc)
-        if not ok:
-            unresolved.append(day)
-
-    if unresolved:
-        # No incluimos payloads, NIFs ni respuestas en el error.
-        raise RuntimeError("Consulta incompleta del informe de empleados")
-
-    return {"hp": hp_out, "baja": baja_out}
+            val = int(total_map.get(he, 0) or 0) - int(known_map.get(he, 0) or 0)
+            # Las métricas son aditivas y no pueden ser negativas. Un negativo
+            # indica respuesta incoherente, por lo que no se usa ese valor.
+            if val >= 0:
+                out[key][he] = val
+    return out
 
 
 def build_informe_diario_maps(
@@ -1538,7 +1577,18 @@ def build_informe_diario_maps(
     d1: date,
     base_emp: pd.DataFrame,
 ) -> tuple[dict, dict]:
-    """Devuelve (horas_programadas_map, horas_baja_map) con claves (NIF, fecha)."""
+    """Devuelve (horas_programadas_map, horas_baja_map) por (NIF, fecha).
+
+    Estrategia robusta:
+      1) una consulta por día, con caché individual y máximo 2 workers;
+      2) reintento secuencial de días fallidos;
+      3) si un día aislado sigue fallando, se recupera mediante un informe de
+         dos días y resta del día vecino ya conocido (las métricas del manual
+         son acumulativas "en el periodo").
+
+    Nunca convierte un dato ausente en 0; solo un 0 explícito de CRECE se usa
+    como jornada no laborable.
+    """
     if base_emp is None or base_emp.empty:
         return {}, {}
 
@@ -1548,40 +1598,100 @@ def build_informe_diario_maps(
         be["num_empleado"] = ""
     be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
 
-    nifs_norm = tuple(sorted({x for x in be["nif"].tolist() if x}))
-    if not nifs_norm:
-        return {}, {}
-
-    fp = _fingerprint_nifs(nifs_norm)
-    numhash_to_nifhash = {}
+    # Mapa pseudónimo -> NIF solo en memoria de esta ejecución (no cacheado).
+    emp_hash_to_nif: dict[str, str] = {}
     for _, row in be.iterrows():
         code = _text(row.get("num_empleado_code"))
         nif = _text(row.get("nif")).upper()
         if code and nif:
-            numhash_to_nifhash[_hash_emp_code(code)] = _hash_nif(nif)
+            emp_hash_to_nif[_hash_emp_code(code)] = nif
 
-    allowed_nif_hashes = tuple(sorted({_hash_nif(n) for n in nifs_norm}))
-    cached = _cached_informe_diario_maps(
-        d0.strftime("%Y-%m-%d"),
-        d1.strftime("%Y-%m-%d"),
-        fp,
-        tuple(sorted(numhash_to_nifhash.items())),
-        allowed_nif_hashes,
-    )
+    if not emp_hash_to_nif:
+        return {}, {}
 
-    hash_to_nif = {_hash_nif(n): n for n in nifs_norm}
+    day_dates = list(_iter_days(d0, d1))
+    day_isos = [d.strftime("%Y-%m-%d") for d in day_dates]
+    if not day_isos:
+        return {}, {}
+
+    metrics_by_day: dict[str, dict] = {}
+    failed_days: list[str] = []
+
+    # Concurrencia baja deliberadamente: /informes/empleados es un endpoint
+    # pesado y CRECE puede limitar solicitudes simultáneas.
+    workers = min(2, len(day_isos))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as exe:
+        futs = {exe.submit(_cached_informe_one_day_metrics, day): day for day in day_isos}
+        for fut in as_completed(futs):
+            day = futs[fut]
+            try:
+                metrics_by_day[day] = fut.result()
+            except Exception as exc:
+                _safe_fail(exc)
+                failed_days.append(day)
+
+    # Reintento secuencial para evitar 429/timeout por concurrencia.
+    unresolved: list[str] = []
+    for day in sorted(set(failed_days)):
+        ok = False
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1.0 * attempt)
+            try:
+                metrics_by_day[day] = _cached_informe_one_day_metrics(day)
+                ok = True
+                break
+            except Exception as exc:
+                _safe_fail(exc)
+        if not ok:
+            unresolved.append(day)
+
+    # Fallback exacto por diferencia de periodo de dos días. El manual define
+    # Horas programadas y Horas de baja como magnitudes del periodo, por lo que
+    # son aditivas y se puede recuperar el día fallido sin inventar datos.
+    still_unresolved: list[str] = []
+    day_pos = {day: i for i, day in enumerate(day_isos)}
+    for day in unresolved:
+        i = day_pos[day]
+        recovered = None
+
+        # Preferimos vecino anterior ya conocido.
+        if i > 0:
+            prev_day = day_isos[i - 1]
+            if prev_day in metrics_by_day:
+                total = _informe_range_metrics(prev_day, day)
+                if total is not None:
+                    recovered = _subtract_metrics(total, metrics_by_day[prev_day])
+
+        # Si no, usamos vecino siguiente conocido.
+        if recovered is None and i + 1 < len(day_isos):
+            next_day = day_isos[i + 1]
+            if next_day in metrics_by_day:
+                total = _informe_range_metrics(day, next_day)
+                if total is not None:
+                    recovered = _subtract_metrics(total, metrics_by_day[next_day])
+
+        if recovered is None:
+            still_unresolved.append(day)
+        else:
+            metrics_by_day[day] = recovered
+
+    if still_unresolved:
+        # No mostramos datos parciales como si fueran completos.
+        raise RuntimeError("Consulta incompleta del informe de empleados")
 
     hp_out: dict[tuple[str, str], int] = {}
-    for (hn, day), mins in (cached.get("hp", {}) or {}).items():
-        nif = hash_to_nif.get(hn)
-        if nif:
-            hp_out[(nif, day)] = int(mins)
-
     baja_out: dict[tuple[str, str], int] = {}
-    for (hn, day), mins in (cached.get("baja", {}) or {}).items():
-        nif = hash_to_nif.get(hn)
-        if nif:
-            baja_out[(nif, day)] = int(mins)
+
+    for day, metrics in metrics_by_day.items():
+        for he, mins in ((metrics or {}).get("hp", {}) or {}).items():
+            nif = emp_hash_to_nif.get(he)
+            if nif:
+                hp_out[(nif, day)] = int(mins)
+        for he, mins in ((metrics or {}).get("baja", {}) or {}).items():
+            nif = emp_hash_to_nif.get(he)
+            if nif:
+                baja_out[(nif, day)] = int(mins)
 
     return hp_out, baja_out
 
