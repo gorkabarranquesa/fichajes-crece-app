@@ -24,9 +24,8 @@ API_URL_BASE = "https://sincronizaciones.crecepersonas.es/api"
 API_TOKEN = st.secrets["API_TOKEN"]
 APP_KEY_B64 = st.secrets["APP_KEY_B64"]
 
-# ---- Hardened cache: avoid storing NIFs in cache keys/values ----
+# ---- Hardened cache: no NIF en claro en claves/valores persistidos ----
 def _cache_hmac(value: str, context: str) -> str:
-    """Hash determinista con clave para pseudonimizar identificadores en caché."""
     try:
         key = base64.b64decode(APP_KEY_B64)
     except Exception:
@@ -36,31 +35,29 @@ def _cache_hmac(value: str, context: str) -> str:
 
 
 def _hash_nif(nif: str) -> str:
-    """Pseudonimiza NIF para claves/valores de caché sin dejarlo en claro."""
     return _cache_hmac((nif or "").upper().strip(), "NIF")
 
 
 def _hash_emp_code(code: str) -> str:
-    """Pseudonimiza el número de empleado para claves internas de caché."""
-    return _cache_hmac(_canonical_emp_code(code), "EMP") if str(code or '').strip() else ""
+    return _cache_hmac(_canonical_emp_code(code), "EMP") if str(code or "").strip() else ""
 
 
 def _fingerprint_nifs(nifs: tuple[str, ...]) -> str:
-    """Fingerprint estable y con clave del conjunto de NIFs."""
     joined = "|".join(sorted(nifs))
     return _cache_hmac(joined, "NIFSET")
 
 CPU = multiprocessing.cpu_count()
+MAX_WORKERS = max(8, min(24, CPU * 3))
 HTTP_TIMEOUT = (5, 25)  # (connect, read)
 
 def _max_workers_days(n_days: int) -> int:
-    # Límite conservador para llamadas por día (evita 429 y saturación)
-    n = int(n_days or 0)
-    if n <= 7:
-        return min(8, max(4, n))
-    if n <= 21:
-        return 8
-    return 6
+    # Endpoint diarios de CRECE: concurrencia deliberadamente conservadora.
+    n = max(1, int(n_days or 0))
+    if n <= 4:
+        return n
+    if n <= 31:
+        return 4
+    return 3
 
 def _max_workers_emps(n_emps: int) -> int:
     # Límite conservador para llamadas por empleado
@@ -86,7 +83,7 @@ BACKOFF_MAX_SECONDS = 6.0
 _SESSION_LOCAL = threading.local()
 
 def _get_http_session() -> requests.Session:
-    """Session HTTP por hilo: conserva pooling sin compartir Session entre workers."""
+    """Una Session por hilo: pooling sin compartir estado entre workers."""
     sess = getattr(_SESSION_LOCAL, "session", None)
     if sess is None:
         sess = requests.Session()
@@ -100,12 +97,10 @@ def _get_http_session() -> requests.Session:
         _SESSION_LOCAL.session = sess
     return sess
 
-# ============================================================
-# SIN FICHAJES
-# ============================================================
-# No hay exclusiones nominales hardcodeadas. La pestaña usa empleados activos
-# según la información disponible en CRECE.
 
+# ============================================================
+# SIN FICHAJES: sin exclusiones nominales hardcodeadas
+# ============================================================
 
 def _safe_fail(_exc: Exception) -> None:
     return None
@@ -157,21 +152,9 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
 # NORMALIZACIÓN
 # ============================================================
 
-def _text(value) -> str:
-    """Texto seguro para datos API/DataFrame: None/NaN -> cadena vacía."""
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
-
-
 def norm_name(s: str) -> str:
-    """Normaliza nombres para reglas personales sin depender de tildes/mayúsculas."""
-    raw = unicodedata.normalize("NFKD", _text(s))
+    """Normaliza nombres ignorando tildes, mayúsculas y espacios."""
+    raw = unicodedata.normalize("NFKD", str(s or "").strip())
     raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
     return " ".join(raw.upper().split())
 
@@ -181,10 +164,9 @@ def name_startswith(nombre_norm: str, prefix_norm: str) -> bool:
 
 
 def _norm_key(s: str) -> str:
-    raw = unicodedata.normalize("NFKD", _text(s))
+    raw = unicodedata.normalize("NFKD", str(s or "").strip())
     raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
     return " ".join(raw.upper().split())
-
 
 
 def _sede_code(sede: str) -> str:
@@ -289,6 +271,33 @@ def quantize_daily_balance_30(diff_mins: int, tol: int = 5) -> int:
 
 
 
+def effective_worked_minutes_for_mod(mins_tc: int, primera_min: int | None) -> int:
+    """Para MOD: en día laborable (horas_programadas>0), NO cuenta el tiempo antes del inicio de turno.
+    Heurística:
+      - Primera entrada < 12:00  -> turno mañana empieza 06:00
+      - Primera entrada >= 12:00 -> turno tarde empieza 14:00
+    Si primera_entrada < inicio_turno: restamos (inicio_turno - primera_entrada) del total contabilizado.
+    """
+    try:
+        total = int(mins_tc or 0)
+    except Exception:
+        total = 0
+    if total <= 0:
+        return 0
+    if primera_min is None:
+        return total
+    try:
+        pe = int(primera_min)
+    except Exception:
+        return total
+
+    shift_start = 6 * 60 if pe < (12 * 60) else 14 * 60
+    if pe >= shift_start:
+        return total
+    exclude = shift_start - pe
+    return max(0, total - exclude)
+
+
 def mins_to_hhmm_signed(mins: int) -> str:
     sign = "+" if mins >= 0 else "-"
     a = abs(int(mins))
@@ -336,12 +345,6 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
 
 
 def _try_parse_encrypted_response(resp: requests.Response):
-    """Parsea respuestas CRECE sin asumir una única representación HTTP.
-
-    CRECE documenta una cadena cifrada, pero algunos proxies/versiones pueden
-    materializar JSON antes de llegar aquí. Se aceptan ambos casos sin exponer
-    el contenido en logs/UI.
-    """
     if resp is None:
         return None
 
@@ -353,52 +356,34 @@ def _try_parse_encrypted_response(resp: requests.Response):
     except Exception:
         pass
 
-    if raw_text:
-        candidates.append(raw_text)
+    candidates.append(raw_text)
 
     for c in candidates:
         try:
-            # JSON ya materializado (respuesta plana o wrapper).
-            if isinstance(c, (list, dict)):
-                if isinstance(c, dict) and "iv" in c and "value" in c:
-                    payload_obj = {k: c[k] for k in ("iv", "value", "mac") if k in c}
-                    payload_b64 = base64.b64encode(
-                        json.dumps(payload_obj).encode("utf-8")
-                    ).decode("utf-8")
-                    dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                    return json.loads(dec)
-                return c
+            if isinstance(c, dict) and "iv" in c and "value" in c:
+                payload_obj = {"iv": c["iv"], "value": c["value"]}
+                payload_b64 = base64.b64encode(json.dumps(payload_obj).encode("utf-8")).decode("utf-8")
+                dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                return json.loads(dec)
 
-            if not isinstance(c, str):
-                continue
+            if isinstance(c, str):
+                s = c.strip().strip('"').strip()
 
-            s = c.strip().strip('"').strip()
-            if not s:
-                continue
+                if s.startswith("{") and s.endswith("}"):
+                    obj = json.loads(s)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        payload_b64 = base64.b64encode(json.dumps(obj).encode("utf-8")).decode("utf-8")
+                        dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
+                        return json.loads(dec)
 
-            # JSON textual: puede ser el sobre cifrado o el resultado ya descifrado.
-            if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-                obj = json.loads(s)
-                if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                    payload_b64 = base64.b64encode(
-                        json.dumps(obj).encode("utf-8")
-                    ).decode("utf-8")
-                    dec = decrypt_crece_payload(payload_b64, APP_KEY_B64)
-                    return json.loads(dec)
-                return obj
-
-            # Formato habitual: base64(JSON{iv,value,mac}).
-            try:
-                dec_json_raw = base64.b64decode(s).decode("utf-8")
-                obj = json.loads(dec_json_raw)
-                if isinstance(obj, dict) and "iv" in obj and "value" in obj:
-                    dec = decrypt_crece_payload(s, APP_KEY_B64)
-                    return json.loads(dec)
-                # Compatibilidad defensiva con respuestas base64 de JSON plano.
-                if isinstance(obj, (list, dict)):
-                    return obj
-            except Exception:
-                pass
+                try:
+                    dec_json_raw = base64.b64decode(s).decode("utf-8")
+                    obj = json.loads(dec_json_raw)
+                    if isinstance(obj, dict) and "iv" in obj and "value" in obj:
+                        dec = decrypt_crece_payload(s, APP_KEY_B64)
+                        return json.loads(dec)
+                except Exception:
+                    pass
 
         except Exception:
             continue
@@ -419,7 +404,7 @@ def _round_seconds_to_minute(seg: float) -> int:
         return 0
     if s < 0:
         s = 0.0
-    return int(s // 60) * 60
+    return int(round(s / 60.0)) * 60
 
 
 def segundos_a_hhmm(seg: float) -> str:
@@ -546,8 +531,7 @@ def _is_schedule_exempt(depto_norm: str, nombre_norm: str) -> bool:
 
 
 def _is_flex(depto_norm: str, nombre_norm: str, sede: str = "") -> bool:
-    # Regla RRHH: todos los empleados MOI de P1 LAKUNTZA tienen horario flexible
-    # para entrada/salida. Se mantienen horas y controles de fichajes.
+    # Regla RRHH: todos los empleados MOI de P1 LAKUNTZA tienen entrada/salida flexible.
     if depto_norm == "MOI" and _sede_code(sede) == "P1":
         return True
 
@@ -555,8 +539,6 @@ def _is_flex(depto_norm: str, nombre_norm: str, sede: str = "") -> bool:
         if name_startswith(nombre_norm, pref):
             return True
     return False
-
-
 
 
 def validar_horario(
@@ -569,7 +551,7 @@ def validar_horario(
     sede: str = "",
     empresa: str = "",
 ) -> list[str]:
-    depto_norm = _text(depto).upper()
+    depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
 
     if dia not in [0, 1, 2, 3, 4]:
@@ -578,8 +560,7 @@ def validar_horario(
     if _is_schedule_exempt(depto_norm, nombre_norm):
         return []
 
-    # Regla RRHH vigente: Barranquesa Tower Flanges está exenta únicamente
-    # de validación horaria de entrada/salida. Horas y nº de fichajes se validan.
+    # Tower Flanges: no validar entrada/salida, pero sí horas y nº de fichajes.
     if _norm_key(empresa) == BTF_EMPRESA_N:
         return []
 
@@ -623,14 +604,12 @@ def validar_horario(
         if not flex:
             ini, fin = 7 * 60, 9 * 60
 
-            # La jornada reducida/completa se decide por Horas programadas de CRECE,
-            # no por el día de la semana. Así verano, previos a festivo y jornadas
-            # especiales se comportan correctamente.
             try:
                 exp_m = int(expected_minutes) if expected_minutes is not None else None
             except Exception:
                 exp_m = None
 
+            # La jornada reducida/completa la determina CRECE mediante Horas programadas.
             salida_min = None
             if exp_m is not None and exp_m > 0:
                 salida_min = (13 * 60 + 30) if exp_m <= (6 * 60 + 35) else (16 * 60 + 30)
@@ -640,14 +619,11 @@ def validar_horario(
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
-            # No inventamos 13:30/16:30 si CRECE no ha devuelto Horas programadas.
             if salida_min is not None and s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
         return incid
 
     return incid
-
-
 
 
 # ============================================================
@@ -659,14 +635,15 @@ def api_exportar_departamentos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/departamentos"
     resp = safe_request("GET", url)
     if resp is None:
-        raise RuntimeError("No se pudo consultar el catálogo de departamentos")
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     try:
         resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError("No se pudo consultar el catálogo de departamentos") from exc
+    except Exception:
+        _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/departamentos"))
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     data = _try_parse_encrypted_response(resp)
     if not isinstance(data, list):
-        raise RuntimeError("Respuesta inválida al consultar el catálogo de departamentos")
+        return pd.DataFrame(columns=["departamento_id", "departamento_nombre"])
     return pd.DataFrame(
         [{"departamento_id": d.get("id"), "departamento_nombre": d.get("nombre")}
          for d in (data or [])]
@@ -678,14 +655,14 @@ def api_exportar_empresas() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empresas"
     resp = safe_request("GET", url)
     if resp is None:
-        raise RuntimeError("No se pudo consultar el catálogo de empresas")
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
     try:
         resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError("No se pudo consultar el catálogo de empresas") from exc
+    except Exception:
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
     data = _try_parse_encrypted_response(resp)
     if not isinstance(data, list):
-        raise RuntimeError("Respuesta inválida al consultar el catálogo de empresas")
+        return pd.DataFrame(columns=["empresa_id", "empresa_nombre"])
     return pd.DataFrame(
         [{"empresa_id": e.get("id"), "empresa_nombre": e.get("nombre")}
          for e in (data or [])]
@@ -694,38 +671,51 @@ def api_exportar_empresas() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_sedes() -> pd.DataFrame:
-    url = f"{API_URL_BASE}/exportacion/sedes"
-    resp = safe_request("GET", url)
-    if resp is None:
-        raise RuntimeError("No se pudo consultar el catálogo de sedes")
-    try:
-        resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError("No se pudo consultar el catálogo de sedes") from exc
+    url1 = f"{API_URL_BASE}/exportacion/sedes"
+    resp = safe_request("GET", url1)
+    if resp is not None and resp.status_code == 200:
+        data = _try_parse_encrypted_response(resp)
+        if isinstance(data, list):
+            return pd.DataFrame(
+                [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+                 for s in (data or [])]
+            )
 
-    data = _try_parse_encrypted_response(resp)
-    if not isinstance(data, list):
-        raise RuntimeError("Respuesta inválida al consultar el catálogo de sedes")
+    url2 = f"{API_URL_BASE}/exportacion/centros"
+    resp2 = safe_request("GET", url2)
+    if resp2 is None:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+    try:
+        resp2.raise_for_status()
+    except Exception:
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
+
+    data2 = _try_parse_encrypted_response(resp2)
+    if not isinstance(data2, list):
+        return pd.DataFrame(columns=["sede_id", "sede_nombre"])
     return pd.DataFrame(
-        [{"sede_id": x.get("id"), "sede_nombre": x.get("nombre")} for x in (data or [])]
+        [{"sede_id": s.get("id"), "sede_nombre": s.get("nombre")}
+         for s in (data2 or [])]
     )
 
 
+@st.cache_data(show_spinner=False, ttl=300)
 def api_exportar_empleados_completos() -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/empleados"
     data = {"solo_nif": 0}
 
     resp = safe_request("POST", url, data=data)
     if resp is None:
-        raise RuntimeError("No se pudo consultar el catálogo de empleados")
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
     try:
         resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError("No se pudo consultar el catálogo de empleados") from exc
+    except Exception:
+        _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/empleados"))
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
 
     data_dec = _try_parse_encrypted_response(resp)
     if not isinstance(data_dec, list):
-        raise RuntimeError("Respuesta inválida al consultar el catálogo de empleados")
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
 
     empleados = data_dec
     lista = []
@@ -778,145 +768,49 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     return df
 
 
-def _normalize_tipos_fichaje_payload(data_dec) -> dict:
-    """Normaliza las variantes plausibles del payload de tipos de fichaje."""
-    rows = None
-
-    if isinstance(data_dec, list):
-        rows = data_dec
-    elif isinstance(data_dec, dict):
-        # Wrappers habituales en APIs/proxies.
-        for key in ("data", "results", "resultado", "items", "tipos_fichaje", "tipos"):
-            value = data_dec.get(key)
-            if isinstance(value, list):
-                rows = value
-                break
-        if rows is None:
-            # También admitimos un objeto asociativo id -> tipo.
-            vals = list(data_dec.values())
-            if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
-                rows = vals
-
-    if not isinstance(rows, list):
-        raise RuntimeError("Respuesta inválida al consultar los tipos de fichaje")
-
-    out = {}
-    for t in rows:
-        if isinstance(t, dict):
-            tid = t.get("id")
-            desc = t.get("descuenta_tiempo", 0)
-            noct = t.get("turno_nocturno", 0)
-        elif isinstance(t, (list, tuple)):
-            # Orden documentado: id, nombre, descripcion, descuenta_tiempo,
-            # entrada, turno_nocturno, fichador.
-            if not t:
-                continue
-            tid = t[0] if len(t) > 0 else None
-            desc = t[3] if len(t) > 3 else 0
-            noct = t[5] if len(t) > 5 else 0
-        else:
-            continue
-
-        try:
-            tid_i = int(tid)
-        except Exception:
-            continue
-
-        try:
-            desc_i = int(desc or 0)
-        except Exception:
-            desc_i = 0
-        try:
-            noct_i = int(noct or 0)
-        except Exception:
-            noct_i = 0
-
-        out[tid_i] = {
-            "descuenta_tiempo": 1 if desc_i == 1 else 0,
-            "turno_nocturno": 1 if noct_i == 1 else 0,
-        }
-
-    if not out:
-        raise RuntimeError("CRECE no ha devuelto tipos de fichaje utilizables")
-    return out
-
-
-@st.cache_data(show_spinner=False, ttl=21600)
+@st.cache_data(show_spinner=False, ttl=3600)
 def api_exportar_tipos_fichaje() -> dict:
-    """Obtiene tipos de fichaje cuando el servicio está disponible.
-
-    Este catálogo es auxiliar: CRECE puede no habilitarlo para un token/intranet
-    aunque sí permita exportar fichajes. Por eso un fallo aquí NO invalida la
-    consulta principal. Se devuelve {} y la app continúa con tiempoContabilizado
-    y horas_programadas, que son las fuentes de verdad de las validaciones.
-    """
     url = f"{API_URL_BASE}/exportacion/tipos-fichaje"
     try:
-        # Mantener exactamente la forma histórica que ya usaba la app: POST sin cuerpo.
         resp = safe_request("POST", url)
         if resp is None:
             return {}
         resp.raise_for_status()
+
         data_dec = _try_parse_encrypted_response(resp)
-        try:
-            return _normalize_tipos_fichaje_payload(data_dec)
-        except Exception:
+        if not isinstance(data_dec, list):
             return {}
-    except Exception as exc:
-        _safe_fail(exc)
+
+        out = {}
+        for t in data_dec:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            out[int(tid)] = {
+                "descuenta_tiempo": int(t.get("descuenta_tiempo") or 0),
+                "turno_nocturno": int(t.get("turno_nocturno") or 0),
+            }
+        return out
+    except Exception as e:
+        _safe_fail(e)
         return {}
 
 
-@st.cache_resource
-def _tipos_fichaje_last_good_holder():
-    # Solo guarda metadatos no personales durante la vida del proceso.
-    return {"map": {}, "ts": 0.0, "lock": threading.Lock()}
-
-
-def get_tipos_fichaje_resiliente() -> tuple[dict, bool]:
-    """Devuelve (mapa, usando_fallback).
-
-    Si el endpoint auxiliar no está disponible, usa la última lectura válida;
-    si tampoco existe, devuelve {} sin bloquear la aplicación. Esto replica el
-    comportamiento estable histórico de la app y evita convertir un endpoint
-    auxiliar en un punto único de fallo.
-    """
-    holder = _tipos_fichaje_last_good_holder()
-
-    try:
-        tipos = api_exportar_tipos_fichaje()
-    except Exception as exc:
-        _safe_fail(exc)
-        tipos = {}
-
-    if tipos:
-        with holder["lock"]:
-            holder["map"] = dict(tipos)
-            holder["ts"] = time.time()
-        return tipos, False
-
-    with holder["lock"]:
-        fallback = dict(holder.get("map") or {})
-    if fallback:
-        return fallback, True
-
-    return {}, False
-
-
-def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list | None:
+def api_exportar_fichajes(nif: str, fi: str, ff: str) -> list:
     url = f"{API_URL_BASE}/exportacion/fichajes"
     data = {"fecha_inicio": fi, "fecha_fin": ff, "nif": nif, "order": "asc"}
 
     try:
         resp = safe_request("POST", url, data=data)
         if resp is None:
-            return None
+            return []
         resp.raise_for_status()
+
         data_dec = _try_parse_encrypted_response(resp)
-        return data_dec if isinstance(data_dec, list) else None
+        return data_dec if isinstance(data_dec, list) else []
     except Exception as e:
         _safe_fail(e)
-        return None
+        return []
 
 
 def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
@@ -948,14 +842,6 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     if isinstance(parsed, dict):
         for k, v in parsed.items():
             add_row(k, v)
-    elif isinstance(parsed, list):
-        # Algunas versiones/proxies pueden materializar el objeto asociativo como lista.
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            key = item.get("nif") or item.get("NIF") or item.get("dni") or item.get("DNI")
-            if key:
-                add_row(str(key), item)
 
     df = pd.DataFrame(filas)
     if df.empty:
@@ -964,7 +850,7 @@ def _parse_tiempo_trabajado_payload(parsed) -> pd.DataFrame:
     return df
 
 
-def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame | None:
+def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataFrame:
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
     payload = [("desde", desde), ("hasta", hasta)]
 
@@ -977,38 +863,26 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> pd.DataF
     try:
         resp = safe_request("POST", url, data=payload)
         if resp is None:
-            return None
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
         resp.raise_for_status()
 
         data_dec = _try_parse_encrypted_response(resp)
         if data_dec is None:
-            return None
+            return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
         return _parse_tiempo_trabajado_payload(data_dec)
 
     except Exception as e:
         _safe_fail(e)
-        return None
+        return pd.DataFrame(columns=["nif", "tiempoEfectivo_seg", "tiempoContabilizado_seg"])
 
 
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def _cached_tiempo_contabilizado_map(
-    d0_iso: str,
-    d1_iso: str,
-    nifs_fingerprint: str,
-    _nifs: tuple[str, ...],
-) -> dict:
-    """Cache seguro del tiempo contabilizado diario.
-
-    Estrategia resiliente para rangos largos:
-    1) primera pasada paralela conservadora;
-    2) cualquier fecha fallida se reintenta secuencialmente;
-    3) solo se aborta si, tras esos reintentos, sigue faltando alguna fecha.
-
-    Así evitamos que un 429/timeout puntual de una única fecha invalide un rango
-    completo, pero tampoco presentamos datos parciales como válidos.
+def _cached_tiempo_contabilizado_map(d0_iso: str, d1_iso: str, nifs_fingerprint: str, _nifs: tuple[str, ...]) -> dict:
+    """Cache seguro (TTL corto): devuelve {(NIF, YYYY-MM-DD): minutos_contabilizados}.
+    Solo cachea minutos (int), no payloads ni datos sensibles extra.
     """
     try:
         d0 = datetime.strptime(d0_iso, "%Y-%m-%d").date()
@@ -1024,65 +898,29 @@ def _cached_tiempo_contabilizado_map(
     if not days:
         return {}
 
-    out: dict[tuple[str, str], int] = {}
+    max_workers = _max_workers_days(len(days))
+    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}  # {(hash_nif, YYYY-MM-DD): minutes}
 
     def _fetch_day(day: str):
         df_tc = api_exportar_tiempo_trabajado(day, day, nifs=nifs)
-        if df_tc is None:
-            raise RuntimeError("Fallo en tiempo trabajado")
         return day, df_tc
 
-    def _consume(day: str, df_tc: pd.DataFrame):
-        if df_tc is None or df_tc.empty:
-            return
-        for _, rr in df_tc.iterrows():
-            nif_tc = str(rr.get("nif") or "").upper().strip()
-            if not nif_tc:
-                continue
-            seg = rr.get("tiempoContabilizado_seg")
-            try:
-                mins = int(max(0.0, float(seg or 0)) // 60)
-            except Exception:
-                mins = 0
-            out[(_hash_nif(nif_tc), day)] = max(0, mins)
-
-    # No conviene golpear este endpoint con demasiadas fechas simultáneas.
-    # 4 workers mantiene buena velocidad y reduce mucho los 429/timeouts.
-    workers = max(1, min(4, len(days)))
-    failed_days: list[str] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        futs = {exe.submit(_fetch_day, day): day for day in days}
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        futs = [exe.submit(_fetch_day, day) for day in days]
         for fut in as_completed(futs):
-            day = futs[fut]
-            try:
-                day_r, df_tc = fut.result()
-                _consume(day_r, df_tc)
-            except Exception as exc:
-                _safe_fail(exc)
-                failed_days.append(day)
-
-    # Segunda oportunidad secuencial: evita que una sola fecha transitoria tumbe
-    # todo el rango. safe_request ya hace su propio backoff; aquí añadimos una
-    # pequeña pausa entre fechas para no volver a saturar CRECE.
-    unresolved: list[str] = []
-    for day in sorted(set(failed_days)):
-        ok = False
-        for attempt in range(2):
-            if attempt:
-                time.sleep(0.6 * attempt)
-            try:
-                day_r, df_tc = _fetch_day(day)
-                _consume(day_r, df_tc)
-                ok = True
-                break
-            except Exception as exc:
-                _safe_fail(exc)
-        if not ok:
-            unresolved.append(day)
-
-    if unresolved:
-        raise RuntimeError("Consulta incompleta de tiempo contabilizado")
+            day, df_tc = fut.result()
+            if df_tc is None or df_tc.empty:
+                continue
+            for _, rr in df_tc.iterrows():
+                nif_tc = str(rr.get("nif") or "").upper().strip()
+                if not nif_tc:
+                    continue
+                seg = rr.get("tiempoContabilizado_seg")
+                try:
+                    mins = int(round(float(seg or 0) / 60.0))
+                except Exception:
+                    mins = 0
+                out[(_hash_nif(nif_tc), day)] = max(0, mins)
 
     return out
 
@@ -1101,7 +939,7 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
     if not hashed:
         return {}
     hash_to_nif = {_hash_nif(n): n for n in nifs_norm}
-    out: dict[tuple[str, str], int] = {}  # {(nif, YYYY-MM-DD): minutos}
+    out: dict[tuple[str, str], int] = {}  # {(hash_nif, YYYY-MM-DD): minutes_programadas}
     for (hn, day), mins in hashed.items():
         nif = hash_to_nif.get(hn)
         if not nif:
@@ -1111,44 +949,33 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """Consulta /informes/empleados.
-
-    La aplicación histórica de CRECE en este entorno ha funcionado enviando
-    fecha_desde/fecha_hasta como JSON. Se mantiene esa forma como principal y
-    se usa form-urlencoded solo como fallback compatible con el manual.
-
-    Devuelve el payload descifrado o None. Nunca escribe payloads/tokens/PII
-    en logs o UI.
-    """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-
-    # 1) Forma que ya funcionaba en la app estable.
-    for as_json in (True, False):
-        try:
-            resp = safe_request(
-                "POST",
-                url,
-                json_body=body if as_json else None,
-                data=None if as_json else body,
-                timeout=(5, 60),
-            )
-            if resp is None:
-                continue
-            resp.raise_for_status()
-            parsed = _try_parse_encrypted_response(resp)
-            if parsed is not None:
-                return parsed
-        except Exception as exc:
-            _safe_fail(exc)
-            continue
-
-    return None
+    try:
+        resp = safe_request("POST", url, json_body=body)
+        if resp is None:
+            return None
+        resp.raise_for_status()
+        return _try_parse_encrypted_response(resp)
+    except Exception as e:
+        _safe_fail(e)
+        return None
 
 
 # ============================================================
 # HELPERS BAJAS (ROBUSTO)
 # ============================================================
+
+def _to_float_any(x) -> float:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return 0.0
+    try:
+        if isinstance(x, str):
+            s = x.strip().replace(",", ".")
+            return float(s) if s else 0.0
+        return float(x)
+    except Exception:
+        return 0.0
 
 
 def _field_key_norm(value) -> str:
@@ -1177,18 +1004,12 @@ def _row_get_alias(row: dict, aliases: list[str]):
 
 
 def _canonical_emp_code(value) -> str:
-    """Código de empleado estable: normaliza ceros a la izquierda y enteros tipo 55.0."""
-    s = _text(value)
+    """Código de empleado estable: ignora ceros a la izquierda si es numérico."""
+    s = str(value or "").strip()
     if not s:
         return ""
     if s.isdigit():
         return s.lstrip("0") or "0"
-    try:
-        num = float(s.replace(",", "."))
-        if num >= 0 and num.is_integer():
-            return str(int(num))
-    except Exception:
-        pass
     return s.upper()
 
 
@@ -1252,9 +1073,47 @@ def _duration_value_to_minutes(value):
     return int(round(num / 60.0))
 
 
-# Posiciones documentadas por CRECE para /informes/empleados (v3.1+).
-# Solo materializamos los campos que utiliza esta app. El API puede devolver
-# filas como objetos con nombre de campo o como arrays posicionales.
+def _report_hours_to_minutes(value):
+    """Convierte campos de informe expresados en horas a minutos.
+
+    En /informes/empleados los campos se llaman explícitamente "Horas ...".
+    Los valores numéricos se interpretan siempre como horas decimales, también
+    cuando un periodo agregado supera 24 horas.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if ":" in raw:
+            parts = raw.split(":")
+            try:
+                if len(parts) == 2:
+                    h, m = int(parts[0]), int(parts[1])
+                    return max(0, h * 60 + m)
+                if len(parts) == 3:
+                    h, m = int(parts[0]), int(parts[1])
+                    sec = float(parts[2].replace(",", "."))
+                    return max(0, int(round(h * 60 + m + sec / 60.0)))
+            except Exception:
+                return None
+        raw = raw.replace(",", ".")
+        try:
+            num = float(raw)
+        except Exception:
+            return None
+    else:
+        try:
+            num = float(value)
+        except Exception:
+            return None
+
+    if pd.isna(num) or num < 0:
+        return None
+    return int(round(num * 60.0))
+
+
 _INFORME_EMP_IDX_NUM = 0
 _INFORME_EMP_IDX_HORAS_PROGRAMADAS = 25
 _INFORME_EMP_IDX_HORAS_BAJA = 33
@@ -1276,21 +1135,13 @@ def _normalize_informe_employee_row(item):
 
 
 def _extract_rows_from_informe(rep):
-    """Extrae filas del informe soportando objetos y arrays posicionales.
-
-    El manual de CRECE describe el resultado como un array por empleado. Algunas
-    instalaciones devuelven objetos con etiquetas; otras, arrays en el orden
-    documentado. Ambas variantes son válidas aquí.
-    """
     if rep is None:
         return []
 
     raw_rows = None
-
     if isinstance(rep, list):
         raw_rows = rep
     elif isinstance(rep, dict):
-        # Wrapper habitual.
         for k in ["data", "empleados", "results", "resultado", "items"]:
             v = rep.get(k)
             if isinstance(v, list):
@@ -1298,11 +1149,9 @@ def _extract_rows_from_informe(rep):
                 break
 
         if raw_rows is None:
-            # Un único objeto fila.
             if _get_employee_number_from_row(rep):
                 raw_rows = [rep]
             else:
-                # Objeto asociativo: clave -> fila (dict o array posicional).
                 vals = list(rep.values())
                 if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
                     raw_rows = vals
@@ -1330,16 +1179,14 @@ def _get_horas_baja_from_row(row: dict) -> float:
     ]
     found, value = _row_get_alias(row, aliases)
     if found:
-        mins = _duration_value_to_minutes(value)
-        return (float(mins) / 60.0) if mins is not None else 0.0
+        return _to_float_any(value)
 
     for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
         v = row.get(k)
         if isinstance(v, dict):
             found, value = _row_get_alias(v, aliases + ["horas"])
             if found:
-                mins = _duration_value_to_minutes(value)
-                return (float(mins) / 60.0) if mins is not None else 0.0
+                return _to_float_any(value)
         elif isinstance(v, list):
             best = 0.0
             for it in v:
@@ -1397,11 +1244,7 @@ def calcular_tiempos_neto(df: pd.DataFrame, tipos_map: dict) -> pd.DataFrame:
                     delta = (b["fecha_dt"] - a["fecha_dt"]).total_seconds()
                     if delta >= 0:
                         delta_i = int(round(delta))
-                        tipo_a = a.get("tipo")
-                        try:
-                            props = tipos_map.get(int(tipo_a), {}) if pd.notna(tipo_a) else {}
-                        except Exception:
-                            props = {}
+                        props = tipos_map.get(int(a.get("tipo")), {}) if a.get("tipo") is not None else {}
                         if int(props.get("descuenta_tiempo", 0)) == 1:
                             descontados += delta_i
                         else:
@@ -1444,15 +1287,20 @@ def _parse_date_any(x):
         except Exception:
             pass
     try:
-        dt = pd.to_datetime(s, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.date()
+        return pd.to_datetime(s, errors="coerce").date()
     except Exception:
         return None
 
 
 
+
+def _normalize_emp_code(x: str, pad: int = 10) -> str:
+    s = str(x or '').strip()
+    if not s:
+        return ''
+    if s.isdigit():
+        return s.zfill(pad)
+    return s
 
 
 def _get_horas_programadas_minutes_from_row(row: dict):
@@ -1473,7 +1321,7 @@ def _get_horas_programadas_minutes_from_row(row: dict):
     ]
     found, value = _row_get_alias(row, aliases)
     if found:
-        mins = _duration_value_to_minutes(value)
+        mins = _report_hours_to_minutes(value)
         return (mins is not None), mins
 
     for nested_key in ["contrato", "jornada", "horario", "turno"]:
@@ -1481,7 +1329,7 @@ def _get_horas_programadas_minutes_from_row(row: dict):
         if isinstance(nested, dict):
             found, value = _row_get_alias(nested, aliases)
             if found:
-                mins = _duration_value_to_minutes(value)
+                mins = _report_hours_to_minutes(value)
                 return (mins is not None), mins
 
     return False, None
@@ -1489,16 +1337,15 @@ def _get_horas_programadas_minutes_from_row(row: dict):
 
 
 def _metrics_from_informe_payload(rep) -> dict:
-    """Convierte un informe CRECE a métricas pseudonimizadas por Nº empleado.
+    """Extrae solo HP y baja por Nº empleado pseudonimizado.
 
-    Retorna hashes HMAC de Nº empleado -> minutos. No conserva nombres, NIFs ni
-    payloads en caché.
+    La caché nunca conserva el payload completo del informe ni datos personales:
+    únicamente hash de Nº empleado -> minutos programados / minutos de baja.
     """
     hp_by_emp: dict[str, int] = {}
     baja_by_emp: dict[str, int] = {}
 
-    rows = _extract_rows_from_informe(rep)
-    for row in rows:
+    for row in _extract_rows_from_informe(rep):
         code = _get_employee_number_from_row(row)
         if not code:
             continue
@@ -1519,45 +1366,35 @@ def _metrics_from_informe_payload(rep) -> dict:
 
 @st.cache_data(show_spinner=False, ttl=900)
 def _cached_informe_one_day_metrics(day_iso: str) -> dict:
-    """Métricas diarias del informe de empleados, sin PII en caché.
+    """Consulta una fecha y cachea únicamente métricas pseudonimizadas.
 
-    Se consulta un único día para que ``Horas programadas`` sea exactamente la
-    jornada diaria del empleado. La respuesta puede venir como objetos o como
-    arrays posicionales según la versión de CRECE; ``_extract_rows_from_informe``
-    normaliza ambas variantes.
+    Si CRECE falla, se lanza excepción. Streamlit no cachea la excepción, de modo
+    que una consulta posterior puede reintentar esa fecha en lugar de quedarse
+    con un fallo cacheado.
     """
     rep = api_informe_empleados(day_iso, day_iso)
     if rep is None:
         raise RuntimeError(f"Informe de empleados no disponible para {day_iso}")
-
     rows = _extract_rows_from_informe(rep)
-    # El informe de empleados es global y, en una intranet con empleados,
-    # debe contener filas también cuando las horas programadas sean 0.
     if not rows:
         raise RuntimeError(f"Informe de empleados vacío/no interpretable para {day_iso}")
-
     return _metrics_from_informe_payload(rep)
 
 
-def build_informe_diario_maps(
+def build_informe_diario_maps_resilient(
     d0: date,
     d1: date,
     base_emp: pd.DataFrame,
-) -> tuple[dict, dict]:
-    """Devuelve (horas_programadas_map, horas_baja_map) por (NIF, fecha).
+) -> tuple[dict, dict, list[str]]:
+    """Devuelve HP, bajas y fechas de informe no disponibles.
 
-    Diseño deliberadamente conservador:
-    - una única llamada diaria a /informes/empleados;
-    - la misma respuesta alimenta jornada y bajas;
-    - ejecución secuencial para no saturar el endpoint pesado;
-    - caché por día (15 min), por lo que rangos solapados reutilizan días;
-    - reintentos adicionales solo para el día que falle.
-
-    No se inventan jornadas: un 0 explícito de CRECE se conserva como 0 y la
-    ausencia real de un día hace fallar la consulta con la fecha concreta.
+    Una sola llamada de /informes/empleados por fecha alimenta HP y Bajas.
+    Los fallos se reintentan secuencialmente y nunca tumban todo el rango.
+    Para una fecha realmente no disponible no se inventa HP=0: simplemente se
+    omiten las reglas que dependen de la jornada programada de ese día.
     """
     if base_emp is None or base_emp.empty:
-        return {}, {}
+        return {}, {}, []
 
     be = base_emp.copy()
     be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
@@ -1565,7 +1402,6 @@ def build_informe_diario_maps(
         be["num_empleado"] = ""
     be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
 
-    # Mapa pseudónimo -> NIF solo en memoria de esta ejecución.
     emp_hash_to_nif: dict[str, str] = {}
     for _, row in be.iterrows():
         code = _text(row.get("num_empleado_code"))
@@ -1574,40 +1410,44 @@ def build_informe_diario_maps(
             emp_hash_to_nif[_hash_emp_code(code)] = nif
 
     if not emp_hash_to_nif:
-        return {}, {}
+        return {}, {}, []
 
-    day_isos = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
-    if not day_isos:
-        return {}, {}
+    days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
+    if not days:
+        return {}, {}, []
 
     metrics_by_day: dict[str, dict] = {}
-    failed: list[str] = []
+    failed_days: list[str] = []
 
-    for pos, day in enumerate(day_isos):
+    # Primera pasada con concurrencia baja. Esto conserva velocidad sin lanzar
+    # decenas de informes pesados a la vez.
+    workers = max(1, min(3, len(days)))
+    with ThreadPoolExecutor(max_workers=workers) as exe:
+        futs = {exe.submit(_cached_informe_one_day_metrics, day): day for day in days}
+        for fut in as_completed(futs):
+            day = futs[fut]
+            try:
+                metrics_by_day[day] = fut.result()
+            except Exception as exc:
+                _safe_fail(exc)
+                failed_days.append(day)
+
+    # Segunda pasada secuencial para los fallos: reduce rate-limit y permite
+    # recuperar timeouts/5xx transitorios sin abortar la consulta completa.
+    unresolved: list[str] = []
+    for day in sorted(set(failed_days)):
         ok = False
-        last_exc = None
-        # safe_request ya incluye su propio retry/backoff. Estos intentos cubren
-        # fallos completos de parseo/respuesta del endpoint sin lanzar en paralelo.
-        for attempt in range(3):
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.8)
             try:
                 metrics_by_day[day] = _cached_informe_one_day_metrics(day)
                 ok = True
                 break
             except Exception as exc:
-                last_exc = exc
                 _safe_fail(exc)
-                if attempt < 2:
-                    time.sleep(0.8 * (attempt + 1))
         if not ok:
-            failed.append(day)
-        # Pausa pequeña entre días no cacheados para no disparar rate-limit.
-        if pos + 1 < len(day_isos):
-            time.sleep(0.12)
-
-    if failed:
-        raise RuntimeError(
-            "No se pudo obtener el informe diario: " + ", ".join(failed)
-        )
+            unresolved.append(day)
 
     hp_out: dict[tuple[str, str], int] = {}
     baja_out: dict[tuple[str, str], int] = {}
@@ -1622,7 +1462,10 @@ def build_informe_diario_maps(
             if nif:
                 baja_out[(nif, day)] = int(mins)
 
-    return hp_out, baja_out
+    return hp_out, baja_out, unresolved
+
+
+
 
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
@@ -1632,15 +1475,15 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
     if "deleted_at" in df_emp.columns:
         deleted = df_emp["deleted_at"].notna() & df_emp["deleted_at"].astype(str).str.strip().ne("") & df_emp["deleted_at"].astype(str).str.lower().ne("null")
     else:
-        deleted = pd.Series(False, index=df_emp.index, dtype=bool)
+        deleted = pd.Series([False] * len(df_emp))
 
-    flags_true = pd.Series(False, index=df_emp.index, dtype=bool)
+    flags_true = pd.Series([False] * len(df_emp))
     for col in ["activo", "en_activo", "contrato_activo"]:
         if col in df_emp.columns:
             s = df_emp[col]
             flags_true = flags_true | s.astype(str).str.strip().str.lower().isin(["1", "true", "t", "si", "sí", "yes", "y"])
 
-    estado_ok = pd.Series(False, index=df_emp.index, dtype=bool)
+    estado_ok = pd.Series([False] * len(df_emp))
     for col in ["estado", "situacion"]:
         if col in df_emp.columns:
             s = df_emp[col].astype(str).str.strip().str.upper()
@@ -1652,9 +1495,9 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
         fb_past = fb_has & (fb <= date.today())
         baja = fb_past
     else:
-        baja = pd.Series(False, index=df_emp.index, dtype=bool)
+        baja = pd.Series([False] * len(df_emp))
 
-    fin_ok = pd.Series(False, index=df_emp.index, dtype=bool)
+    fin_ok = pd.Series([False] * len(df_emp))
     for col in ["fecha_fin_contrato", "fin_contrato"]:
         if col in df_emp.columns:
             fc = df_emp[col].apply(_parse_date_any)
@@ -1675,41 +1518,20 @@ def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
 
 st.set_page_config(page_title="Fichajes CRECE Personas", layout="wide")
 
-try:
-    with st.spinner("Cargando catálogos…"):
-        departamentos_df = api_exportar_departamentos()
-        empresas_df = api_exportar_empresas()
-        sedes_df = api_exportar_sedes()
-
-        # El catálogo de empleados contiene PII: se conserva únicamente en la
-        # sesión del usuario (no en la caché global compartida de Streamlit).
-        _emp_cache = st.session_state.get("_empleados_catalog_cache")
-        _emp_cache_ts = float(st.session_state.get("_empleados_catalog_cache_ts", 0.0) or 0.0)
-        if isinstance(_emp_cache, pd.DataFrame) and (time.time() - _emp_cache_ts) < 180:
-            empleados_df = _emp_cache.copy()
-        else:
-            empleados_df = api_exportar_empleados_completos()
-            st.session_state["_empleados_catalog_cache"] = empleados_df.copy()
-            st.session_state["_empleados_catalog_cache_ts"] = time.time()
-except Exception:
-    st.error("No se han podido cargar los datos base de CRECE. Reintenta en unos segundos.")
-    st.stop()
+with st.spinner("Cargando catálogos…"):
+    departamentos_df = api_exportar_departamentos()
+    empresas_df = api_exportar_empresas()
+    sedes_df = api_exportar_sedes()
+    empleados_df = api_exportar_empleados_completos()
 
 if empleados_df.empty:
     st.error("No hay empleados disponibles.")
     st.stop()
 
-if "departamento_id" in empleados_df.columns:
-    empleados_df["departamento_id"] = empleados_df["departamento_id"].fillna("").astype(str).str.strip()
-if "departamento_id" in departamentos_df.columns:
-    departamentos_df["departamento_id"] = departamentos_df["departamento_id"].fillna("").astype(str).str.strip()
 empleados_df = empleados_df.merge(departamentos_df, on="departamento_id", how="left")
-if "departamento_nombre" not in empleados_df.columns:
-    empleados_df["departamento_nombre"] = ""
-empleados_df["departamento_nombre"] = empleados_df["departamento_nombre"].fillna("").astype(str).str.strip()
 
-empleados_df["empresa_id"] = empleados_df.get("empresa_id", pd.Series([""] * len(empleados_df), index=empleados_df.index)).fillna("").astype(str).str.strip()
-empleados_df["sede_id"] = empleados_df.get("sede_id", pd.Series([""] * len(empleados_df), index=empleados_df.index)).fillna("").astype(str).str.strip()
+empleados_df["empresa_id"] = empleados_df.get("empresa_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
+empleados_df["sede_id"] = empleados_df.get("sede_id", pd.Series([""] * len(empleados_df))).astype(str).str.strip()
 
 emp_map = {}
 if not empresas_df.empty and "empresa_id" in empresas_df.columns:
@@ -1767,8 +1589,6 @@ empleados_filtrados_emp_sede = empleados_df[
 # (si eliges empleados concretos, su filtro manda por encima de Empresa/Sede)
 empleados_activos_opts_df = empleados_df[empleado_activo_o_contrato(empleados_df)].copy()
 empleados_activos_opts_df = empleados_activos_opts_df.sort_values(["nombre_completo"], kind="mergesort")
-# Etiquetas únicas: normalmente se muestra solo el nombre; si hubiera dos personas
-# con el mismo nombre, añadimos nº de empleado (o últimos 4 del NIF) para no perder una.
 _nombre_series = empleados_activos_opts_df["nombre_completo"].fillna("").astype(str).str.strip()
 _nombre_counts = _nombre_series.value_counts()
 emp_opts_map = {}
@@ -1824,12 +1644,17 @@ for k, v in [
     ("result_bajas", {}),
     ("result_sin_fichajes", {}),
     ("result_excesos_semana", {}),
+    ("result_csv_incidencias", b""),
+    ("result_csv_bajas", b""),
+    ("result_csv_sin", b""),
+    ("result_csv_excesos", b""),
     ("scope_fi", ""),
     ("scope_ff", ""),
     ("scope_empresas_norm", set()),
     ("scope_sedes_norm", set()),
     ("scope_empleados_nif", set()),
     ("scope_used_employee_filter", False),
+    ("result_informe_missing_days", []),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1859,45 +1684,20 @@ if consultar:
     ff = fecha_fin.strftime("%Y-%m-%d")
     signature = _sig(fi, ff, sel_empresas, sel_sedes, sel_empleados_nifs)
 
-    d0 = datetime.strptime(fi, "%Y-%m-%d").date()
-    d1 = datetime.strptime(ff, "%Y-%m-%d").date()
-    base_emp = empleados_filtrados.copy()
-    base_emp["nif"] = base_emp["nif"].fillna("").astype(str).str.upper().str.strip()
-    base_emp["num_empleado"] = base_emp.get(
-        "num_empleado", pd.Series("", index=base_emp.index)
-    ).fillna("").astype(str).str.strip()
-    try:
-        full_weeks = list_full_workweeks_in_range(d0, d1)
-    except Exception:
-        full_weeks = []
-
     with st.spinner("Procesando…"):
-        tipos_map, tipos_fallback = get_tipos_fichaje_resiliente()
-        if tipos_fallback:
-            st.warning(
-                "CRECE no ha respondido al catálogo de tipos de fichaje en esta consulta. "
-                "Se está usando la última lectura válida disponible."
-            )
-        # Si el endpoint de tipos no está habilitado para este token/intranet, no
-        # bloqueamos la consulta. Las reglas principales siguen basándose en
-        # tiempoContabilizado y horas_programadas. El mapa vacío conserva el
-        # comportamiento histórico de la app para este endpoint auxiliar.
+        tipos_map = api_exportar_tipos_fichaje()
 
         # --------- FICHAJES ----------
         fichajes_rows = []
-        fichajes_failed = 0
         with ThreadPoolExecutor(max_workers=_max_workers_emps(len(empleados_filtrados))) as exe:
             futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
             for fut in as_completed(futures):
                 emp = futures[fut]
                 try:
-                    rows_fich = fut.result()
+                    rows_fich = fut.result() or []
                 except Exception as _e:
                     _safe_fail(_e)
-                    rows_fich = None
-                if rows_fich is None:
-                    fichajes_failed += 1
-                    continue
+                    rows_fich = []
                 for x in rows_fich:
                     fichajes_rows.append(
                         {
@@ -1913,48 +1713,48 @@ if consultar:
                         }
                     )
 
-        if fichajes_failed:
-            st.error("No se ha podido completar la consulta de fichajes de CRECE. Reintenta para evitar resultados parciales.")
-            st.stop()
-
         if not fichajes_rows:
             df_fich = pd.DataFrame(columns=["nif", "Nombre", "Departamento", "Empresa", "Sede", "id", "tipo", "direccion", "fecha", "fecha_dt", "fecha_dia"])
         else:
             df_fich = pd.DataFrame(fichajes_rows)
             df_fich["nif"] = df_fich["nif"].astype(str).str.upper().str.strip()
             df_fich["fecha_dt"] = pd.to_datetime(df_fich["fecha"], errors="coerce")
-            if df_fich["fecha_dt"].isna().any():
-                st.error("CRECE ha devuelto uno o más fichajes con fecha no interpretable. Reintenta la consulta para evitar resultados parciales.")
-                st.stop()
-            df_fich["direccion"] = df_fich["direccion"].fillna("").astype(str).str.strip().str.lower()
+            df_fich = df_fich.dropna(subset=["fecha_dt"])
 
             def _dia_row(r):
-                try:
-                    props = tipos_map.get(int(r.get("tipo")), {}) if pd.notna(r.get("tipo")) else {}
-                except Exception:
-                    props = {}
+                props = tipos_map.get(int(r["tipo"]), {}) if pd.notna(r.get("tipo")) else {}
                 return ajustar_fecha_dia(r["fecha_dt"], int(props.get("turno_nocturno", 0)))
 
             df_fich["fecha_dia"] = df_fich.apply(_dia_row, axis=1)
 
-        # Mapas diarios únicos para TODAS las personas del alcance.
-        # Regla de negocio: horas_programadas y tiempoContabilizado se consultan siempre,
-        # haya o no fichajes. El mismo dato alimenta Fichajes, Bajas, Sin fichajes y Exceso.
-        try:
-            horas_prog_map_query, bajas_min_map_query = build_informe_diario_maps(d0, d1, base_emp)
-        except Exception as _e:
-            _safe_fail(_e)
-            st.error("No se ha podido completar el informe diario de CRECE. Reintenta la consulta para evitar resultados parciales.")
-            st.stop()
+        # --------- MAPAS DIARIOS COMPARTIDOS ----------
+        # Se consultan una sola vez por rango y se reutilizan en todas las pestañas.
+        d0 = datetime.strptime(fi, "%Y-%m-%d").date()
+        d1 = datetime.strptime(ff, "%Y-%m-%d").date()
 
-        nifs_tc = base_emp["nif"].dropna().astype(str).str.upper().str.strip()
-        nifs_tc = [n for n in nifs_tc.unique().tolist() if n]
+        base_emp = empleados_filtrados.copy()
+        base_emp["nif"] = base_emp["nif"].fillna("").astype(str).str.upper().str.strip()
+        base_emp["num_empleado"] = base_emp.get(
+            "num_empleado", pd.Series("", index=base_emp.index)
+        ).fillna("").astype(str).str.strip()
+
         try:
-            tc_map_query = build_tiempo_contabilizado_map(d0, d1, nifs_tc)
+            horas_prog_map_query, bajas_min_map_query, informe_missing_days = build_informe_diario_maps_resilient(
+                d0, d1, base_emp
+            )
         except Exception as _e:
             _safe_fail(_e)
-            st.error("No se ha podido obtener todo el tiempo contabilizado de CRECE. Reintenta la consulta.")
-            st.stop()
+            horas_prog_map_query, bajas_min_map_query, informe_missing_days = {}, {}, []
+
+        nifs_all_query = [
+            n for n in base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+            if n
+        ]
+        try:
+            tc_map_query = build_tiempo_contabilizado_map(d0, d1, nifs_all_query)
+        except Exception as _e:
+            _safe_fail(_e)
+            tc_map_query = {}
 
         # --------- INCIDENCIAS ----------
         if df_fich.empty:
@@ -2017,7 +1817,7 @@ if consultar:
             resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
             def _max_ok(r):
-                sp = _lookup_special(_text(r.get("Departamento")).upper(), norm_name(r.get("Nombre")))
+                sp = _lookup_special((r.get("Departamento") or "").upper().strip(), norm_name(r.get("Nombre")))
                 if sp and "max_fichajes_ok" in sp:
                     return sp["max_fichajes_ok"]
                 return pd.NA
@@ -2044,8 +1844,7 @@ if consultar:
                 num_fich = int(r.get("Numero de fichajes", 0) or 0)
                 worked = worked_minutes > 0 or num_fich > 0
 
-                # Solo un cero EXPLÍCITO de Horas programadas significa no laborable.
-                # Si el informe no trae el dato, nunca lo convertimos por defecto en 0.
+                # Solo un cero explícito de CRECE significa día no laborable.
                 if exp_known and exp_min == 0 and worked:
                     return "Trabajado en día no laborable"
 
@@ -2054,29 +1853,21 @@ if consultar:
                         motivos.append("Trabajo en fin de semana")
                     return "; ".join(motivos)
 
-                # Horas insuficientes: la jornada esperada sale de Horas programadas,
-                # incluyendo jornadas reducidas/especiales. Tolerancia diaria: 5 min.
-                if exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - 5):
+                # Horas insuficientes: siempre contra Horas programadas de CRECE.
+                if exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - TOLERANCIA_MINUTOS):
                     motivos.append(f"Horas insuficientes (mín {segundos_a_hhmm(exp_min * 60)})")
 
-                # Reglas de cantidad de fichajes. Para MOI/ESTRUCTURA, el mínimo
-                # también depende de Horas programadas (no del lunes/viernes):
-                #   <= 6h35 -> 2 fichajes
-                #   >  6h35 -> 4 fichajes
-                # Esto cubre jornada de verano, previos a festivo y otras reducciones.
-                min_f = None
-                depto_norm = _text(r.get("Departamento")).upper()
+                depto_norm = str(r.get("Departamento") or "").upper().strip()
 
-                # Para MOI/ESTRUCTURA el nº mínimo depende de Horas programadas.
-                # Si CRECE no devuelve ese dato, no fabricamos un mínimo por día de semana.
+                # Cantidad de fichajes: para MOI/ESTRUCTURA depende de la jornada
+                # programada real; para MOD el mínimo general es 2.
+                min_f = None
                 if depto_norm in ["MOI", "ESTRUCTURA"]:
-                    min_f = None
                     if exp_known and exp_min is not None and exp_min > 0:
                         min_f = 2 if exp_min <= (6 * 60 + 35) else 4
                 elif depto_norm == "MOD":
                     min_f = 2
 
-                # Las reglas especiales por persona siguen teniendo prioridad.
                 sp = _lookup_special(depto_norm, norm_name(r.get("Nombre")))
                 if sp and "min_fichajes" in sp:
                     min_f = int(sp["min_fichajes"])
@@ -2085,14 +1876,15 @@ if consultar:
                     exp_known
                     and exp_min is not None
                     and exp_min > 0
-                    and worked_minutes >= max(0, exp_min - 5)
+                    and worked_minutes >= max(0, exp_min - TOLERANCIA_MINUTOS)
                 )
 
-                if min_f is not None and pd.notna(min_f):
+                if min_f is not None:
                     try:
                         min_f_i = int(min_f)
                         if num_fich < min_f_i:
                             motivos.append(f"Fichajes insuficientes (mín {min_f_i})")
+
                         max_ok = r.get("max_fichajes_ok")
                         if pd.notna(max_ok):
                             max_ok_i = int(max_ok)
@@ -2145,8 +1937,8 @@ if consultar:
                 ])
 
         # --------- BAJAS ----------
-        # Se reutiliza la misma lectura de /informes/empleados usada para
-        # horas_programadas; no se vuelve a consultar el API día a día.
+        # Se reutiliza la MISMA lectura diaria de /informes/empleados utilizada
+        # para Horas programadas. No se vuelve a golpear el endpoint.
         bajas_por_dia = {}
         if bajas_min_map_query:
             base_by_nif = (
@@ -2154,12 +1946,12 @@ if consultar:
                 .drop_duplicates(subset=["nif"])
                 .set_index("nif", drop=False)
             )
-            bajas_rows_by_day: dict[str, list[dict]] = {}
+            rows_by_day: dict[str, list[dict]] = {}
             for (nif_b, day_b), baja_mins in bajas_min_map_query.items():
                 if int(baja_mins or 0) <= 0 or nif_b not in base_by_nif.index:
                     continue
                 emp = base_by_nif.loc[nif_b]
-                bajas_rows_by_day.setdefault(day_b, []).append(
+                rows_by_day.setdefault(day_b, []).append(
                     {
                         "Fecha": day_b,
                         "Empresa": _text(emp.get("Empresa")),
@@ -2171,11 +1963,13 @@ if consultar:
                     }
                 )
 
-            for day_b, rows_b in bajas_rows_by_day.items():
+            for day_b, rows_b in rows_by_day.items():
                 out = pd.DataFrame(rows_b)
                 out = out[out["Nombre"].astype(str).str.strip().ne("")]
                 if not out.empty:
-                    bajas_por_dia[day_b] = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
+                    bajas_por_dia[day_b] = (
+                        out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
+                    )
 
         # --------- SIN FICHAJES ----------
         sin_por_dia = {}
@@ -2192,29 +1986,31 @@ if consultar:
         presentes = {}
         if not df_fich.empty:
             for day, sub in df_fich.groupby("fecha_dia"):
-                presentes[str(day)] = set(sub["nif"].dropna().astype(str).str.upper().str.strip().tolist())
+                presentes[str(day)] = set(
+                    sub["nif"].dropna().astype(str).str.upper().str.strip().tolist()
+                )
+
+        bajas_nifs_by_day: dict[str, set[str]] = {}
+        for (nif_b, day_b), baja_mins in (bajas_min_map_query or {}).items():
+            if int(baja_mins or 0) > 0:
+                bajas_nifs_by_day.setdefault(str(day_b), set()).add(str(nif_b).upper().strip())
 
         for cur in _iter_days(d0, d1):
             day = cur.strftime("%Y-%m-%d")
             present_set = presentes.get(day, set())
 
-            # "Sin fichajes" solo tiene sentido si CRECE programa jornada > 0.
-            # Así no aparecen fines de semana, festivos/cierres o días libres con HP=0.
-            # Las personas con baja laboral del día ya se muestran en su pestaña y no
-            # se duplican aquí como falsa ausencia de fichaje.
+            # Solo puede faltar fichaje si CRECE programa jornada > 0.
             expected_to_work = {
                 n for n in empleados_nifs
                 if int(horas_prog_map_query.get((n, day), 0) or 0) > 0
             }
-            on_sick_leave = {
-                n for n in empleados_nifs
-                if int(bajas_min_map_query.get((n, day), 0) or 0) > 0
-            }
+            on_sick_leave = bajas_nifs_by_day.get(day, set())
             fully_accounted = {
                 n for n in expected_to_work
                 if int(tc_map_query.get((n, day), 0) or 0)
                 >= max(0, int(horas_prog_map_query.get((n, day), 0) or 0) - TOLERANCIA_MINUTOS)
             }
+
             missing = sorted(expected_to_work - present_set - on_sick_leave - fully_accounted)
             if not missing:
                 continue
@@ -2229,7 +2025,7 @@ if consultar:
             out = out.sort_values(["Nombre"], kind="mergesort").reset_index(drop=True)
             sin_por_dia[day] = out
 
-        
+
         # --------- EXCESO SEMANAL (MOI + ESTRUCTURA + MOD) ----------
         # ✅ Criterio (RRHH):
         #   - Trabajado diario SIEMPRE = tiempoContabilizado (exportacion/tiempo-trabajado), haya fichaje o no.
@@ -2238,20 +2034,25 @@ if consultar:
         #   - Exceso semanal = suma de balances diarios cuantizados (con signo, puede ser + o -).
         #   - Exceso no tiene incidencias, solo cálculo de balance.
 
+        # Semanas completas disponibles dentro del rango (L-V, L-S, L-D)
+        try:
+            full_weeks = list_full_workweeks_in_range(d0, d1)  # [(mon, end_incl, mode), ...]
+        except Exception:
+            full_weeks = []
+
         excesos_por_semana = {}
+        csv_excesos = b""
 
         if full_weeks:
-            # Reutilizamos exactamente los mismos mapas diarios ya validados para Fichajes.
+            # Reutilizamos exactamente los mismos mapas usados por Fichajes/Sin fichajes.
             horas_prog_map = horas_prog_map_query
+            tc_map = tc_map_query
 
             def expected_day_minutes(nif: str, day: date):
                 key = (str(nif).upper().strip(), day.strftime("%Y-%m-%d"))
                 if key not in horas_prog_map:
                     return None
                 return int(horas_prog_map[key])
-
-            # 2) tiempoContabilizado (minutos), compartido con Fichajes
-            tc_map = tc_map_query
 
             def worked_day_minutes(nif: str, day: date) -> int:
                 return int(tc_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
@@ -2260,6 +2061,8 @@ if consultar:
             base_exc = base_emp.copy()
             base_exc["Departamento_norm"] = base_exc.get("departamento_nombre", base_exc.get("Departamento", "")).astype(str).str.upper().str.strip()
             base_exc = base_exc[base_exc["Departamento_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])].copy()
+
+            all_rows = []
 
             for wk_start, wk_end_incl, mode in full_weeks:
                 # Etiqueta UI
@@ -2323,6 +2126,7 @@ if consultar:
                             "nif": nif,
                         }
                         rows.append(row)
+                        all_rows.append({"Semana": label, **{k: v for k, v in row.items() if k != "nif"}})
 
                 if rows:
                     dfw = (
@@ -2335,7 +2139,13 @@ if consultar:
 
                 excesos_por_semana[label] = dfw
 
-
+            if all_rows:
+                df_all = (
+                    pd.DataFrame(all_rows)
+                    .sort_values(["Semana", "Empresa", "Sede", "Departamento", "Nombre"], kind="mergesort")
+                    .reset_index(drop=True)
+                )
+                csv_excesos = df_all.to_csv(index=False).encode("utf-8")
 if consultar:
     # --------- Guardar en estado + CSVs ----------
     incidencias_por_dia = {}
@@ -2356,7 +2166,25 @@ if consultar:
     st.session_state["result_bajas"] = bajas_por_dia
     st.session_state["result_sin_fichajes"] = sin_por_dia
     st.session_state["result_excesos_semana"] = excesos_por_semana
+    st.session_state["result_informe_missing_days"] = list(informe_missing_days or [])
 
+    st.session_state["result_csv_incidencias"] = (
+        _df_view(salida_incidencias).to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
+    )
+
+    if bajas_por_dia:
+        df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_bajas"] = _df_view(df_all_bajas).to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_bajas"] = b""
+
+    if sin_por_dia:
+        df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
+        st.session_state["result_csv_sin"] = _df_view(df_all_sin).to_csv(index=False).encode("utf-8")
+    else:
+        st.session_state["result_csv_sin"] = b""
+
+    st.session_state["result_csv_excesos"] = csv_excesos
 
 
 # ------------------------------------------------------------
@@ -2367,10 +2195,13 @@ ff_sig = fecha_fin.strftime("%Y-%m-%d")
 current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes, sel_empleados_nifs)
 
 last_sig = st.session_state.get("last_sig", "")
+results_match = (last_sig == current_sig)
 if not last_sig:
     # En el arranque (sin haber pulsado Consultar) NO mostramos nada más que los filtros.
     # Importante: sin mensajes ni pestañas.
     st.stop()
+elif not results_match:
+    pass
 
 
 try:
@@ -2394,16 +2225,17 @@ scope_ff = st.session_state.get("scope_ff", "")
 scope_emp_norm = set(st.session_state.get("scope_empresas_norm", set()) or set())
 scope_sed_norm = set(st.session_state.get("scope_sedes_norm", set()) or set())
 scope_emp_nifs = set(st.session_state.get("scope_empleados_nif", set()) or set())
-scope_used_employee_filter = bool(st.session_state.get("scope_used_employee_filter", False))
 active_emp_nifs = set(sel_empleados_nifs or set())
 
+scope_used_employee_filter = bool(st.session_state.get("scope_used_employee_filter", False))
 same_dates_as_scope = (scope_fi == fecha_inicio.isoformat()) and (scope_ff == fecha_fin.isoformat())
+
 if active_emp_nifs:
-    # Si hay empleados seleccionados, ese filtro manda por encima de Empresa/Sede.
+    # Con empleados seleccionados, ese filtro manda sobre Empresa/Sede.
     can_filter_locally = same_dates_as_scope and active_emp_nifs.issubset(scope_emp_nifs)
 else:
-    # Si la consulta original era por empleados concretos, quitar el filtro de empleados
-    # amplía el universo; hay que consultar de nuevo para no mostrar datos incompletos.
+    # Quitar un filtro de empleados de una consulta originalmente limitada amplía
+    # el universo y exige volver a consultar.
     can_filter_locally = (
         same_dates_as_scope
         and not scope_used_employee_filter
@@ -2458,23 +2290,22 @@ if can_filter_locally:
     res_sin = _filter_day_dict(res_sin)
     res_exc = _filter_day_dict(res_exc)
 else:
-    # Si el usuario AMPLÍA el alcance o cambia fechas, los resultados anteriores ya no
-    # representan los filtros visibles. Los ocultamos hasta una nueva consulta para no
-    # inducir a RRHH a interpretar datos antiguos como si fueran actuales.
+    # Si el alcance visible ya no está contenido en la última consulta, no se
+    # muestran resultados antiguos bajo filtros nuevos.
     if st.session_state.get("last_sig", ""):
         if not same_dates_as_scope:
             st.info("ℹ️ Has cambiado el rango de fechas respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
         elif active_emp_nifs and not active_emp_nifs.issubset(scope_emp_nifs):
             st.info("ℹ️ Has ampliado Empleados respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
-        elif scope_used_employee_filter:
-            st.info("ℹ️ Has quitado el filtro de empleados de una consulta limitada a empleados concretos. Pulsa **Consultar** para cargar el universo completo de Empresa/Sede.")
+        elif scope_used_employee_filter and not active_emp_nifs:
+            st.info("ℹ️ Has quitado el filtro de empleados de una consulta limitada. Pulsa **Consultar** para cargar el universo completo.")
         elif (not active_emp_norm.issubset(scope_emp_norm)) or (not active_sed_norm.issubset(scope_sed_norm)):
             st.info("ℹ️ Has ampliado Empresa/Sede respecto a la última consulta. Pulsa **Consultar** para recargar datos.")
         st.stop()
 
 
 def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> bytes:
-    """CSV de lo que se está mostrando ahora (respeta re-filtrado local)."""
+    """CSV de lo que realmente se está mostrando tras el re-filtrado local."""
     parts = []
     for key, df in (result_dict or {}).items():
         if not isinstance(df, pd.DataFrame) or df.empty:
@@ -2488,7 +2319,18 @@ def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> byte
     return pd.concat(parts, ignore_index=True).to_csv(index=False).encode("utf-8")
 
 
-# Tabs: Exceso solo aparece cuando el rango contiene al menos una semana completa.
+# Aviso no bloqueante únicamente si CRECE ha dejado alguna fecha sin informe.
+_missing_days_ui = list(st.session_state.get("result_informe_missing_days", []) or [])
+if _missing_days_ui:
+    st.warning(
+        f"CRECE no ha devuelto el informe diario para {len(_missing_days_ui)} fecha(s). "
+        "La consulta continúa y no inventa jornadas: en esas fechas se omiten solo "
+        "las validaciones que dependen de Horas programadas."
+    )
+
+
+# Tabs: en rangos cortos (menos de 7 días) solo mostramos Fichajes/Bajas/Sin fichajes
+range_days = (fecha_fin - fecha_inicio).days + 1 if fecha_fin >= fecha_inicio else 0
 tab_labels = ["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"]
 show_exceso_tab = bool(weeks_ui)
 if show_exceso_tab:
