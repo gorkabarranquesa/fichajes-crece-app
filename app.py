@@ -983,30 +983,33 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> dict:
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """Consulta el informe de empleados sin asumir un único encoding POST.
+    """Consulta /informes/empleados como informe POR PERIODO.
 
-    En este entorno CRECE ha funcionado históricamente con JSON. El manual
-    documenta parámetros POST sin fijar Content-Type, así que mantenemos JSON
-    como primera opción y form-urlencoded como fallback. Nunca se registran
-    payloads, tokens ni PII.
+    El manual documenta fecha_desde/fecha_hasta como parámetros POST. Probamos
+    primero form-urlencoded (forma habitual del API CRECE) y dejamos JSON como
+    compatibilidad. Solo aceptamos una respuesta si contiene filas de informe;
+    un HTTP 200 con wrapper/error no se considera una lectura válida.
     """
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
 
-    for as_json in (True, False):
+    for mode in ("form", "json"):
         try:
             resp = safe_request(
                 "POST",
                 url,
-                json_body=body if as_json else None,
-                data=None if as_json else body,
+                data=body if mode == "form" else None,
+                json_body=body if mode == "json" else None,
                 timeout=(5, 60),
             )
             if resp is None:
                 continue
             resp.raise_for_status()
             parsed = _try_parse_encrypted_response(resp)
-            if parsed is not None:
+            if parsed is None:
+                continue
+            # Evita aceptar como éxito un objeto de error/wrapper sin empleados.
+            if _extract_rows_from_informe(parsed):
                 return parsed
         except Exception as e:
             _safe_fail(e)
@@ -1057,12 +1060,22 @@ def _row_get_alias(row: dict, aliases: list[str]):
 
 
 def _canonical_emp_code(value) -> str:
-    """Código de empleado estable: ignora ceros a la izquierda si es numérico."""
-    s = str(value or "").strip()
+    """Código de empleado estable.
+
+    Normaliza 00055, 55 y 55.0 al mismo valor para poder enlazar de forma
+    fiable exportación de empleados con Nº empleado del informe.
+    """
+    s = _text(value)
     if not s:
         return ""
     if s.isdigit():
         return s.lstrip("0") or "0"
+    try:
+        num = float(s.replace(",", "."))
+        if num >= 0 and num.is_integer():
+            return str(int(num))
+    except Exception:
+        pass
     return s.upper()
 
 
@@ -1421,20 +1434,33 @@ def _metrics_from_informe_payload(rep) -> dict:
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def _cached_informe_one_day_metrics(day_iso: str) -> dict:
-    """Consulta una fecha y cachea únicamente métricas pseudonimizadas.
+def _cached_informe_period_metrics(fecha_desde: str, fecha_hasta: str) -> dict:
+    """Métricas agregadas de /informes/empleados para un periodo.
 
-    Si CRECE falla, se lanza excepción. Streamlit no cachea la excepción, de modo
-    que una consulta posterior puede reintentar esa fecha en lugar de quedarse
-    con un fallo cacheado.
+    El manual define este endpoint como un INFORME POR PERIODO. Por tanto,
+    no lo tratamos como un endpoint diario. Cacheamos únicamente métricas
+    pseudonimizadas (hash de Nº empleado -> minutos), nunca el payload ni PII.
     """
-    rep = api_informe_empleados(day_iso, day_iso)
+    rep = api_informe_empleados(fecha_desde, fecha_hasta)
     if rep is None:
-        raise RuntimeError(f"Informe de empleados no disponible para {day_iso}")
+        raise RuntimeError(
+            f"Informe de empleados no disponible para {fecha_desde}..{fecha_hasta}"
+        )
     rows = _extract_rows_from_informe(rep)
     if not rows:
-        raise RuntimeError(f"Informe de empleados vacío/no interpretable para {day_iso}")
+        raise RuntimeError(
+            f"Informe de empleados vacío/no interpretable para {fecha_desde}..{fecha_hasta}"
+        )
     return _metrics_from_informe_payload(rep)
+
+
+def _chunk_date_ranges(d0: date, d1: date, chunk_days: int = 31):
+    """Divide un rango en bloques pequeños para evitar informes acumulados enormes."""
+    cur = d0
+    while cur <= d1:
+        end = min(d1, cur + timedelta(days=max(1, int(chunk_days)) - 1))
+        yield cur, end
+        cur = end + timedelta(days=1)
 
 
 def build_informe_diario_maps_resilient(
@@ -1442,14 +1468,25 @@ def build_informe_diario_maps_resilient(
     d1: date,
     base_emp: pd.DataFrame,
 ) -> tuple[dict, dict, list[str]]:
-    """Devuelve HP, bajas y fechas de informe no disponibles.
+    """Reconstruye Horas programadas y Bajas DIARIAS desde el informe por periodo.
 
-    Una sola llamada de /informes/empleados por fecha alimenta HP y Bajas.
-    Los fallos se reintentan secuencialmente y nunca tumban todo el rango.
-    Para una fecha realmente no disponible no se inventa HP=0: simplemente se
-    omiten las reglas que dependen de la jornada programada de ese día.
+    Motivo:
+    /api/informes/empleados devuelve métricas agregadas DEL PERIODO. Consultarlo
+    con fecha_desde == fecha_hasta ha demostrado no ser fiable en esta intranet.
+
+    Estrategia:
+    - Para cada bloque de hasta 31 días usamos un ancla dos días anterior.
+    - Consultamos acumulados [ancla..fin] para cada fecha de corte.
+    - El valor del día D es la diferencia:
+          acumulado(ancla..D) - acumulado(ancla..D-1)
+    - Ambas consultas abarcan al menos 2 días, por lo que no dependemos de la
+      consulta "mismo día -> mismo día".
+    - La misma reconstrucción obtiene Horas programadas y Horas de baja.
+    - Un 0 derivado es un cero real; un fallo de API NO se transforma en 0.
+
+    La caché conserva únicamente hashes de Nº empleado y minutos.
     """
-    if base_emp is None or base_emp.empty:
+    if base_emp is None or base_emp.empty or d0 > d1:
         return {}, {}, []
 
     be = base_emp.copy()
@@ -1466,60 +1503,129 @@ def build_informe_diario_maps_resilient(
             emp_hash_to_nif[_hash_emp_code(code)] = nif
 
     if not emp_hash_to_nif:
-        return {}, {}, []
+        # Sin Nº empleado no se puede enlazar de forma fiable con el informe.
+        return {}, {}, [
+            d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)
+        ]
 
-    days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
-    if not days:
-        return {}, {}, []
+    # Preparamos todas las consultas acumuladas necesarias.
+    # key=(anchor_iso,end_iso) -> métricas
+    request_pairs: set[tuple[str, str]] = set()
+    chunks: list[tuple[date, date, date]] = []
+    for c0, c1 in _chunk_date_ranges(d0, d1, 31):
+        anchor = c0 - timedelta(days=2)
+        chunks.append((c0, c1, anchor))
 
-    metrics_by_day: dict[str, dict] = {}
-    failed_days: list[str] = []
+        # Corte previo al primer día del bloque y cada día del bloque.
+        first_cut = c0 - timedelta(days=1)
+        cuts = [first_cut] + list(_iter_days(c0, c1))
+        for cut in cuts:
+            request_pairs.add(
+                (anchor.strftime("%Y-%m-%d"), cut.strftime("%Y-%m-%d"))
+            )
 
-    # Primera pasada con concurrencia baja. Esto conserva velocidad sin lanzar
-    # decenas de informes pesados a la vez.
-    workers = max(1, min(3, len(days)))
+    metrics_by_pair: dict[tuple[str, str], dict] = {}
+    failed_pairs: list[tuple[str, str]] = []
+
+    def _fetch(pair: tuple[str, str]):
+        a, b = pair
+        return pair, _cached_informe_period_metrics(a, b)
+
+    # Concurrencia baja: el informe es pesado.
+    workers = max(1, min(3, len(request_pairs)))
     with ThreadPoolExecutor(max_workers=workers) as exe:
-        futs = {exe.submit(_cached_informe_one_day_metrics, day): day for day in days}
+        futs = {exe.submit(_fetch, pair): pair for pair in request_pairs}
         for fut in as_completed(futs):
-            day = futs[fut]
+            pair = futs[fut]
             try:
-                metrics_by_day[day] = fut.result()
+                pair_r, metrics = fut.result()
+                metrics_by_pair[pair_r] = metrics
             except Exception as exc:
                 _safe_fail(exc)
-                failed_days.append(day)
+                failed_pairs.append(pair)
 
-    # Segunda pasada secuencial para los fallos: reduce rate-limit y permite
-    # recuperar timeouts/5xx transitorios sin abortar la consulta completa.
-    unresolved: list[str] = []
-    for day in sorted(set(failed_days)):
+    # Reintento secuencial de pares fallidos.
+    unresolved_pairs: set[tuple[str, str]] = set()
+    for pair in sorted(set(failed_pairs)):
         ok = False
         for attempt in range(2):
             if attempt:
                 time.sleep(0.8)
             try:
-                metrics_by_day[day] = _cached_informe_one_day_metrics(day)
+                _, metrics = _fetch(pair)
+                metrics_by_pair[pair] = metrics
                 ok = True
                 break
             except Exception as exc:
                 _safe_fail(exc)
         if not ok:
-            unresolved.append(day)
+            unresolved_pairs.add(pair)
 
     hp_out: dict[tuple[str, str], int] = {}
     baja_out: dict[tuple[str, str], int] = {}
+    unresolved_days: set[str] = set()
 
-    for day, metrics in metrics_by_day.items():
-        for he, mins in ((metrics or {}).get("hp", {}) or {}).items():
-            nif = emp_hash_to_nif.get(he)
-            if nif:
-                hp_out[(nif, day)] = int(mins)
-        for he, mins in ((metrics or {}).get("baja", {}) or {}).items():
-            nif = emp_hash_to_nif.get(he)
-            if nif:
-                baja_out[(nif, day)] = int(mins)
+    def _delta(curr: dict, prev: dict, section: str, he: str):
+        c = int((((curr or {}).get(section, {}) or {}).get(he, 0)) or 0)
+        p = int((((prev or {}).get(section, {}) or {}).get(he, 0)) or 0)
+        return c - p
 
-    return hp_out, baja_out, unresolved
+    for c0, c1, anchor in chunks:
+        anchor_iso = anchor.strftime("%Y-%m-%d")
+        prev_cut = c0 - timedelta(days=1)
 
+        for day in _iter_days(c0, c1):
+            day_iso = day.strftime("%Y-%m-%d")
+            prev_iso = prev_cut.strftime("%Y-%m-%d")
+            pair_prev = (anchor_iso, prev_iso)
+            pair_curr = (anchor_iso, day_iso)
+
+            if (
+                pair_prev in unresolved_pairs
+                or pair_curr in unresolved_pairs
+                or pair_prev not in metrics_by_pair
+                or pair_curr not in metrics_by_pair
+            ):
+                unresolved_days.add(day_iso)
+                prev_cut = day
+                continue
+
+            prev_metrics = metrics_by_pair[pair_prev]
+            curr_metrics = metrics_by_pair[pair_curr]
+
+            day_bad = False
+            for he, nif in emp_hash_to_nif.items():
+                hp_delta = _delta(curr_metrics, prev_metrics, "hp", he)
+                baja_delta = _delta(curr_metrics, prev_metrics, "baja", he)
+
+                # Pequeños negativos pueden venir de redondeo decimal del informe.
+                # Negativos materiales indican que no podemos reconstruir ese día.
+                if hp_delta < -5 or baja_delta < -5:
+                    day_bad = True
+                    continue
+
+                hp_out[(nif, day_iso)] = max(0, hp_delta)
+                if baja_delta > 0:
+                    baja_out[(nif, day_iso)] = max(0, baja_delta)
+
+            if day_bad:
+                unresolved_days.add(day_iso)
+
+            prev_cut = day
+
+    # Si una fecha quedó dudosa, eliminamos todas sus HP derivadas para no mezclar
+    # datos fiables con parciales.
+    if unresolved_days:
+        hp_out = {
+            k: v for k, v in hp_out.items()
+            if k[1] not in unresolved_days
+        }
+        baja_out = {
+            k: v for k, v in baja_out.items()
+            if k[1] not in unresolved_days
+        }
+
+    return hp_out, baja_out, sorted(unresolved_days)
 
 
 
@@ -2113,6 +2219,24 @@ if consultar:
             def worked_day_minutes(nif: str, day: date) -> int:
                 return int(tc_map.get((str(nif).upper().strip(), day.strftime("%Y-%m-%d")), 0) or 0)
 
+            # Primera entrada por día: solo se usa para el matiz MOD del balance.
+            # La columna "Trabajado semanal" sigue sumando TODO tiempoContabilizado.
+            primera_entrada_map: dict[tuple[str, str], int] = {}
+            if not df_fich.empty:
+                _entradas_exc = df_fich[df_fich["direccion"] == "entrada"].copy()
+                if not _entradas_exc.empty:
+                    _grp_exc = (
+                        _entradas_exc.groupby(["nif", "fecha_dia"], as_index=False)["fecha_dt"]
+                        .min()
+                    )
+                    for _, _rr in _grp_exc.iterrows():
+                        _nif_e = str(_rr.get("nif") or "").upper().strip()
+                        _day_e = str(_rr.get("fecha_dia") or "")
+                        _ts_e = _rr.get("fecha_dt")
+                        if _nif_e and _day_e and pd.notna(_ts_e):
+                            _dt_e = pd.to_datetime(_ts_e)
+                            primera_entrada_map[(_nif_e, _day_e)] = int(_dt_e.hour * 60 + _dt_e.minute)
+
             # 3) Cálculo por semana y empleado (NO depende de que haya fichajes)
             base_exc = base_emp.copy()
             base_exc["Departamento_norm"] = base_exc.get("departamento_nombre", base_exc.get("Departamento", "")).astype(str).str.upper().str.strip()
@@ -2154,10 +2278,22 @@ if consultar:
                                 expected_complete = False
                                 break
 
+                            # La columna semanal muestra siempre el tiempoContabilizado
+                            # completo de CRECE, tal como pidió RRHH.
                             trabajado_sem_min += int(mins_tc)
                             jornada_sem_min += int(exp_day)
 
-                            diff_day = int(mins_tc) - int(exp_day)
+                            # Matiz MOD: en días laborables el tiempo anterior al inicio
+                            # de turno no suma al BALANCE diario. No se modifica el total
+                            # mostrado en "Trabajado semanal".
+                            mins_balance = int(mins_tc)
+                            if str(depto).upper().strip() == "MOD" and int(exp_day) > 0:
+                                pe = primera_entrada_map.get(
+                                    (nif, cur_day.strftime("%Y-%m-%d"))
+                                )
+                                mins_balance = effective_worked_minutes_for_mod(mins_tc, pe)
+
+                            diff_day = int(mins_balance) - int(exp_day)
                             bal_day_q = quantize_daily_balance_30(diff_day, tol=5)
                             exceso_sem_min += int(bal_day_q)
                             cur_day += timedelta(days=1)
@@ -2379,9 +2515,9 @@ def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> byte
 _missing_days_ui = list(st.session_state.get("result_informe_missing_days", []) or [])
 if _missing_days_ui:
     st.warning(
-        f"CRECE no ha devuelto el informe diario para {len(_missing_days_ui)} fecha(s). "
-        "La consulta continúa y no inventa jornadas: en esas fechas se omiten solo "
-        "las validaciones que dependen de Horas programadas."
+        f"No se ha podido reconstruir de forma fiable la jornada programada para "
+        f"{len(_missing_days_ui)} fecha(s). La consulta continúa sin inventar datos; "
+        "esas fechas se omiten únicamente de las validaciones que necesitan Horas programadas."
     )
 
 
@@ -2410,7 +2546,13 @@ if "tab_fich" in tab_map:
     with tab_map["tab_fich"]:
         incid = res_incid
         if not incid:
-            st.success("🎉 No hay incidencias en el rango seleccionado.")
+            if _missing_days_ui:
+                st.warning(
+                    "No hay incidencias mostrables, pero faltan datos de jornada programada "
+                    "para parte del rango y no se pueden validar todas las reglas dependientes de Horas programadas."
+                )
+            else:
+                st.success("🎉 No hay incidencias en el rango seleccionado.")
         else:
             for day in sorted(incid.keys()):
                 view_df = _df_view(incid[day])
@@ -2426,7 +2568,13 @@ if "tab_bajas" in tab_map:
     with tab_map["tab_bajas"]:
         bajas = res_bajas
         if not bajas:
-            st.info("No hay empleados de baja en el rango seleccionado.")
+            if _missing_days_ui:
+                st.warning(
+                    "No se puede confirmar que no haya bajas en todo el rango porque faltan "
+                    "datos del informe de empleados para algunas fechas."
+                )
+            else:
+                st.info("No hay empleados de baja en el rango seleccionado.")
         else:
             for day in sorted(bajas.keys()):
                 view_df = _df_view(bajas.get(day))
@@ -2442,7 +2590,13 @@ if "tab_sin" in tab_map:
     with tab_map["tab_sin"]:
         sinf = res_sin
         if not sinf:
-            st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
+            if _missing_days_ui:
+                st.warning(
+                    "No se puede confirmar que no haya empleados sin fichajes en todo el rango "
+                    "porque faltan Horas programadas para algunas fechas."
+                )
+            else:
+                st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
         else:
             for day in sorted(sinf.keys()):
                 view_df = _df_view(sinf.get(day))
@@ -2470,7 +2624,13 @@ if "tab_exc" in tab_map:
             st.data_editor(_df_view(dfw), use_container_width=True, hide_index=True, disabled=True, num_rows="fixed", key=_make_editor_key('exceso', label, current_sig))
 
         if not shown_any_week:
-            st.info("No hay excesos de jornada en el rango seleccionado.")
+            if _missing_days_ui:
+                st.warning(
+                    "No se puede confirmar que no haya excesos de jornada: faltan Horas programadas "
+                    "para parte del rango."
+                )
+            else:
+                st.info("No hay excesos de jornada en el rango seleccionado.")
 
         csv_w = _csv_from_result_dict(res_exc, week_mode=True)
         if csv_w:
