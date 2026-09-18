@@ -727,16 +727,16 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
     resp = safe_request("POST", url, data=data)
     if resp is None:
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
     try:
         resp.raise_for_status()
     except Exception:
         _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/empleados"))
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
 
     data_dec = _try_parse_encrypted_response(resp)
     if not isinstance(data_dec, list):
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
 
     empleados = data_dec
     lista = []
@@ -770,6 +770,14 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             or e.get("idEmpleado")
         )
 
+        empleado_id = (
+            e.get("id")
+            or e.get("empleado_id")
+            or e.get("empleadoId")
+            or e.get("employee_id")
+            or e.get("employeeId")
+        )
+
         row = {
             "nif": e.get("nif"),
             "nombre_completo": nombre_completo,
@@ -777,6 +785,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             "empresa_id": empresa_id,
             "sede_id": sede_id,
             "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
+            "empleado_id": str(empleado_id).strip() if empleado_id is not None else "",
         }
 
         for k in [
@@ -799,6 +808,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     if not df.empty:
         df["nif"] = df["nif"].fillna("").astype(str).str.upper().str.strip()
         df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
+        df["empleado_id"] = df.get("empleado_id", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
     return df
 
 
@@ -1016,6 +1026,185 @@ def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
             continue
 
     return None
+
+
+def api_informe_turnos(fecha_desde: str, fecha_hasta: str):
+    """Informe diario de turnos asignados.
+
+    El manual 3.3 devuelve una fila por turno con Empleado ID, Número de
+    empleado, Nombre, Fecha y Horario duración computada. Se consulta sin
+    filtro de empleados y se filtra en memoria para no mezclar ID interno con
+    Nº empleado.
+    """
+    url = f"{API_URL_BASE}/informes/turnos"
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+
+    for mode in ("form", "json"):
+        try:
+            resp = safe_request(
+                "POST",
+                url,
+                data=body if mode == "form" else None,
+                json_body=body if mode == "json" else None,
+                timeout=(5, 60),
+            )
+            if resp is None:
+                continue
+            resp.raise_for_status()
+            parsed = _try_parse_encrypted_response(resp)
+            if isinstance(parsed, (list, dict)):
+                return parsed
+        except Exception as exc:
+            _safe_fail(exc)
+    return None
+
+
+def _extract_turnos_rows(rep):
+    """Normaliza /informes/turnos según el orden documentado por CRECE.
+
+    Array posicional:
+      0 Turno ID
+      1 Empleado ID
+      2 Número de empleado
+      3 Nombre y apellidos
+      4 Fecha
+      5 Horario ID
+      6 Horario abreviatura
+      7 Horario color
+      8 Horario duración computada
+      9 Horario texto
+    """
+    if rep is None:
+        return []
+
+    raw = rep
+    if isinstance(rep, dict):
+        for key in ("data", "turnos", "results", "resultado", "items"):
+            val = rep.get(key)
+            if isinstance(val, list):
+                raw = val
+                break
+        else:
+            vals = list(rep.values())
+            raw = vals if vals and all(isinstance(v, (dict, list, tuple)) for v in vals) else []
+
+    if not isinstance(raw, list):
+        return []
+
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            found_eid, eid = _row_get_alias(item, [
+                "Empleado ID", "empleado_id", "empleadoId", "employee_id", "employeeId"
+            ])
+            found_num, num = _row_get_alias(item, [
+                "Número de empleado", "Numero de empleado", "Nº empleado", "N° empleado",
+                "num_empleado", "numEmpleado", "employee_number", "employeeNumber"
+            ])
+            found_name, name = _row_get_alias(item, [
+                "Nombre y apellidos", "Nombre", "nombre", "nombre_completo", "name"
+            ])
+            found_date, fecha = _row_get_alias(item, ["Fecha", "fecha", "date"])
+            found_dur, dur = _row_get_alias(item, [
+                "Horario duración computada", "Horario duracion computada",
+                "duracion_computada", "duracionComputada", "horario_duracion_computada"
+            ])
+            if found_date and found_dur:
+                out.append({
+                    "empleado_id": eid if found_eid else None,
+                    "num_empleado": num if found_num else None,
+                    "nombre": name if found_name else None,
+                    "fecha": fecha,
+                    "duracion": dur,
+                })
+        elif isinstance(item, (list, tuple)) and len(item) >= 9:
+            out.append({
+                "empleado_id": item[1] if len(item) > 1 else None,
+                "num_empleado": item[2] if len(item) > 2 else None,
+                "nombre": item[3] if len(item) > 3 else None,
+                "fecha": item[4] if len(item) > 4 else None,
+                "duracion": item[8] if len(item) > 8 else None,
+            })
+    return out
+
+
+def _turnos_daily_map(d0: date, d1: date, base_emp: pd.DataFrame) -> dict:
+    """Devuelve {(NIF, fecha): minutos} a partir de /informes/turnos.
+
+    Mapea por ID interno, luego Nº empleado y como último recurso por nombre
+    normalizado cuando este es único en el alcance. Solo guarda filas explícitas
+    de CRECE; no convierte automáticamente la ausencia de turno en 0.
+    """
+    if base_emp is None or base_emp.empty or d0 > d1:
+        return {}
+
+    be = base_emp.copy()
+    be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
+    if "num_empleado" not in be.columns:
+        be["num_empleado"] = ""
+    if "empleado_id" not in be.columns:
+        be["empleado_id"] = ""
+    if "nombre_completo" not in be.columns:
+        be["nombre_completo"] = ""
+
+    by_id = {}
+    by_num = {}
+    name_groups = {}
+    for _, r in be.iterrows():
+        nif = _text(r.get("nif")).upper()
+        if not nif:
+            continue
+        eid = _canonical_emp_code(r.get("empleado_id"))
+        num = _canonical_emp_code(r.get("num_empleado"))
+        nam = norm_name(r.get("nombre_completo"))
+        if eid:
+            by_id[eid] = nif
+        if num:
+            by_num[num] = nif
+        if nam:
+            name_groups.setdefault(nam, set()).add(nif)
+    by_name = {k: next(iter(v)) for k, v in name_groups.items() if len(v) == 1}
+
+    out = {}
+    # Bloques moderados para evitar respuestas excesivamente grandes.
+    cur = d0
+    while cur <= d1:
+        end = min(d1, cur + timedelta(days=30))
+        rep = api_informe_turnos(cur.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if rep is not None:
+            for row in _extract_turnos_rows(rep):
+                nif = ""
+                eid = _canonical_emp_code(row.get("empleado_id"))
+                num = _canonical_emp_code(row.get("num_empleado"))
+                nam = norm_name(row.get("nombre"))
+                if eid:
+                    nif = by_id.get(eid, "")
+                if not nif and num:
+                    nif = by_num.get(num, "")
+                if not nif and nam:
+                    nif = by_name.get(nam, "")
+                if not nif:
+                    continue
+
+                try:
+                    dt = pd.to_datetime(row.get("fecha"), errors="coerce")
+                    if pd.isna(dt):
+                        continue
+                    day_iso = dt.date().strftime("%Y-%m-%d")
+                except Exception:
+                    continue
+
+                mins = _duration_value_to_minutes(row.get("duracion"))
+                if mins is None:
+                    continue
+                mins = max(0, int(mins))
+                # Si hubiera más de una fila de turno en el mismo día, usamos la
+                # mayor duración para evitar duplicar una reasignación del horario.
+                key = (nif, day_iso)
+                out[key] = max(out.get(key, 0), mins)
+        cur = end + timedelta(days=1)
+
+    return out
 
 
 # ============================================================
@@ -1463,28 +1652,120 @@ def _chunk_date_ranges(d0: date, d1: date, chunk_days: int = 31):
         cur = end + timedelta(days=1)
 
 
+
+def _metric_diff(curr: dict, prev: dict) -> dict:
+    """Resta dos informes acumulados preservando solo diferencias coherentes."""
+    out = {"hp": {}, "baja": {}}
+    for section in ("hp", "baja"):
+        cm = ((curr or {}).get(section, {}) or {})
+        pm = ((prev or {}).get(section, {}) or {})
+        for he in set(cm) | set(pm):
+            c = int(cm.get(he, 0) or 0)
+            p = int(pm.get(he, 0) or 0)
+            d = c - p
+            if d < -TOLERANCIA_MINUTOS:
+                continue
+            out[section][he] = max(0, d)
+    return out
+
+
+def _reconstruct_block_daily_metrics(b0: date, b1: date, total_metrics: dict | None) -> dict[str, dict]:
+    """Reconstruye métricas diarias de un bloque usando SOLO informes de periodo.
+
+    Evita depender de fecha_desde == fecha_hasta cuando el bloque tiene >=3 días.
+    Para un bloque D1..Dn:
+      D1 = total(D1..Dn) - total(D2..Dn)
+      Dk = total(D1..Dk) - total(D1..D{k-1})
+      Dn = total(D1..Dn) - total(D1..D{n-1})
+
+    Es una reconstrucción algebraica de las métricas agregadas documentadas por
+    CRECE; no introduce jornadas teóricas ni reglas propias.
+    """
+    if total_metrics is None or b0 > b1:
+        return {}
+    days = list(_iter_days(b0, b1))
+    n = len(days)
+    if n == 0:
+        return {}
+    if n == 1:
+        day = days[0].strftime("%Y-%m-%d")
+        try:
+            one = _cached_informe_period_metrics(day, day)
+            return {day: one}
+        except Exception as exc:
+            _safe_fail(exc)
+            return {}
+    if n == 2:
+        # No existe una descomposición sin usar al menos un periodo de un día.
+        out = {}
+        for d in days:
+            ds = d.strftime("%Y-%m-%d")
+            try:
+                out[ds] = _cached_informe_period_metrics(ds, ds)
+            except Exception as exc:
+                _safe_fail(exc)
+        return out
+
+    out = {}
+    total = total_metrics
+
+    # Primer día: total bloque - bloque sin el primer día.
+    try:
+        suffix = _cached_informe_period_metrics(
+            days[1].strftime("%Y-%m-%d"), days[-1].strftime("%Y-%m-%d")
+        )
+        first_metrics = _metric_diff(total, suffix)
+        out[days[0].strftime("%Y-%m-%d")] = first_metrics
+    except Exception as exc:
+        _safe_fail(exc)
+        first_metrics = None
+
+    # Días intermedios por diferencias de prefijos.
+    prev_prefix = first_metrics
+    for i in range(1, n - 1):
+        try:
+            prefix = _cached_informe_period_metrics(
+                days[0].strftime("%Y-%m-%d"), days[i].strftime("%Y-%m-%d")
+            )
+            if prev_prefix is None:
+                # Para i=1, prev_prefix debería ser D1. Si faltó, no podemos
+                # derivar D2 de forma fiable.
+                prev_prefix = prefix
+                continue
+            daily = _metric_diff(prefix, prev_prefix)
+            out[days[i].strftime("%Y-%m-%d")] = daily
+            prev_prefix = prefix
+        except Exception as exc:
+            _safe_fail(exc)
+            prev_prefix = None
+
+    # Último día = total - prefijo hasta penúltimo.
+    try:
+        prefix_pen = _cached_informe_period_metrics(
+            days[0].strftime("%Y-%m-%d"), days[-2].strftime("%Y-%m-%d")
+        )
+        out[days[-1].strftime("%Y-%m-%d")] = _metric_diff(total, prefix_pen)
+    except Exception as exc:
+        _safe_fail(exc)
+
+    return out
+
+
 def build_informe_diario_maps_resilient(
     d0: date,
     d1: date,
     base_emp: pd.DataFrame,
 ) -> tuple[dict, dict, list[str]]:
-    """Reconstruye Horas programadas y Bajas DIARIAS desde el informe por periodo.
+    """Construye HP/Bajas diarias usando dos fuentes oficiales de CRECE.
 
-    Motivo:
-    /api/informes/empleados devuelve métricas agregadas DEL PERIODO. Consultarlo
-    con fecha_desde == fecha_hasta ha demostrado no ser fiable en esta intranet.
-
-    Estrategia:
-    - Para cada bloque de hasta 31 días usamos un ancla dos días anterior.
-    - Consultamos acumulados [ancla..fin] para cada fecha de corte.
-    - El valor del día D es la diferencia:
-          acumulado(ancla..D) - acumulado(ancla..D-1)
-    - Ambas consultas abarcan al menos 2 días, por lo que no dependemos de la
-      consulta "mismo día -> mismo día".
-    - La misma reconstrucción obtiene Horas programadas y Horas de baja.
-    - Un 0 derivado es un cero real; un fallo de API NO se transforma en 0.
-
-    La caché conserva únicamente hashes de Nº empleado y minutos.
+    - /informes/empleados mantiene "Horas programadas" como fuente oficial.
+    - /informes/turnos aporta la distribución diaria explícita del horario.
+    - Si turnos y el total del informe cuadran (±5 min), los días sin turno se
+      confirman como 0.
+    - Si no cuadran, se reconstruye el día mediante diferencias entre informes
+      de PERIODO. Así no dependemos de fecha_desde == fecha_hasta.
+    - Bajas se reconstruyen por periodo únicamente en los bloques que realmente
+      tienen horas de baja.
     """
     if base_emp is None or base_emp.empty or d0 > d1:
         return {}, {}, []
@@ -1495,138 +1776,100 @@ def build_informe_diario_maps_resilient(
         be["num_empleado"] = ""
     be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
 
-    emp_hash_to_nif: dict[str, str] = {}
+    emp_hash_to_nif = {}
+    nif_to_hash = {}
     for _, row in be.iterrows():
         code = _text(row.get("num_empleado_code"))
         nif = _text(row.get("nif")).upper()
         if code and nif:
-            emp_hash_to_nif[_hash_emp_code(code)] = nif
+            he = _hash_emp_code(code)
+            emp_hash_to_nif[he] = nif
+            nif_to_hash[nif] = he
 
-    if not emp_hash_to_nif:
-        # Sin Nº empleado no se puede enlazar de forma fiable con el informe.
-        return {}, {}, [
-            d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)
-        ]
+    try:
+        turnos_map = _turnos_daily_map(d0, d1, be)
+    except Exception as exc:
+        _safe_fail(exc)
+        turnos_map = {}
 
-    # Preparamos todas las consultas acumuladas necesarias.
-    # key=(anchor_iso,end_iso) -> métricas
-    request_pairs: set[tuple[str, str]] = set()
-    chunks: list[tuple[date, date, date]] = []
-    for c0, c1 in _chunk_date_ranges(d0, d1, 31):
-        anchor = c0 - timedelta(days=2)
-        chunks.append((c0, c1, anchor))
+    hp_out = dict(turnos_map)
+    baja_out = {}
+    unresolved_employee_days = set()
 
-        # Corte previo al primer día del bloque y cada día del bloque.
-        first_cut = c0 - timedelta(days=1)
-        cuts = [first_cut] + list(_iter_days(c0, c1))
-        for cut in cuts:
-            request_pairs.add(
-                (anchor.strftime("%Y-%m-%d"), cut.strftime("%Y-%m-%d"))
-            )
+    # Bloques alineados a semana. El primero/último pueden ser parciales.
+    blocks = []
+    cur = d0
+    while cur <= d1:
+        end = min(d1, cur + timedelta(days=(6 - cur.weekday())))
+        blocks.append((cur, end))
+        cur = end + timedelta(days=1)
 
-    metrics_by_pair: dict[tuple[str, str], dict] = {}
-    failed_pairs: list[tuple[str, str]] = []
+    for b0, b1 in blocks:
+        b0s, b1s = b0.strftime("%Y-%m-%d"), b1.strftime("%Y-%m-%d")
+        try:
+            total_metrics = _cached_informe_period_metrics(b0s, b1s)
+        except Exception as exc:
+            _safe_fail(exc)
+            total_metrics = None
 
-    def _fetch(pair: tuple[str, str]):
-        a, b = pair
-        return pair, _cached_informe_period_metrics(a, b)
+        days = [d.strftime("%Y-%m-%d") for d in _iter_days(b0, b1)]
+        hp_agg = ((total_metrics or {}).get("hp", {}) or {})
+        baja_agg = ((total_metrics or {}).get("baja", {}) or {})
 
-    # Concurrencia baja: el informe es pesado.
-    workers = max(1, min(3, len(request_pairs)))
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        futs = {exe.submit(_fetch, pair): pair for pair in request_pairs}
-        for fut in as_completed(futs):
-            pair = futs[fut]
-            try:
-                pair_r, metrics = fut.result()
-                metrics_by_pair[pair_r] = metrics
-            except Exception as exc:
-                _safe_fail(exc)
-                failed_pairs.append(pair)
-
-    # Reintento secuencial de pares fallidos.
-    unresolved_pairs: set[tuple[str, str]] = set()
-    for pair in sorted(set(failed_pairs)):
-        ok = False
-        for attempt in range(2):
-            if attempt:
-                time.sleep(0.8)
-            try:
-                _, metrics = _fetch(pair)
-                metrics_by_pair[pair] = metrics
-                ok = True
-                break
-            except Exception as exc:
-                _safe_fail(exc)
-        if not ok:
-            unresolved_pairs.add(pair)
-
-    hp_out: dict[tuple[str, str], int] = {}
-    baja_out: dict[tuple[str, str], int] = {}
-    unresolved_days: set[str] = set()
-
-    def _delta(curr: dict, prev: dict, section: str, he: str):
-        c = int((((curr or {}).get(section, {}) or {}).get(he, 0)) or 0)
-        p = int((((prev or {}).get(section, {}) or {}).get(he, 0)) or 0)
-        return c - p
-
-    for c0, c1, anchor in chunks:
-        anchor_iso = anchor.strftime("%Y-%m-%d")
-        prev_cut = c0 - timedelta(days=1)
-
-        for day in _iter_days(c0, c1):
-            day_iso = day.strftime("%Y-%m-%d")
-            prev_iso = prev_cut.strftime("%Y-%m-%d")
-            pair_prev = (anchor_iso, prev_iso)
-            pair_curr = (anchor_iso, day_iso)
-
-            if (
-                pair_prev in unresolved_pairs
-                or pair_curr in unresolved_pairs
-                or pair_prev not in metrics_by_pair
-                or pair_curr not in metrics_by_pair
-            ):
-                unresolved_days.add(day_iso)
-                prev_cut = day
+        # Detectamos empleados cuyo reparto de turnos no puede validarse contra
+        # Horas programadas del informe oficial.
+        need_reconstruction = set()
+        for _, er in be.iterrows():
+            nif = _text(er.get("nif")).upper()
+            if not nif:
                 continue
+            he = nif_to_hash.get(nif)
+            agg_known = bool(he and he in hp_agg)
+            agg_hp = int(hp_agg.get(he, 0) or 0) if agg_known else None
+            explicit_sum = sum(int(hp_out.get((nif, day), 0) or 0) for day in days if (nif, day) in hp_out)
 
-            prev_metrics = metrics_by_pair[pair_prev]
-            curr_metrics = metrics_by_pair[pair_curr]
+            if agg_known and abs(explicit_sum - int(agg_hp)) <= TOLERANCIA_MINUTOS:
+                # Validado por el total oficial: ausencia de turno = 0 real.
+                for day in days:
+                    hp_out.setdefault((nif, day), 0)
+            else:
+                need_reconstruction.add(nif)
 
-            day_bad = False
-            for he, nif in emp_hash_to_nif.items():
-                hp_delta = _delta(curr_metrics, prev_metrics, "hp", he)
-                baja_delta = _delta(curr_metrics, prev_metrics, "baja", he)
+        # Solo reconstruimos el bloque si hace falta para HP o si contiene bajas.
+        block_has_baja = any(int(v or 0) > 0 for v in baja_agg.values())
+        daily_metrics = {}
+        if need_reconstruction or block_has_baja:
+            daily_metrics = _reconstruct_block_daily_metrics(b0, b1, total_metrics)
 
-                # Pequeños negativos pueden venir de redondeo decimal del informe.
-                # Negativos materiales indican que no podemos reconstruir ese día.
-                if hp_delta < -5 or baja_delta < -5:
-                    day_bad = True
-                    continue
+        # Aplicamos primero el HP reconstruido: es derivado directamente de
+        # Horas programadas del informe y por tanto prevalece sobre el turno.
+        for day, metrics in daily_metrics.items():
+            hp_day = ((metrics or {}).get("hp", {}) or {})
+            baja_day = ((metrics or {}).get("baja", {}) or {})
+            for he, mins in hp_day.items():
+                nif = emp_hash_to_nif.get(he)
+                if nif and (not need_reconstruction or nif in need_reconstruction):
+                    hp_out[(nif, day)] = int(mins)
+            for he, mins in baja_day.items():
+                nif = emp_hash_to_nif.get(he)
+                if nif and int(mins or 0) > 0:
+                    baja_out[(nif, day)] = int(mins)
 
-                hp_out[(nif, day_iso)] = max(0, hp_delta)
-                if baja_delta > 0:
-                    baja_out[(nif, day_iso)] = max(0, baja_delta)
+        # Determinamos qué celdas de jornada siguen realmente desconocidas.
+        for _, er in be.iterrows():
+            nif = _text(er.get("nif")).upper()
+            if not nif:
+                continue
+            for day in days:
+                if (nif, day) not in hp_out:
+                    unresolved_employee_days.add((nif, day))
 
-            if day_bad:
-                unresolved_days.add(day_iso)
+        # Si el agregado dice que hay baja pero la reconstrucción no consiguió
+        # localizarla, no inventamos la fecha; Bajas quedará conservadoramente
+        # incompleta para ese bloque.
 
-            prev_cut = day
-
-    # Si una fecha quedó dudosa, eliminamos todas sus HP derivadas para no mezclar
-    # datos fiables con parciales.
-    if unresolved_days:
-        hp_out = {
-            k: v for k, v in hp_out.items()
-            if k[1] not in unresolved_days
-        }
-        baja_out = {
-            k: v for k, v in baja_out.items()
-            if k[1] not in unresolved_days
-        }
-
-    return hp_out, baja_out, sorted(unresolved_days)
-
+    unresolved_days = sorted({day for _, day in unresolved_employee_days})
+    return hp_out, baja_out, unresolved_days
 
 
 
@@ -2515,9 +2758,9 @@ def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> byte
 _missing_days_ui = list(st.session_state.get("result_informe_missing_days", []) or [])
 if _missing_days_ui:
     st.warning(
-        f"No se ha podido reconstruir de forma fiable la jornada programada para "
-        f"{len(_missing_days_ui)} fecha(s). La consulta continúa sin inventar datos; "
-        "esas fechas se omiten únicamente de las validaciones que necesitan Horas programadas."
+        f"Falta jornada programada completa para {len(_missing_days_ui)} fecha(s) del rango. "
+        "La app usa turnos diarios validados contra Horas programadas y no inventa datos; "
+        "solo se omiten los cálculos que no pueden cerrarse con fiabilidad."
     )
 
 
