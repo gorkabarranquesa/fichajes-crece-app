@@ -1378,6 +1378,273 @@ def _row_get_alias(row: dict, aliases: list[str]):
     return False, None
 
 
+# ============================================================
+# DIAGNÓSTICO TEMPORAL — /api/informes/turnos
+# ============================================================
+
+_TURNOS_POS = {
+    "turno_id": 0,
+    "empleado_id": 1,
+    "num_empleado": 2,
+    "nombre": 3,
+    "fecha": 4,
+    "horario_id": 5,
+    "horario_abreviatura": 6,
+    "horario_color": 7,
+    "horario_duracion_computada": 8,
+    "horario_texto": 9,
+}
+
+
+def _extract_generic_rows(payload):
+    """Extrae filas de una respuesta de informe sin asumir un wrapper concreto."""
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        # Wrappers habituales en APIs/reportes.
+        for key in ("data", "datos", "results", "resultado", "rows", "turnos"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = _extract_generic_rows(value)
+                if nested:
+                    return nested
+        # Como último recurso, si todos los valores son filas, devolverlos.
+        vals = list(payload.values())
+        if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
+            return vals
+    return []
+
+
+def _turno_value(row, aliases, pos_key):
+    if isinstance(row, dict):
+        found, value = _row_get_alias(row, aliases)
+        return value if found else None
+    if isinstance(row, (list, tuple)):
+        pos = _TURNOS_POS[pos_key]
+        return row[pos] if len(row) > pos else None
+    return None
+
+
+def _normalize_turno_row(row):
+    if not isinstance(row, (dict, list, tuple)):
+        return None
+    return {
+        "Turno ID": _turno_value(row, ["Turno ID", "turno_id", "id_turno"], "turno_id"),
+        "Empleado ID": _turno_value(row, ["Empleado ID", "empleado_id", "id_empleado"], "empleado_id"),
+        "Nº empleado": _turno_value(
+            row,
+            ["Número de empleado", "Nº empleado", "Numero empleado", "num_empleado", "numero_empleado"],
+            "num_empleado",
+        ),
+        "Nombre y apellidos": _turno_value(
+            row, ["Nombre y apellidos", "Nombre", "nombre_apellidos", "nombre"], "nombre"
+        ),
+        "Fecha": _turno_value(row, ["Fecha", "fecha"], "fecha"),
+        "Horario ID": _turno_value(row, ["Horario ID", "horario_id", "id_horario"], "horario_id"),
+        "Horario abreviatura": _turno_value(
+            row, ["Horario abreviatura", "horario_abreviatura", "abreviatura"], "horario_abreviatura"
+        ),
+        "Horario color": _turno_value(row, ["Horario color", "horario_color", "color"], "horario_color"),
+        "Horario duración computada": _turno_value(
+            row,
+            ["Horario duración computada", "Horario duracion computada", "horario_duracion_computada", "duracion_computada"],
+            "horario_duracion_computada",
+        ),
+        "Horario texto": _turno_value(row, ["Horario texto", "horario_texto"], "horario_texto"),
+    }
+
+
+def api_informe_turnos(fecha_desde: str, fecha_hasta: str):
+    """Una única petición POST a /api/informes/turnos para diagnóstico.
+
+    No reintenta 422 ni hace fallback JSON: queremos observar el comportamiento
+    real del endpoint sin contaminar la prueba ni castigar CRECE.
+    """
+    url = f"{API_URL_BASE}/informes/turnos"
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+    t0 = time.monotonic()
+    try:
+        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "rows": [],
+        }
+
+    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
+    status = int(resp.status_code)
+    if status != 200:
+        # Solo un extracto corto del mensaje de error; nunca headers sensibles ni payload completo.
+        msg = ""
+        try:
+            obj = resp.json()
+            if isinstance(obj, dict):
+                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
+            elif obj is not None:
+                msg = str(obj)[:300]
+        except Exception:
+            try:
+                msg = str(resp.text or "")[:300]
+            except Exception:
+                msg = ""
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": msg or f"HTTP {status}",
+            "rows": [],
+        }
+
+    parsed = _try_parse_encrypted_response(resp)
+    if parsed is None:
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
+            "rows": [],
+        }
+
+    raw_rows = _extract_generic_rows(parsed)
+    rows = []
+    for raw in raw_rows:
+        item = _normalize_turno_row(raw)
+        if item is not None:
+            rows.append(item)
+    return {
+        "ok": True,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "error": "",
+        "rows": rows,
+    }
+
+
+def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date, scope_emp_df: pd.DataFrame):
+    """Genera detalle, matriz empleado/día y resumen del informe de turnos."""
+    rows = list((result or {}).get("rows", []) or [])
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        detail = pd.DataFrame(columns=[
+            "Turno ID", "Empleado ID", "Nº empleado", "Nombre y apellidos", "Fecha",
+            "Horario ID", "Horario abreviatura", "Horario color",
+            "Horario duración computada", "Horario texto",
+        ])
+
+    detail["num_code"] = detail.get("Nº empleado", pd.Series(index=detail.index, dtype=object)).apply(_canonical_emp_code)
+    detail["Fecha"] = pd.to_datetime(detail.get("Fecha"), errors="coerce").dt.strftime("%Y-%m-%d")
+    detail["Duración minutos"] = detail.get(
+        "Horario duración computada", pd.Series(index=detail.index, dtype=object)
+    ).apply(_duration_value_to_minutes)
+    detail["Duración HH:MM"] = detail["Duración minutos"].apply(
+        lambda x: minutos_a_hhmm(int(x)) if pd.notna(x) else ""
+    )
+
+    scope = scope_emp_df.copy()
+    if "num_empleado" not in scope.columns:
+        scope["num_empleado"] = ""
+    scope["num_code"] = scope["num_empleado"].apply(_canonical_emp_code)
+    scope = scope[scope["num_code"].astype(str).str.strip().ne("")].copy()
+    scope_codes = set(scope["num_code"].tolist())
+    if scope_codes:
+        detail = detail[detail["num_code"].isin(scope_codes)].copy()
+
+    name_map = dict(zip(scope["num_code"], scope.get("nombre_completo", pd.Series("", index=scope.index)).fillna("")))
+    empresa_map = dict(zip(scope["num_code"], scope.get("Empresa", pd.Series("", index=scope.index)).fillna("")))
+    sede_map_local = dict(zip(scope["num_code"], scope.get("Sede", pd.Series("", index=scope.index)).fillna("")))
+    dept_map = dict(zip(scope["num_code"], scope.get("departamento_nombre", pd.Series("", index=scope.index)).fillna("")))
+
+    if not detail.empty:
+        detail["Nombre app"] = detail["num_code"].map(name_map).fillna("")
+        detail["Empresa"] = detail["num_code"].map(empresa_map).fillna("")
+        detail["Sede"] = detail["num_code"].map(sede_map_local).fillna("")
+        detail["Departamento"] = detail["num_code"].map(dept_map).fillna("")
+
+    # Agregación por empleado/día de todas las filas de turno encontradas.
+    if detail.empty:
+        daily_found = pd.DataFrame(columns=["num_code", "Fecha", "Nº turnos", "Jornada turnos minutos", "Horarios"])
+    else:
+        tmp = detail.copy()
+        tmp["Duración minutos num"] = pd.to_numeric(tmp["Duración minutos"], errors="coerce").fillna(0).astype(int)
+        daily_found = (
+            tmp.groupby(["num_code", "Fecha"], as_index=False)
+            .agg(
+                **{
+                    "Nº turnos": ("Turno ID", "size"),
+                    "Jornada turnos minutos": ("Duración minutos num", "sum"),
+                    "Horarios": ("Horario texto", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
+                    "Abreviaturas": ("Horario abreviatura", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
+                }
+            )
+        )
+
+    days = []
+    cur = fecha_desde
+    while cur <= fecha_hasta:
+        days.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+
+    matrix_rows = []
+    found_lookup = {
+        (str(r["num_code"]), str(r["Fecha"])): r
+        for _, r in daily_found.iterrows()
+    }
+    for _, emp in scope.sort_values(["nombre_completo"], kind="mergesort").iterrows():
+        code = str(emp.get("num_code") or "")
+        for day in days:
+            hit = found_lookup.get((code, day))
+            mins = int(hit.get("Jornada turnos minutos", 0)) if hit is not None else 0
+            n_turnos = int(hit.get("Nº turnos", 0)) if hit is not None else 0
+            matrix_rows.append({
+                "Fecha": day,
+                "Nº empleado": str(emp.get("num_empleado") or ""),
+                "Nombre": str(emp.get("nombre_completo") or ""),
+                "Empresa": str(emp.get("Empresa") or ""),
+                "Sede": str(emp.get("Sede") or ""),
+                "Departamento": str(emp.get("departamento_nombre") or ""),
+                "Nº turnos": n_turnos,
+                "Jornada turnos": minutos_a_hhmm(mins),
+                "Jornada turnos minutos": mins,
+                "Estado turno": "CON TURNO" if hit is not None else "SIN FILA DE TURNO",
+                "Abreviaturas": str(hit.get("Abreviaturas") or "") if hit is not None else "",
+                "Horario texto": str(hit.get("Horarios") or "") if hit is not None else "",
+            })
+    matrix = pd.DataFrame(matrix_rows)
+
+    if matrix.empty:
+        summary = pd.DataFrame(columns=["Nº empleado", "Nombre", "Días con turno", "Días sin fila", "Total turnos"])
+    else:
+        summary = (
+            matrix.groupby(["Nº empleado", "Nombre"], as_index=False)
+            .agg(
+                **{
+                    "Días con turno": ("Estado turno", lambda s: int((s == "CON TURNO").sum())),
+                    "Días sin fila": ("Estado turno", lambda s: int((s == "SIN FILA DE TURNO").sum())),
+                    "Total minutos": ("Jornada turnos minutos", "sum"),
+                }
+            )
+        )
+        summary["Total turnos"] = summary["Total minutos"].apply(lambda x: minutos_a_hhmm(int(x)))
+        summary = summary.drop(columns=["Total minutos"])
+
+    detail_cols = [
+        "Fecha", "Nº empleado", "Nombre y apellidos", "Nombre app", "Empresa", "Sede", "Departamento",
+        "Turno ID", "Empleado ID", "Horario ID", "Horario abreviatura",
+        "Horario duración computada", "Duración HH:MM", "Duración minutos", "Horario texto",
+    ]
+    detail_cols = [c for c in detail_cols if c in detail.columns]
+    detail = detail[detail_cols].sort_values([c for c in ["Fecha", "Nombre app", "Nº empleado"] if c in detail.columns], kind="mergesort") if not detail.empty else detail
+
+    return detail.reset_index(drop=True), matrix.reset_index(drop=True), summary.reset_index(drop=True)
+
+
 def _canonical_emp_code(value) -> str:
     """Código de empleado estable.
 
@@ -2167,9 +2434,99 @@ for k, v in [
     ("result_tiempo_missing_days", []),
     ("result_exceso_incomplete_count", 0),
     ("result_informe_diag", []),
+    ("turnos_diag_result", None),
+    ("turnos_diag_detail", None),
+    ("turnos_diag_matrix", None),
+    ("turnos_diag_summary", None),
+    ("turnos_diag_range", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# ------------------------------------------------------------
+# DIAGNÓSTICO TEMPORAL /informes/turnos
+# ------------------------------------------------------------
+with st.expander("🧪 Diagnóstico temporal — /informes/turnos", expanded=False):
+    st.caption(
+        "Prueba aislada: hace UNA sola petición a /api/informes/turnos para el rango seleccionado. "
+        "No ejecuta la consulta normal de Fichajes/Excesos."
+    )
+    st.write("Para la primera prueba usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
+    _turnos_test_clicked = st.button("Probar /informes/turnos", key="btn_diag_turnos")
+
+    if _turnos_test_clicked:
+        if fecha_inicio > fecha_fin:
+            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
+        elif fecha_fin > hoy:
+            st.error("La fecha fin no puede ser mayor que hoy.")
+        else:
+            with st.spinner("Consultando /informes/turnos una sola vez…"):
+                _td_res = api_informe_turnos(
+                    fecha_inicio.strftime("%Y-%m-%d"),
+                    fecha_fin.strftime("%Y-%m-%d"),
+                )
+            st.session_state["turnos_diag_result"] = _td_res
+            st.session_state["turnos_diag_range"] = (
+                fecha_inicio.strftime("%Y-%m-%d"),
+                fecha_fin.strftime("%Y-%m-%d"),
+            )
+            if _td_res.get("ok"):
+                _td_detail, _td_matrix, _td_summary = _build_turnos_diagnostic(
+                    _td_res, fecha_inicio, fecha_fin, empleados_filtrados
+                )
+                st.session_state["turnos_diag_detail"] = _td_detail
+                st.session_state["turnos_diag_matrix"] = _td_matrix
+                st.session_state["turnos_diag_summary"] = _td_summary
+            else:
+                st.session_state["turnos_diag_detail"] = pd.DataFrame()
+                st.session_state["turnos_diag_matrix"] = pd.DataFrame()
+                st.session_state["turnos_diag_summary"] = pd.DataFrame()
+
+    _td_res = st.session_state.get("turnos_diag_result")
+    if isinstance(_td_res, dict):
+        _td_range = st.session_state.get("turnos_diag_range")
+        st.write(
+            f"**Resultado HTTP:** `{_td_res.get('status')}` · "
+            f"**Duración:** `{_td_res.get('elapsed_ms')} ms` · "
+            f"**Filas recibidas:** `{len(_td_res.get('rows') or [])}`"
+        )
+        if _td_range:
+            st.caption(f"Rango probado: {_td_range[0]} → {_td_range[1]}")
+        if not _td_res.get("ok"):
+            st.error(f"Error de /informes/turnos: {_td_res.get('error') or 'sin detalle'}")
+        else:
+            _td_summary = st.session_state.get("turnos_diag_summary")
+            _td_matrix = st.session_state.get("turnos_diag_matrix")
+            _td_detail = st.session_state.get("turnos_diag_detail")
+
+            if isinstance(_td_summary, pd.DataFrame) and not _td_summary.empty:
+                st.write("**Resumen por empleado**")
+                st.dataframe(_td_summary, use_container_width=True, hide_index=True)
+            if isinstance(_td_matrix, pd.DataFrame) and not _td_matrix.empty:
+                st.write("**Matriz empleado × día (incluye días sin fila de turno)**")
+                st.dataframe(_td_matrix, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ Descargar matriz turnos",
+                    data=_td_matrix.to_csv(index=False).encode("utf-8"),
+                    file_name="diagnostico_turnos_matriz.csv",
+                    mime="text/csv",
+                    key="download_diag_turnos_matrix",
+                )
+            if isinstance(_td_detail, pd.DataFrame) and not _td_detail.empty:
+                st.write("**Detalle bruto normalizado de filas devueltas por CRECE**")
+                st.dataframe(_td_detail, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ Descargar detalle turnos",
+                    data=_td_detail.to_csv(index=False).encode("utf-8"),
+                    file_name="diagnostico_turnos_detalle.csv",
+                    mime="text/csv",
+                    key="download_diag_turnos_detail",
+                )
+
+    if _turnos_test_clicked:
+        # Evita que esta prueba temporal siga hacia la consulta normal de la app.
+        st.stop()
 
 
 # --- Safe defaults to avoid NameError on first load / when no results ---
