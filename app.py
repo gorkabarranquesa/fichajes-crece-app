@@ -8,6 +8,7 @@ import threading
 import random
 import time
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -79,6 +80,13 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 MAX_RETRIES = 4
 BACKOFF_BASE_SECONDS = 0.6
 BACKOFF_MAX_SECONDS = 6.0
+RETRY_AFTER_MAX_SECONDS = 90.0
+
+# /informes/empleados es un informe pesado en CRECE. Se serializa de forma
+# global para evitar peticiones simultáneas desde ejecuciones/sesiones Streamlit.
+INFORME_MIN_INTERVAL_SECONDS = 1.00
+_INFORME_GATE_LOCK = threading.Lock()
+_INFORME_LAST_FINISH_MONO = 0.0
 
 _SESSION_LOCAL = threading.local()
 
@@ -106,6 +114,26 @@ def _safe_fail(_exc: Exception) -> None:
     return None
 
 
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """Interpreta Retry-After sin registrar cabeceras ni payloads."""
+    try:
+        raw = (resp.headers.get("Retry-After") or "").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(RETRY_AFTER_MAX_SECONDS, float(raw)))
+    except Exception:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        seconds = dt.timestamp() - time.time()
+        return max(0.0, min(RETRY_AFTER_MAX_SECONDS, seconds))
+    except Exception:
+        return None
+
+
 def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT):
     method = (method or "").upper().strip()
     if method not in {"GET", "POST"}:
@@ -127,7 +155,10 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
             if resp.status_code in RETRY_STATUS:
                 if attempt < MAX_RETRIES:
                     wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
-                    wait += random.uniform(0, 0.25)
+                    retry_after = _retry_after_seconds(resp)
+                    if retry_after is not None:
+                        wait = max(wait, retry_after)
+                    wait += random.uniform(0, 0.20)
                     time.sleep(wait)
                     continue
                 return resp
@@ -138,7 +169,7 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
             last_exc = e
             if attempt < MAX_RETRIES:
                 wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
-                wait += random.uniform(0, 0.25)
+                wait += random.uniform(0, 0.20)
                 time.sleep(wait)
                 continue
             _safe_fail(last_exc)
@@ -710,6 +741,7 @@ def validar_horario(
     expected_minutes=None,
     sede: str = "",
     empresa: str = "",
+    completed_day: bool = True,
 ) -> list[str]:
     depto_norm = (depto or "").upper().strip()
     nombre_norm = norm_name(nombre)
@@ -779,7 +811,8 @@ def validar_horario(
             elif e_min > fin:
                 incid.append(f"Entrada tarde ({primera_entrada_hhmm})")
 
-            if salida_min is not None and s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
+            # Una salida intermedia del día actual no es aún la salida final.
+            if completed_day and salida_min is not None and s_min is not None and s_min < (salida_min - MARGEN_HORARIO_MIN):
                 incid.append(f"Salida temprana ({ultima_salida_hhmm})")
         return incid
 
@@ -1203,21 +1236,54 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> tuple
 
 
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """POST form-urlencoded documentado de /api/informes/empleados."""
+    """Consulta robusta y SERIAL de /api/informes/empleados.
+
+    El formato primario es POST form-urlencoded, conforme al manual. Solo se
+    prueba JSON si CRECE devuelve un error de formato (400/415/422). La
+    exclusión mutua impide generar varios informes pesados simultáneamente.
+    """
+    global _INFORME_LAST_FINISH_MONO
+
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-    try:
-        resp = safe_request("POST", url, data=body, timeout=(5, 60))
+
+    def _parse_valid(resp):
         if resp is None:
             return None
-        resp.raise_for_status()
-        parsed = _try_parse_encrypted_response(resp)
-        if parsed is None or not _extract_rows_from_informe(parsed):
+        try:
+            resp.raise_for_status()
+        except Exception:
             return None
-        return parsed
-    except Exception as e:
-        _safe_fail(e)
-        return None
+        parsed = _try_parse_encrypted_response(resp)
+        if parsed is None:
+            return None
+        return parsed if _extract_rows_from_informe(parsed) else None
+
+    with _INFORME_GATE_LOCK:
+        elapsed = time.monotonic() - float(_INFORME_LAST_FINISH_MONO or 0.0)
+        if elapsed < INFORME_MIN_INTERVAL_SECONDS:
+            time.sleep(INFORME_MIN_INTERVAL_SECONDS - elapsed)
+
+        try:
+            resp = safe_request("POST", url, data=body, timeout=(5, 75))
+            parsed = _parse_valid(resp)
+            if parsed is not None:
+                return parsed
+
+            status = getattr(resp, "status_code", None) if resp is not None else None
+            # No duplicamos una petición que ya ha fallado por throttling/5xx.
+            if status in {400, 415, 422}:
+                resp_json = safe_request("POST", url, json_body=body, timeout=(5, 75))
+                parsed_json = _parse_valid(resp_json)
+                if parsed_json is not None:
+                    return parsed_json
+
+            return None
+        except Exception as e:
+            _safe_fail(e)
+            return None
+        finally:
+            _INFORME_LAST_FINISH_MONO = time.monotonic()
 
 
 
@@ -1706,17 +1772,12 @@ def build_informe_diario_maps_resilient(
     d1: date,
     base_emp: pd.DataFrame,
 ) -> tuple[dict, dict, dict, list[str]]:
-    """Obtiene directamente el informe CRECE de cada día.
+    """Obtiene el informe CRECE de cada día SIN concurrencia.
 
-    No reconstruye días mediante diferencias entre informes agregados. Para cada
-    fecha se consulta /informes/empleados con fecha_desde=fecha_hasta y se enlaza
-    Nº empleado con num_empleado.
-
-    Devuelve:
-      hp_out[(nif, fecha)] -> minutos programados, incluido 0 explícito
-      baja_out[(nif, fecha)] -> minutos de baja (>0)
-      contratado_out[(nif, fecha)] -> bool según Días contratado en el periodo
-      unavailable_days -> días cuyo informe no pudo obtenerse/interpretarse
+    No reconstruye jornadas por diferencias entre informes agregados. Cada
+    fecha usa /informes/empleados con fecha_desde=fecha_hasta=D y enlaza
+    exclusivamente Nº empleado con num_empleado. Los éxitos quedan cacheados
+    por fecha; los fallos se reintentan secuencialmente con enfriamiento.
     """
     if base_emp is None or base_emp.empty or d0 > d1:
         return {}, {}, {}, []
@@ -1741,36 +1802,26 @@ def build_informe_diario_maps_resilient(
     metrics_by_day: dict[str, dict] = {}
     failed_days: set[str] = set()
 
-    def _fetch(day_iso: str):
-        return day_iso, _cached_informe_period_metrics(day_iso, day_iso)
-
-    workers = max(1, min(3, len(all_days)))
-    with ThreadPoolExecutor(max_workers=workers) as exe:
-        futs = {exe.submit(_fetch, day): day for day in all_days}
-        for fut in as_completed(futs):
-            day = futs[fut]
-            try:
-                day_r, metrics = fut.result()
-                metrics_by_day[day_r] = metrics
-            except Exception as exc:
-                _safe_fail(exc)
-                failed_days.add(day)
-
-    # Reintento secuencial solo de fallos reales para no castigar el endpoint.
-    for day in sorted(list(failed_days)):
-        ok = False
-        for attempt in range(2):
+    # No ThreadPoolExecutor aquí. En la prueba real, las ráfagas concurrentes
+    # dejaron casi todo el rango sin informe. Una única petición en vuelo es
+    # deliberada: primero exactitud; la caché evita repetir días ya obtenidos.
+    for day in all_days:
+        metrics = None
+        for attempt in range(3):
             if attempt:
-                time.sleep(0.8)
+                time.sleep(1.25 * attempt)
             try:
-                _, metrics = _fetch(day)
-                metrics_by_day[day] = metrics
-                ok = True
-                break
+                metrics = _cached_informe_period_metrics(day, day)
+                if metrics:
+                    break
             except Exception as exc:
                 _safe_fail(exc)
-        if ok:
-            failed_days.discard(day)
+                metrics = None
+
+        if metrics:
+            metrics_by_day[day] = metrics
+        else:
+            failed_days.add(day)
 
     hp_out: dict[tuple[str, str], int] = {}
     baja_out: dict[tuple[str, str], int] = {}
@@ -1786,6 +1837,17 @@ def build_informe_diario_maps_resilient(
         hp_sec = (metrics.get("hp", {}) or {})
         baja_sec = (metrics.get("baja", {}) or {})
         contratado_sec = (metrics.get("contratado", {}) or {})
+
+        # Un HTTP 200 no basta: al menos una persona del alcance debe enlazar
+        # por Nº empleado/num_empleado con métricas del informe.
+        matched = sum(
+            1 for he in emp_hash_to_nif
+            if he in hp_sec or he in baja_sec or he in contratado_sec
+        )
+        if matched == 0:
+            unavailable_days.add(day)
+            continue
+
         for he, nif in emp_hash_to_nif.items():
             if he in hp_sec:
                 try:
@@ -1802,7 +1864,10 @@ def build_informe_diario_maps_resilient(
                     pass
 
             if he in contratado_sec:
-                contratado_out[(nif, day)] = bool(int(contratado_sec[he]))
+                try:
+                    contratado_out[(nif, day)] = bool(int(contratado_sec[he]))
+                except Exception:
+                    pass
 
     return hp_out, baja_out, contratado_out, sorted(unavailable_days)
 
@@ -2214,6 +2279,11 @@ if consultar:
 
                 day_str = str(r.get("Fecha", "") or "")
                 nif_str = str(r.get("nif", "") or "").upper().strip()
+                try:
+                    row_day = datetime.strptime(day_str, "%Y-%m-%d").date()
+                except Exception:
+                    row_day = None
+                completed_day = bool(row_day is not None and row_day < date.today())
 
                 exp_key = (nif_str, day_str)
                 exp_known = exp_key in (horas_prog_map_incid or {})
@@ -2240,8 +2310,8 @@ if consultar:
                         motivos.append("Trabajo en fin de semana")
                     return "; ".join(motivos)
 
-                # Horas insuficientes: siempre contra Horas programadas de CRECE.
-                if tc_known and exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - TOLERANCIA_MINUTOS):
+                # Horas insuficientes solo con la jornada ya cerrada.
+                if completed_day and tc_known and exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - TOLERANCIA_MINUTOS):
                     motivos.append(f"Horas insuficientes (mín {segundos_a_hhmm(exp_min * 60)})")
 
                 depto_norm = str(r.get("Departamento") or "").upper().strip()
@@ -2259,7 +2329,7 @@ if consultar:
                     and worked_minutes >= max(0, exp_min - TOLERANCIA_MINUTOS)
                 )
 
-                if min_f is not None:
+                if completed_day and min_f is not None:
                     try:
                         min_f_i = int(min_f)
                         if num_fich < min_f_i:
@@ -2284,6 +2354,7 @@ if consultar:
                     expected_minutes=(exp_min if exp_known else None),
                     sede=r.get("Sede", ""),
                     empresa=r.get("Empresa", ""),
+                    completed_day=completed_day,
                 )
                 return "; ".join(motivos)
 
@@ -2375,6 +2446,9 @@ if consultar:
                 bajas_nifs_by_day.setdefault(str(day_b), set()).add(str(nif_b).upper().strip())
 
         for cur in _iter_days(d0, d1):
+            # Una jornada aún abierta no puede clasificarse como "sin fichajes".
+            if cur >= date.today():
+                continue
             day = cur.strftime("%Y-%m-%d")
             present_set = presentes.get(day, set())
             on_sick_leave = bajas_nifs_by_day.get(day, set())
@@ -2416,7 +2490,10 @@ if consultar:
         #   esperado diario  = Horas programadas
         # Balance diario cuantizado; balance semanal = suma de balances diarios.
         try:
-            full_weeks = list_full_workweeks_in_range(d0, d1)
+            full_weeks = [
+                w for w in list_full_workweeks_in_range(d0, d1)
+                if w[1] < date.today()
+            ]
         except Exception:
             full_weeks = []
 
