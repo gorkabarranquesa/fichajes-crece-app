@@ -1894,6 +1894,89 @@ def _pick_key(df: pd.DataFrame, names: list[str]):
     return None
 
 
+
+# ============================================================
+# DIAGNÓSTICO TEMPORAL — comparación semanal /informes/empleados
+# ============================================================
+
+def api_informe_empleados_once_diag(fecha_desde: str, fecha_hasta: str):
+    """Una sola petición a /api/informes/empleados, sin retries ni fallback.
+
+    Se usa únicamente para comparar el total semanal de Horas programadas
+    con el detalle diario ya descargado de /informes/turnos. No ejecuta la
+    consulta normal de la aplicación ni hace llamadas adicionales.
+    """
+    url = f"{API_URL_BASE}/informes/empleados"
+    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
+    t0 = time.monotonic()
+    try:
+        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "rows": [],
+        }
+
+    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
+    status = int(resp.status_code)
+    if status != 200:
+        msg = ""
+        try:
+            obj = resp.json()
+            if isinstance(obj, dict):
+                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
+            elif obj is not None:
+                msg = str(obj)[:300]
+        except Exception:
+            try:
+                msg = str(resp.text or "")[:300]
+            except Exception:
+                msg = ""
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": msg or f"HTTP {status}",
+            "rows": [],
+        }
+
+    parsed = _try_parse_encrypted_response(resp)
+    if parsed is None:
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
+            "rows": [],
+        }
+
+    raw_rows = _extract_rows_from_informe(parsed)
+    rows_out = []
+    for idx, row in enumerate(raw_rows):
+        code = _get_employee_number_from_row(row)
+        found_hp, hp_mins = _get_horas_programadas_minutes_from_row(row)
+        found_days, dias_contratado = _get_dias_contratado_from_row(row)
+        baja_h = _get_horas_baja_from_row(row)
+        rows_out.append({
+            "Fila informe": idx + 1,
+            "Nº empleado": code,
+            "Horas programadas": (segundos_a_hhmm(int(hp_mins) * 60) if found_hp and hp_mins is not None else ""),
+            "Horas programadas minutos": (int(hp_mins) if found_hp and hp_mins is not None else None),
+            "Días contratado en el periodo": (float(dias_contratado) if found_days and dias_contratado is not None else None),
+            "Horas baja": float(baja_h or 0.0),
+        })
+
+    return {
+        "ok": True,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "error": "",
+        "rows": rows_out,
+    }
+
 # ============================================================
 # DÍA (turno nocturno) + tiempos netos
 # ============================================================
@@ -2528,6 +2611,65 @@ with st.expander("🧪 Diagnóstico temporal — /informes/turnos", expanded=Fal
         # Evita que esta prueba temporal siga hacia la consulta normal de la app.
         st.stop()
 
+
+
+# ------------------------------------------------------------
+# DIAGNÓSTICO TEMPORAL — total semanal de /informes/empleados
+# ------------------------------------------------------------
+with st.expander("🧪 Paso 4.2 — Horas programadas semanales", expanded=False):
+    st.caption(
+        "Hace UNA sola petición a /api/informes/empleados para el rango seleccionado. "
+        "No ejecuta la consulta normal ni hace reintentos."
+    )
+    st.write("Para esta comparación usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
+    _emp_week_clicked = st.button(
+        "Probar Horas programadas del periodo",
+        key="btn_diag_informe_empleados_week",
+    )
+
+    if _emp_week_clicked:
+        if fecha_inicio > fecha_fin:
+            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
+        elif fecha_fin > hoy:
+            st.error("La fecha fin no puede ser mayor que hoy.")
+        else:
+            with st.spinner("Consultando /informes/empleados una sola vez…"):
+                _ew_res = api_informe_empleados_once_diag(
+                    fecha_inicio.strftime("%Y-%m-%d"),
+                    fecha_fin.strftime("%Y-%m-%d"),
+                )
+            st.session_state["emp_week_diag_result"] = _ew_res
+            st.session_state["emp_week_diag_range"] = (
+                fecha_inicio.strftime("%Y-%m-%d"),
+                fecha_fin.strftime("%Y-%m-%d"),
+            )
+
+    _ew_res = st.session_state.get("emp_week_diag_result")
+    if isinstance(_ew_res, dict):
+        _ew_range = st.session_state.get("emp_week_diag_range")
+        st.write(
+            f"**Resultado HTTP:** `{_ew_res.get('status')}` · "
+            f"**Duración:** `{_ew_res.get('elapsed_ms')} ms` · "
+            f"**Filas recibidas:** `{len(_ew_res.get('rows') or [])}`"
+        )
+        if _ew_range:
+            st.caption(f"Rango probado: {_ew_range[0]} → {_ew_range[1]}")
+        if not _ew_res.get("ok"):
+            st.error(f"Error de /informes/empleados: {_ew_res.get('error') or 'sin detalle'}")
+        else:
+            _ew_df = pd.DataFrame(_ew_res.get("rows") or [])
+            if not _ew_df.empty:
+                st.dataframe(_ew_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ Descargar Horas programadas semanales",
+                    data=_ew_df.to_csv(index=False).encode("utf-8"),
+                    file_name="diagnostico_horas_programadas_semana.csv",
+                    mime="text/csv",
+                    key="download_diag_emp_week",
+                )
+
+    if _emp_week_clicked:
+        st.stop()
 
 # --- Safe defaults to avoid NameError on first load / when no results ---
 salida_incidencias = pd.DataFrame()
