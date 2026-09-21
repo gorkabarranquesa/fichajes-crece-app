@@ -88,6 +88,31 @@ INFORME_MIN_INTERVAL_SECONDS = 1.00
 _INFORME_GATE_LOCK = threading.Lock()
 _INFORME_LAST_FINISH_MONO = 0.0
 
+# Diagnóstico técnico temporal de /informes/empleados. Solo guarda metadatos
+# no sensibles: fecha/rango, modo, intento, estado HTTP, tiempos, bytes y etapa.
+_INFORME_DIAG_LOCK = threading.Lock()
+_INFORME_DIAG_EVENTS: list[dict] = []
+
+def _diag_informe_event(**event) -> None:
+    clean = {}
+    for k, v in event.items():
+        if v is None:
+            clean[k] = None
+        elif isinstance(v, (int, float, bool)):
+            clean[k] = v
+        else:
+            clean[k] = str(v)[:160]
+    with _INFORME_DIAG_LOCK:
+        _INFORME_DIAG_EVENTS.append(clean)
+
+def _reset_informe_diag() -> None:
+    with _INFORME_DIAG_LOCK:
+        _INFORME_DIAG_EVENTS.clear()
+
+def _snapshot_informe_diag() -> list[dict]:
+    with _INFORME_DIAG_LOCK:
+        return [dict(x) for x in _INFORME_DIAG_EVENTS]
+
 _SESSION_LOCAL = threading.local()
 
 def _get_http_session() -> requests.Session:
@@ -134,7 +159,7 @@ def _retry_after_seconds(resp: requests.Response) -> float | None:
         return None
 
 
-def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT):
+def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT, trace_label: str | None = None):
     method = (method or "").upper().strip()
     if method not in {"GET", "POST"}:
         return None
@@ -142,6 +167,7 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
     last_exc = None
     for attempt in range(MAX_RETRIES + 1):
         try:
+            _t0 = time.monotonic()
             resp = _get_http_session().request(
                 method,
                 url,
@@ -151,6 +177,15 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
                 timeout=timeout,
                 verify=True,
             )
+            _elapsed_ms = int(round((time.monotonic() - _t0) * 1000.0))
+            if trace_label:
+                _diag_informe_event(
+                    kind="http", label=trace_label, attempt=attempt + 1,
+                    status=int(resp.status_code), elapsed_ms=_elapsed_ms,
+                    bytes=len(resp.content or b""),
+                    retry_after=_retry_after_seconds(resp),
+                    content_type=(resp.headers.get("Content-Type") or "").split(";")[0],
+                )
 
             if resp.status_code in RETRY_STATUS:
                 if attempt < MAX_RETRIES:
@@ -167,6 +202,11 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
 
         except requests.RequestException as e:
             last_exc = e
+            if trace_label:
+                _diag_informe_event(
+                    kind="transport_error", label=trace_label, attempt=attempt + 1,
+                    error=type(e).__name__,
+                )
             if attempt < MAX_RETRIES:
                 wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
                 wait += random.uniform(0, 0.20)
@@ -1238,26 +1278,34 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> tuple
 def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
     """Consulta robusta y SERIAL de /api/informes/empleados.
 
-    El formato primario es POST form-urlencoded, conforme al manual. Solo se
-    prueba JSON si CRECE devuelve un error de formato (400/415/422). La
-    exclusión mutua impide generar varios informes pesados simultáneamente.
+    Versión instrumentada: registra únicamente metadatos técnicos no sensibles
+    para distinguir HTTP/rate-limit/timeout de errores de descifrado o parsing.
     """
     global _INFORME_LAST_FINISH_MONO
 
     url = f"{API_URL_BASE}/informes/empleados"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
 
-    def _parse_valid(resp):
+    def _parse_valid(resp, mode: str):
         if resp is None:
+            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="no_response")
             return None
+        status = getattr(resp, "status_code", None)
         try:
             resp.raise_for_status()
         except Exception:
+            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="http_error", status=status)
             return None
         parsed = _try_parse_encrypted_response(resp)
         if parsed is None:
+            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="decrypt_or_json_failed", status=status)
             return None
-        return parsed if _extract_rows_from_informe(parsed) else None
+        rows = _extract_rows_from_informe(parsed)
+        if not rows:
+            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="no_rows", status=status)
+            return None
+        _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="ok", status=status, rows=len(rows))
+        return parsed
 
     with _INFORME_GATE_LOCK:
         elapsed = time.monotonic() - float(_INFORME_LAST_FINISH_MONO or 0.0)
@@ -1265,21 +1313,23 @@ def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
             time.sleep(INFORME_MIN_INTERVAL_SECONDS - elapsed)
 
         try:
-            resp = safe_request("POST", url, data=body, timeout=(5, 75))
-            parsed = _parse_valid(resp)
+            label_form = f"{fecha_desde}..{fecha_hasta}:form"
+            resp = safe_request("POST", url, data=body, timeout=(5, 75), trace_label=label_form)
+            parsed = _parse_valid(resp, "form")
             if parsed is not None:
                 return parsed
 
             status = getattr(resp, "status_code", None) if resp is not None else None
-            # No duplicamos una petición que ya ha fallado por throttling/5xx.
             if status in {400, 415, 422}:
-                resp_json = safe_request("POST", url, json_body=body, timeout=(5, 75))
-                parsed_json = _parse_valid(resp_json)
+                label_json = f"{fecha_desde}..{fecha_hasta}:json"
+                resp_json = safe_request("POST", url, json_body=body, timeout=(5, 75), trace_label=label_json)
+                parsed_json = _parse_valid(resp_json, "json")
                 if parsed_json is not None:
                     return parsed_json
 
             return None
         except Exception as e:
+            _diag_informe_event(kind="api_exception", label=f"{fecha_desde}..{fecha_hasta}", error=type(e).__name__)
             _safe_fail(e)
             return None
         finally:
@@ -1831,6 +1881,7 @@ def build_informe_diario_maps_resilient(
     for day in all_days:
         metrics = metrics_by_day.get(day)
         if metrics is None:
+            _diag_informe_event(kind="day", day=day, outcome="no_metrics")
             unavailable_days.add(day)
             continue
 
@@ -1845,8 +1896,19 @@ def build_informe_diario_maps_resilient(
             if he in hp_sec or he in baja_sec or he in contratado_sec
         )
         if matched == 0:
+            _diag_informe_event(
+                kind="day", day=day, outcome="no_employee_match",
+                scope=len(emp_hash_to_nif), hp_entries=len(hp_sec),
+                baja_entries=len(baja_sec), contratado_entries=len(contratado_sec),
+            )
             unavailable_days.add(day)
             continue
+
+        _diag_informe_event(
+            kind="day", day=day, outcome="ok", matched=matched,
+            scope=len(emp_hash_to_nif), hp_entries=len(hp_sec),
+            baja_entries=len(baja_sec), contratado_entries=len(contratado_sec),
+        )
 
         for he, nif in emp_hash_to_nif.items():
             if he in hp_sec:
@@ -2104,6 +2166,7 @@ for k, v in [
     ("result_informe_missing_days", []),
     ("result_tiempo_missing_days", []),
     ("result_exceso_incomplete_count", 0),
+    ("result_informe_diag", []),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -2119,6 +2182,7 @@ weeks_ui = []
 consultar = st.button("Consultar")
 
 if consultar:
+    _reset_informe_diag()
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
@@ -2204,6 +2268,8 @@ if consultar:
         except Exception as _e:
             _safe_fail(_e)
             tc_map_query, tiempo_missing_days = {}, []
+
+        st.session_state["result_informe_diag"] = _snapshot_informe_diag()
 
         # --------- INCIDENCIAS ----------
         if df_fich.empty:
@@ -2814,6 +2880,53 @@ if _missing_tc_days_ui:
         f"No se ha podido obtener tiempoContabilizado de CRECE para "
         f"{len(_missing_tc_days_ui)} fecha(s). Esas fechas no se interpretan como 00:00."
     )
+
+# Diagnóstico técnico temporal: solo aparece si falló /informes/empleados.
+# No contiene NIF, nombres, tokens, payloads ni respuestas desencriptadas.
+_diag_events_ui = list(st.session_state.get("result_informe_diag", []) or [])
+if _missing_days_ui and _diag_events_ui:
+    with st.expander("🔎 Diagnóstico técnico CRECE — informe de empleados", expanded=True):
+        _diag_df = pd.DataFrame(_diag_events_ui)
+        _http = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("http")].copy() if not _diag_df.empty else pd.DataFrame()
+        _parse = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("parse")].copy() if not _diag_df.empty else pd.DataFrame()
+        _day = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("day")].copy() if not _diag_df.empty else pd.DataFrame()
+
+        st.caption("Solo metadatos técnicos; no se muestran datos personales ni payloads de CRECE.")
+        if not _http.empty and "status" in _http.columns:
+            _status_counts = (
+                _http.assign(status=_http["status"].fillna("sin_status").astype(str))
+                .groupby("status", dropna=False).size().reset_index(name="Intentos HTTP")
+                .sort_values("Intentos HTTP", ascending=False)
+            )
+            st.write("**Estados HTTP observados**")
+            st.dataframe(_status_counts, use_container_width=True, hide_index=True)
+        if not _parse.empty and "outcome" in _parse.columns:
+            _parse_counts = (
+                _parse.assign(outcome=_parse["outcome"].fillna("desconocido").astype(str))
+                .groupby("outcome", dropna=False).size().reset_index(name="Respuestas finales")
+                .sort_values("Respuestas finales", ascending=False)
+            )
+            st.write("**Resultado de descifrado/lectura**")
+            st.dataframe(_parse_counts, use_container_width=True, hide_index=True)
+        if not _day.empty and "outcome" in _day.columns:
+            _day_counts = (
+                _day.assign(outcome=_day["outcome"].fillna("desconocido").astype(str))
+                .groupby("outcome", dropna=False).size().reset_index(name="Fechas")
+                .sort_values("Fechas", ascending=False)
+            )
+            st.write("**Resultado por fecha**")
+            st.dataframe(_day_counts, use_container_width=True, hide_index=True)
+
+        _safe_cols = [c for c in ["kind", "label", "day", "attempt", "status", "elapsed_ms", "bytes", "retry_after", "content_type", "outcome", "rows", "error", "matched", "scope", "hp_entries", "contratado_entries"] if c in _diag_df.columns]
+        if _safe_cols:
+            _diag_export = _diag_df[_safe_cols].copy()
+            st.download_button(
+                "⬇ Descargar diagnóstico técnico",
+                data=_diag_export.to_csv(index=False).encode("utf-8"),
+                file_name="diagnostico_informes_crece.csv",
+                mime="text/csv",
+                key="download_diag_informes_crece",
+            )
 
 
 # Exceso solo se muestra cuando el rango contiene al menos una semana completa.
