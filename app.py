@@ -1544,7 +1544,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
         "Horario duración computada", pd.Series(index=detail.index, dtype=object)
     ).apply(_duration_value_to_minutes)
     detail["Duración HH:MM"] = detail["Duración minutos"].apply(
-        lambda x: minutos_a_hhmm(int(x)) if pd.notna(x) else ""
+        lambda x: segundos_a_hhmm(int(x) * 60) if pd.notna(x) else ""
     )
 
     scope = scope_emp_df.copy()
@@ -1610,7 +1610,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
                 "Sede": str(emp.get("Sede") or ""),
                 "Departamento": str(emp.get("departamento_nombre") or ""),
                 "Nº turnos": n_turnos,
-                "Jornada turnos": minutos_a_hhmm(mins),
+                "Jornada turnos": segundos_a_hhmm(int(mins) * 60),
                 "Jornada turnos minutos": mins,
                 "Estado turno": "CON TURNO" if hit is not None else "SIN FILA DE TURNO",
                 "Abreviaturas": str(hit.get("Abreviaturas") or "") if hit is not None else "",
@@ -1631,7 +1631,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
                 }
             )
         )
-        summary["Total turnos"] = summary["Total minutos"].apply(lambda x: minutos_a_hhmm(int(x)))
+        summary["Total turnos"] = summary["Total minutos"].apply(lambda x: segundos_a_hhmm(int(x) * 60))
         summary = summary.drop(columns=["Total minutos"])
 
     detail_cols = [
