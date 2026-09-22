@@ -43,6 +43,31 @@ def _hash_emp_code(code: str) -> str:
     return _cache_hmac(_canonical_emp_code(code), "EMP") if str(code or "").strip() else ""
 
 
+def _canonical_crece_id(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s:
+        return ""
+    try:
+        f = float(s.replace(",", "."))
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return s
+
+
+def _hash_crece_employee_id(value) -> str:
+    cid = _canonical_crece_id(value)
+    return _cache_hmac(cid, "CRECE_EMP_ID") if cid else ""
+
+
 def _fingerprint_nifs(nifs: tuple[str, ...]) -> str:
     joined = "|".join(sorted(nifs))
     return _cache_hmac(joined, "NIFSET")
@@ -82,9 +107,9 @@ BACKOFF_BASE_SECONDS = 0.6
 BACKOFF_MAX_SECONDS = 6.0
 RETRY_AFTER_MAX_SECONDS = 90.0
 
-# /informes/empleados es un informe pesado en CRECE. Se serializa de forma
-# global para evitar peticiones simultáneas desde ejecuciones/sesiones Streamlit.
-INFORME_MIN_INTERVAL_SECONDS = 1.00
+# CRECE limita /api/informes/* a 1 petición por minuto. La aplicación usa
+# /informes/turnos como única fuente de jornada diaria y serializa estas llamadas.
+INFORME_MIN_INTERVAL_SECONDS = 61.0
 _INFORME_GATE_LOCK = threading.Lock()
 _INFORME_LAST_FINISH_MONO = 0.0
 
@@ -377,12 +402,16 @@ def effective_worked_minutes_for_mod(mins_tc: int, pre_shift_work_minutes: int =
     return max(0, total - pre)
 
 
-def build_mod_pre_shift_work_map(df_fich: pd.DataFrame, tipos_map: dict) -> dict:
-    """Devuelve {(NIF, fecha): minutos_trabajados_antes_inicio_turno} para MOD.
+def build_mod_pre_shift_work_map(
+    df_fich: pd.DataFrame,
+    tipos_map: dict,
+    shift_start_map: dict | None = None,
+) -> dict:
+    """Devuelve {(NIF, fecha): minutos_trabajados antes del inicio real del turno MOD}.
 
-    Solo suma solapes de pares entrada->salida reales. Los intervalos cuyo tipo
-    descuenta tiempo no se consideran trabajo. De esta forma no se resta, por
-    ejemplo, un hueco entre dos fichajes anteriores a las 06:00/14:00.
+    Prioriza la hora de inicio del horario asignado en CRECE. Si no está disponible,
+    conserva como fallback la lógica histórica 06:00/14:00 según la primera entrada.
+    Solo descuenta trabajo REAL contenido en pares entrada->salida.
     """
     if df_fich is None or df_fich.empty:
         return {}
@@ -405,9 +434,12 @@ def build_mod_pre_shift_work_map(df_fich: pd.DataFrame, tipos_map: dict) -> dict
         first_ts = pd.to_datetime(entradas.iloc[0]["fecha_dt"], errors="coerce")
         if pd.isna(first_ts):
             continue
-        shift_start_min = 6 * 60 if int(first_ts.hour) < 12 else 14 * 60
+        shift_start_map = shift_start_map or {}
+        shift_start_min = shift_start_map.get((nif_s, day_s))
+        if shift_start_min is None:
+            shift_start_min = 6 * 60 if int(first_ts.hour) < 12 else 14 * 60
         try:
-            shift_start_dt = pd.Timestamp(day_s) + pd.Timedelta(minutes=shift_start_min)
+            shift_start_dt = pd.Timestamp(day_s) + pd.Timedelta(minutes=int(shift_start_min))
         except Exception:
             continue
 
@@ -930,16 +962,16 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
 
     resp = safe_request("POST", url, data=data)
     if resp is None:
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
     try:
         resp.raise_for_status()
     except Exception:
         _safe_fail(Exception(f"HTTP {getattr(resp,'status_code', 'ERR')} exportacion/empleados"))
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
 
     data_dec = _try_parse_encrypted_response(resp)
     if not isinstance(data_dec, list):
-        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado"])
+        return pd.DataFrame(columns=["nif", "nombre_completo", "departamento_id", "empresa_id", "sede_id", "num_empleado", "empleado_id"])
 
     lista = []
     for e in (data_dec or []):
@@ -971,6 +1003,14 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             or e.get("employeeNumber")
         )
 
+        empleado_id = (
+            e.get("id")
+            or e.get("ID")
+            or e.get("empleado_id")
+            or e.get("id_empleado")
+            or e.get("employee_id")
+        )
+
         row = {
             "nif": e.get("nif"),
             "nombre_completo": nombre_completo,
@@ -978,6 +1018,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
             "empresa_id": empresa_id,
             "sede_id": sede_id,
             "num_empleado": str(num_empleado).strip() if num_empleado is not None else "",
+            "empleado_id": _canonical_crece_id(empleado_id),
         }
 
         for k in [
@@ -993,6 +1034,7 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
     if not df.empty:
         df["nif"] = df["nif"].fillna("").astype(str).str.upper().str.strip()
         df["num_empleado"] = df["num_empleado"].astype(str).str.strip()
+        df["empleado_id"] = df.get("empleado_id", pd.Series("", index=df.index)).apply(_canonical_crece_id)
     return df
 
 
@@ -1022,6 +1064,61 @@ def api_exportar_tipos_fichaje() -> dict:
         return out
     except Exception as e:
         _safe_fail(e)
+        return {}
+
+
+def _clock_to_minutes(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            h = int(parts[0])
+            m = int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h * 60 + m
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def api_exportar_horarios() -> dict:
+    """Mapa de horarios CRECE por ID, usado para conocer el inicio real del turno."""
+    url = f"{API_URL_BASE}/exportacion/horarios"
+    try:
+        resp = safe_request("POST", url)
+        if resp is None:
+            return {}
+        resp.raise_for_status()
+        data_dec = _try_parse_encrypted_response(resp)
+        if not isinstance(data_dec, list):
+            return {}
+        out = {}
+        for h in data_dec:
+            if not isinstance(h, dict):
+                continue
+            hid = _canonical_crece_id(h.get("id"))
+            if not hid:
+                continue
+            libre_raw = str(h.get("libre") or "").strip().lower()
+            out[hid] = {
+                "hora_inicio_min": _clock_to_minutes(h.get("hora_inicio")),
+                "duracion_min": _duration_value_to_minutes(h.get("duracion_computada")),
+                "libre": libre_raw in {"1", "true", "t", "si", "sí", "yes"},
+                "abreviatura": str(h.get("abreviatura") or "").strip(),
+            }
+        return out
+    except Exception as exc:
+        _safe_fail(exc)
         return {}
 
 
@@ -1499,73 +1596,109 @@ def _normalize_turno_row(row):
     }
 
 
-def api_informe_turnos(fecha_desde: str, fecha_hasta: str):
-    """Una única petición POST a /api/informes/turnos para diagnóstico.
+def _extract_http_error_message(resp) -> str:
+    if resp is None:
+        return ""
+    try:
+        obj = resp.json()
+        if isinstance(obj, dict):
+            return str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:400]
+        if obj is not None:
+            return str(obj)[:400]
+    except Exception:
+        pass
+    try:
+        return str(resp.text or "")[:400]
+    except Exception:
+        return ""
 
-    No reintenta 422 ni hace fallback JSON: queremos observar el comportamiento
-    real del endpoint sin contaminar la prueba ni castigar CRECE.
+
+def _blocked_retry_seconds(message: str) -> float | None:
+    """Extrae 'Intente de nuevo en N segundos' de los 422 de CRECE."""
+    import re
+    m = re.search(r"(?:nuevo|again)\s+en\s+(\d+)\s+seg", str(message or ""), flags=re.I)
+    if not m:
+        return None
+    try:
+        return max(0.0, min(65.0, float(m.group(1))))
+    except Exception:
+        return None
+
+
+def api_informe_turnos(fecha_desde: str, fecha_hasta: str):
+    """Obtiene /api/informes/turnos respetando el límite oficial de 1 petición/minuto.
+
+    CRECE confirmó que todos los endpoints de informes están limitados a una
+    petición por minuto. Si el servidor devuelve el 422 temporal con el tiempo
+    restante, se espera exactamente ese cooldown y se hace un único reintento.
     """
+    global _INFORME_LAST_FINISH_MONO
+
     url = f"{API_URL_BASE}/informes/turnos"
     body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-    t0 = time.monotonic()
-    try:
-        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
-            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-            "rows": [],
-        }
 
-    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
-    status = int(resp.status_code)
-    if status != 200:
-        # Solo un extracto corto del mensaje de error; nunca headers sensibles ni payload completo.
-        msg = ""
+    with _INFORME_GATE_LOCK:
+        elapsed = time.monotonic() - float(_INFORME_LAST_FINISH_MONO or 0.0)
+        if elapsed < INFORME_MIN_INTERVAL_SECONDS:
+            time.sleep(INFORME_MIN_INTERVAL_SECONDS - elapsed)
+
+        last_status = None
+        last_error = ""
+        total_t0 = time.monotonic()
         try:
-            obj = resp.json()
-            if isinstance(obj, dict):
-                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
-            elif obj is not None:
-                msg = str(obj)[:300]
-        except Exception:
-            try:
-                msg = str(resp.text or "")[:300]
-            except Exception:
-                msg = ""
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": msg or f"HTTP {status}",
-            "rows": [],
-        }
+            for attempt in range(2):
+                resp = safe_request("POST", url, data=body, timeout=(5, 90))
+                if resp is None:
+                    return {
+                        "ok": False,
+                        "status": None,
+                        "elapsed_ms": int(round((time.monotonic() - total_t0) * 1000)),
+                        "error": "No se ha podido conectar con /informes/turnos.",
+                        "rows": [],
+                    }
 
-    parsed = _try_parse_encrypted_response(resp)
-    if parsed is None:
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
-            "rows": [],
-        }
+                last_status = int(resp.status_code)
+                if last_status == 200:
+                    parsed = _try_parse_encrypted_response(resp)
+                    if parsed is None:
+                        return {
+                            "ok": False,
+                            "status": 200,
+                            "elapsed_ms": int(round((time.monotonic() - total_t0) * 1000)),
+                            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
+                            "rows": [],
+                        }
+                    raw_rows = _extract_generic_rows(parsed)
+                    rows = []
+                    for raw in raw_rows:
+                        item = _normalize_turno_row(raw)
+                        if item is not None:
+                            rows.append(item)
+                    return {
+                        "ok": True,
+                        "status": 200,
+                        "elapsed_ms": int(round((time.monotonic() - total_t0) * 1000)),
+                        "error": "",
+                        "rows": rows,
+                    }
 
-    raw_rows = _extract_generic_rows(parsed)
-    rows = []
-    for raw in raw_rows:
-        item = _normalize_turno_row(raw)
-        if item is not None:
-            rows.append(item)
-    return {
-        "ok": True,
-        "status": status,
-        "elapsed_ms": elapsed_ms,
-        "error": "",
-        "rows": rows,
-    }
+                last_error = _extract_http_error_message(resp) or f"HTTP {last_status}"
+                if last_status == 422 and attempt == 0:
+                    wait = _blocked_retry_seconds(last_error)
+                    if wait is not None:
+                        time.sleep(wait + 1.0)
+                        continue
+                break
+
+            return {
+                "ok": False,
+                "status": last_status,
+                "elapsed_ms": int(round((time.monotonic() - total_t0) * 1000)),
+                "error": last_error or (f"HTTP {last_status}" if last_status else "Error de informe de turnos"),
+                "rows": [],
+            }
+        finally:
+            _INFORME_LAST_FINISH_MONO = time.monotonic()
 
 
 def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date, scope_emp_df: pd.DataFrame):
@@ -1779,6 +1912,279 @@ def _duration_value_to_minutes(value):
     if num <= 24 * 60:
         return int(round(num))
     return int(round(num / 60.0))
+
+
+def _canonical_absence(value) -> str:
+    """Normaliza un valor escalar de ausencia confirmado por CRECE."""
+    raw = _absence_label(value)
+    if not raw:
+        return ""
+    s = unicodedata.normalize("NFKD", str(raw))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().replace("_", " ").replace("-", " ")
+    s = " ".join(s.split())
+    aliases = {
+        "no contrato": "no-contrato",
+        "festivo": "festivo",
+        "permiso": "permiso",
+        "vacaciones": "vacaciones",
+        "vacaciones medio dia": "vacaciones medio dia",
+        "asuntos propios": "asuntos propios",
+        # Observado en producción en /informes/turnos aunque no figuró en la
+        # última enumeración escrita del proveedor.
+        "baja": "baja",
+    }
+    return aliases.get(s, s)
+
+
+def _absence_types(value) -> set[str]:
+    """Extrae uno o varios tipos sin asumir que `ausencia` sea siempre string."""
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        out = set()
+        for item in value:
+            out.update(_absence_types(item))
+        return {x for x in out if x}
+    if isinstance(value, dict):
+        for key in ("tipo", "nombre", "descripcion", "descripción", "motivo", "ausencia", "label", "texto", "name", "description"):
+            if key in value and value.get(key) not in (None, ""):
+                return _absence_types(value.get(key))
+        return {_canonical_absence(value)} if _canonical_absence(value) else set()
+
+    raw = str(value).strip()
+    if not raw:
+        return set()
+    # Por compatibilidad con posibles respuestas múltiples serializadas.
+    parts = [p.strip() for p in raw.replace(";", "|").split("|") if p.strip()]
+    out = {_canonical_absence(p) for p in parts}
+    return {x for x in out if x}
+
+
+def _expected_minutes_from_turno(base_minutes, base_known: bool, absences: set[str]) -> tuple[int | None, bool]:
+    """Aplica la semántica diaria de Turnos/Ausencias confirmada por CRECE."""
+    absences = set(absences or set())
+    contracted = "no-contrato" not in absences
+    if not base_known:
+        return None, contracted
+    base = max(0, int(base_minutes or 0))
+    if not contracted:
+        return 0, False
+    if absences.intersection({"festivo", "vacaciones", "asuntos propios", "baja"}):
+        return 0, True
+    if "vacaciones medio dia" in absences:
+        return int(round(base / 2.0)), True
+    unknown = absences.difference({"permiso"})
+    if unknown:
+        return None, True
+    return base, True
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _cached_turnos_period_metrics(fecha_desde: str, fecha_hasta: str) -> dict:
+    """Devuelve solo métricas pseudonimizadas de /informes/turnos.
+
+    No se cachean nombres, NIF ni IDs CRECE en claro. La respuesta bruta se
+    transforma dentro de esta función y el valor persistido contiene hashes.
+    """
+    result = api_informe_turnos(fecha_desde, fecha_hasta)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "No se pudo obtener /informes/turnos")
+
+    horarios = api_exportar_horarios()
+    grouped: dict[tuple[str, str], dict] = {}
+    unknown_absences: set[str] = set()
+
+    for row in list(result.get("rows") or []):
+        emp_id = _canonical_crece_id(row.get("Empleado ID"))
+        num_code = _canonical_emp_code(row.get("Nº empleado"))
+        try:
+            day = pd.to_datetime(row.get("Fecha"), errors="coerce")
+            day_iso = day.strftime("%Y-%m-%d") if pd.notna(day) else ""
+        except Exception:
+            day_iso = ""
+        if not day_iso or not (emp_id or num_code):
+            continue
+
+        emp_hash = _hash_crece_employee_id(emp_id) if emp_id else ""
+        num_hash = _hash_emp_code(num_code) if num_code else ""
+        group_key = ((emp_hash or f"NUM:{num_hash}"), day_iso)
+        g = grouped.setdefault(group_key, {
+            "emp_hash": emp_hash,
+            "num_hash": num_hash,
+            "day": day_iso,
+            "durations": [],
+            "blank_schedule_rows": 0,
+            "invalid_schedule_rows": 0,
+            "absence_types": set(),
+            "shift_starts": [],
+        })
+
+        row_absences = _absence_types(row.get("Ausencia"))
+        for absence in row_absences:
+            g["absence_types"].add(absence)
+            if absence not in {
+                "no-contrato", "festivo", "permiso", "vacaciones",
+                "vacaciones medio dia", "asuntos propios", "baja",
+            }:
+                unknown_absences.add(absence)
+
+        horario_id = _canonical_crece_id(row.get("Horario ID"))
+        if not horario_id:
+            # Confirmado por CRECE: empleado+día sin Horario ID = 0 horas
+            # programadas por ausencia de horario en el cuadrante.
+            g["blank_schedule_rows"] += 1
+            continue
+
+        dur = _duration_value_to_minutes(row.get("Horario duración computada"))
+        if dur is None:
+            g["invalid_schedule_rows"] += 1
+            continue
+        g["durations"].append(max(0, int(dur)))
+
+        if int(dur) > 0:
+            hinfo = horarios.get(horario_id, {}) if isinstance(horarios, dict) else {}
+            start_min = hinfo.get("hora_inicio_min") if isinstance(hinfo, dict) else None
+            if start_min is not None:
+                try:
+                    g["shift_starts"].append(int(start_min))
+                except Exception:
+                    pass
+
+    records = []
+    for g in grouped.values():
+        durations = list(g.get("durations") or [])
+        blank_rows = int(g.get("blank_schedule_rows") or 0)
+        invalid_rows = int(g.get("invalid_schedule_rows") or 0)
+        absences = set(g.get("absence_types") or set())
+
+        if durations:
+            base_minutes = int(sum(durations))
+            base_known = True
+        elif blank_rows > 0 and invalid_rows == 0:
+            base_minutes = 0
+            base_known = True
+        else:
+            base_minutes = None
+            base_known = False
+
+        expected, contracted = _expected_minutes_from_turno(base_minutes, base_known, absences)
+
+        baja_minutes = 0
+        if "baja" in absences and base_minutes is not None and int(base_minutes) > 0:
+            baja_minutes = int(base_minutes)
+
+        shift_start = None
+        starts = [int(x) for x in (g.get("shift_starts") or []) if x is not None]
+        if starts and expected is not None and int(expected) > 0:
+            shift_start = min(starts)
+
+        records.append({
+            "emp_hash": g.get("emp_hash") or "",
+            "num_hash": g.get("num_hash") or "",
+            "day": g.get("day") or "",
+            "expected_minutes": expected,
+            "contracted": bool(contracted),
+            "baja_minutes": int(baja_minutes),
+            "shift_start_min": shift_start,
+            "absence_types": tuple(sorted(absences)),
+        })
+
+    return {
+        "records": records,
+        "unknown_absences": sorted(unknown_absences),
+        "rows_received": len(result.get("rows") or []),
+    }
+
+
+def build_turnos_daily_maps(
+    d0: date,
+    d1: date,
+    base_emp: pd.DataFrame,
+) -> tuple[dict, dict, dict, dict, list[str], list[str]]:
+    """Construye jornada diaria, bajas y vigencia desde /informes/turnos.
+
+    Fuentes semánticas confirmadas por CRECE:
+    - Horario duración computada = turno programado del día.
+    - Sin Horario ID = 0 h programadas (distinto de horario libre, pero ambos 0).
+    - no-contrato/festivo/vacaciones/asuntos propios/baja = 0 h esperadas.
+    - vacaciones medio dia = 50 % del turno.
+    - permiso = mantiene turno; tiempoContabilizado cubre el permiso retribuido.
+    """
+    if base_emp is None or base_emp.empty or d0 > d1:
+        return {}, {}, {}, {}, [], []
+
+    all_days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
+    try:
+        metrics = _cached_turnos_period_metrics(
+            d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d")
+        )
+    except Exception as exc:
+        _safe_fail(exc)
+        return {}, {}, {}, {}, all_days, []
+
+    be = base_emp.copy()
+    be["nif"] = be.get("nif", pd.Series("", index=be.index)).fillna("").astype(str).str.upper().str.strip()
+    be["empleado_id"] = be.get("empleado_id", pd.Series("", index=be.index)).apply(_canonical_crece_id)
+    be["num_code"] = be.get("num_empleado", pd.Series("", index=be.index)).apply(_canonical_emp_code)
+
+    id_to_nif = {}
+    for _, row in be.iterrows():
+        nif = str(row.get("nif") or "").upper().strip()
+        eid = _canonical_crece_id(row.get("empleado_id"))
+        if nif and eid:
+            id_to_nif[_hash_crece_employee_id(eid)] = nif
+
+    # Fallback por Nº empleado solo si ese número es único en todo el universo
+    # permitido. Esto evita atribuciones cruzadas cuando CRECE tiene duplicados.
+    num_to_nif = {}
+    for _, row in be.iterrows():
+        nif = str(row.get("nif") or "").upper().strip()
+        code = str(row.get("num_code") or "").strip()
+        unique_global = bool(row.get("num_empleado_unique_global", False))
+        if nif and code and unique_global:
+            num_to_nif[_hash_emp_code(code)] = nif
+
+    hp_out: dict[tuple[str, str], int] = {}
+    baja_out: dict[tuple[str, str], int] = {}
+    contratado_out: dict[tuple[str, str], bool] = {}
+    shift_start_out: dict[tuple[str, str], int] = {}
+
+    for rec in list((metrics or {}).get("records", []) or []):
+        nif = id_to_nif.get(str(rec.get("emp_hash") or ""))
+        if not nif:
+            nif = num_to_nif.get(str(rec.get("num_hash") or ""))
+        day = str(rec.get("day") or "")
+        if not nif or not day:
+            continue
+
+        key = (nif, day)
+        contratado_out[key] = bool(rec.get("contracted") is True)
+
+        expected = rec.get("expected_minutes")
+        if expected is not None:
+            try:
+                hp_out[key] = max(0, int(expected))
+            except Exception:
+                pass
+
+        try:
+            baja = max(0, int(rec.get("baja_minutes") or 0))
+        except Exception:
+            baja = 0
+        if baja > 0:
+            baja_out[key] = baja
+
+        start_min = rec.get("shift_start_min")
+        if start_min is not None:
+            try:
+                shift_start_out[key] = int(start_min)
+            except Exception:
+                pass
+
+    unknown_absences = list((metrics or {}).get("unknown_absences", []) or [])
+    return hp_out, baja_out, contratado_out, shift_start_out, [], unknown_absences
+
 
 
 def _report_hours_to_minutes(value):
@@ -2570,6 +2976,16 @@ if empleados_df.empty:
     st.error("Tras aplicar filtros de empresas/sedes permitidas, no quedan empleados. Revisa que los nombres coincidan en catálogo.")
     st.stop()
 
+# Nº empleado no es necesariamente único en CRECE. Solo se permite como fallback
+# de enlace con Turnos cuando es único en TODO el universo permitido.
+empleados_df["_num_code_global"] = empleados_df.get(
+    "num_empleado", pd.Series("", index=empleados_df.index)
+).apply(_canonical_emp_code)
+_num_counts_global = empleados_df["_num_code_global"].replace("", pd.NA).dropna().value_counts()
+empleados_df["num_empleado_unique_global"] = empleados_df["_num_code_global"].apply(
+    lambda x: bool(x) and int(_num_counts_global.get(x, 0)) == 1
+)
+
 hoy = date.today()
 col1, col2 = st.columns(2)
 with col1:
@@ -2634,8 +3050,20 @@ else:
 
 st.write("---")
 
-# Marcador temporal inequívoco para verificar que GitHub/Streamlit ha desplegado esta versión.
-st.caption("VERSIÓN DE PRUEBA ACTIVA: PASO 4.4 — /informes/turnos + campo ausencia")
+
+APP_STATE_VERSION = "turnos-ausencias-2026-09-22-v1"
+if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
+    for _state_key in [
+        "last_sig", "result_incidencias", "result_bajas", "result_sin_fichajes",
+        "result_excesos_semana", "result_csv_incidencias", "result_csv_bajas",
+        "result_csv_sin", "result_csv_excesos", "scope_fi", "scope_ff",
+        "scope_empresas_norm", "scope_sedes_norm", "scope_empleados_nif",
+        "scope_used_employee_filter", "result_informe_missing_days",
+        "result_tiempo_missing_days", "result_exceso_incomplete_count",
+        "result_turnos_unknown_absences",
+    ]:
+        st.session_state.pop(_state_key, None)
+    st.session_state["_app_state_version"] = APP_STATE_VERSION
 
 
 def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list, empleados_sel_nifs: set[str] | None = None) -> str:
@@ -2669,233 +3097,10 @@ for k, v in [
     ("result_informe_missing_days", []),
     ("result_tiempo_missing_days", []),
     ("result_exceso_incomplete_count", 0),
-    ("result_informe_diag", []),
-    ("turnos_diag_result", None),
-    ("turnos_diag_detail", None),
-    ("turnos_diag_matrix", None),
-    ("turnos_diag_summary", None),
-    ("turnos_diag_range", None),
-    ("vacaciones_diag_result", None),
-    ("vacaciones_diag_range", None),
+    ("result_turnos_unknown_absences", []),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
-
-
-# ------------------------------------------------------------
-# DIAGNÓSTICO TEMPORAL /informes/turnos
-# ------------------------------------------------------------
-with st.expander("🧪 Paso 4.4 — /informes/turnos + ausencia", expanded=False):
-    st.caption(
-        "Prueba aislada: hace UNA sola petición a /api/informes/turnos para el rango seleccionado. "
-        "No ejecuta la consulta normal de Fichajes/Excesos."
-    )
-    st.write("Prueba el nuevo campo **ausencia** añadido por CRECE usando **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
-    _turnos_test_clicked = st.button("Probar /informes/turnos + ausencia", key="btn_diag_turnos")
-
-    if _turnos_test_clicked:
-        if fecha_inicio > fecha_fin:
-            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
-        elif fecha_fin > hoy:
-            st.error("La fecha fin no puede ser mayor que hoy.")
-        else:
-            with st.spinner("Consultando /informes/turnos una sola vez…"):
-                _td_res = api_informe_turnos(
-                    fecha_inicio.strftime("%Y-%m-%d"),
-                    fecha_fin.strftime("%Y-%m-%d"),
-                )
-            st.session_state["turnos_diag_result"] = _td_res
-            st.session_state["turnos_diag_range"] = (
-                fecha_inicio.strftime("%Y-%m-%d"),
-                fecha_fin.strftime("%Y-%m-%d"),
-            )
-            if _td_res.get("ok"):
-                _td_detail, _td_matrix, _td_summary = _build_turnos_diagnostic(
-                    _td_res, fecha_inicio, fecha_fin, empleados_filtrados
-                )
-                st.session_state["turnos_diag_detail"] = _td_detail
-                st.session_state["turnos_diag_matrix"] = _td_matrix
-                st.session_state["turnos_diag_summary"] = _td_summary
-            else:
-                st.session_state["turnos_diag_detail"] = pd.DataFrame()
-                st.session_state["turnos_diag_matrix"] = pd.DataFrame()
-                st.session_state["turnos_diag_summary"] = pd.DataFrame()
-
-    _td_res = st.session_state.get("turnos_diag_result")
-    if isinstance(_td_res, dict):
-        _td_range = st.session_state.get("turnos_diag_range")
-        st.write(
-            f"**Resultado HTTP:** `{_td_res.get('status')}` · "
-            f"**Duración:** `{_td_res.get('elapsed_ms')} ms` · "
-            f"**Filas recibidas:** `{len(_td_res.get('rows') or [])}`"
-        )
-        if _td_range:
-            st.caption(f"Rango probado: {_td_range[0]} → {_td_range[1]}")
-        if not _td_res.get("ok"):
-            st.error(f"Error de /informes/turnos: {_td_res.get('error') or 'sin detalle'}")
-        else:
-            _td_summary = st.session_state.get("turnos_diag_summary")
-            _td_matrix = st.session_state.get("turnos_diag_matrix")
-            _td_detail = st.session_state.get("turnos_diag_detail")
-
-            if isinstance(_td_summary, pd.DataFrame) and not _td_summary.empty:
-                st.write("**Resumen por empleado**")
-                st.dataframe(_td_summary, use_container_width=True, hide_index=True)
-            if isinstance(_td_detail, pd.DataFrame) and not _td_detail.empty and "Tiene ausencia" in _td_detail.columns:
-                _td_abs = _td_detail[_td_detail["Tiene ausencia"] == True].copy()
-                st.write(f"**Filas con ausencia informada por CRECE: {len(_td_abs)}**")
-                if not _td_abs.empty:
-                    _abs_cols = [c for c in [
-                        "Fecha", "Nº empleado", "Nombre app", "Empleado ID",
-                        "Horario abreviatura", "Duración HH:MM", "Ausencia tipo", "Ausencia raw"
-                    ] if c in _td_abs.columns]
-                    st.dataframe(_td_abs[_abs_cols], use_container_width=True, hide_index=True)
-            if isinstance(_td_matrix, pd.DataFrame) and not _td_matrix.empty:
-                st.write("**Matriz empleado × día (incluye días sin fila de turno)**")
-                st.dataframe(_td_matrix, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇ Descargar matriz turnos",
-                    data=_td_matrix.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_turnos_ausencias_matriz.csv",
-                    mime="text/csv",
-                    key="download_diag_turnos_matrix",
-                )
-            if isinstance(_td_detail, pd.DataFrame) and not _td_detail.empty:
-                st.write("**Detalle bruto normalizado de filas devueltas por CRECE**")
-                st.dataframe(_td_detail, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇ Descargar detalle turnos",
-                    data=_td_detail.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_turnos_ausencias_detalle.csv",
-                    mime="text/csv",
-                    key="download_diag_turnos_detail",
-                )
-
-    if _turnos_test_clicked:
-        # Evita que esta prueba temporal siga hacia la consulta normal de la app.
-        st.stop()
-
-
-
-# ------------------------------------------------------------
-# DIAGNÓSTICO TEMPORAL — total semanal de /informes/empleados
-# ------------------------------------------------------------
-with st.expander("🧪 Paso 4.2 — Horas programadas semanales", expanded=False):
-    st.caption(
-        "Hace UNA sola petición a /api/informes/empleados para el rango seleccionado. "
-        "No ejecuta la consulta normal ni hace reintentos."
-    )
-    st.write("Para esta comparación usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
-    _emp_week_clicked = st.button(
-        "Probar Horas programadas del periodo",
-        key="btn_diag_informe_empleados_week",
-    )
-
-    if _emp_week_clicked:
-        if fecha_inicio > fecha_fin:
-            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
-        elif fecha_fin > hoy:
-            st.error("La fecha fin no puede ser mayor que hoy.")
-        else:
-            with st.spinner("Consultando /informes/empleados una sola vez…"):
-                _ew_res = api_informe_empleados_once_diag(
-                    fecha_inicio.strftime("%Y-%m-%d"),
-                    fecha_fin.strftime("%Y-%m-%d"),
-                )
-            st.session_state["emp_week_diag_result"] = _ew_res
-            st.session_state["emp_week_diag_range"] = (
-                fecha_inicio.strftime("%Y-%m-%d"),
-                fecha_fin.strftime("%Y-%m-%d"),
-            )
-
-    _ew_res = st.session_state.get("emp_week_diag_result")
-    if isinstance(_ew_res, dict):
-        _ew_range = st.session_state.get("emp_week_diag_range")
-        st.write(
-            f"**Resultado HTTP:** `{_ew_res.get('status')}` · "
-            f"**Duración:** `{_ew_res.get('elapsed_ms')} ms` · "
-            f"**Filas recibidas:** `{len(_ew_res.get('rows') or [])}`"
-        )
-        if _ew_range:
-            st.caption(f"Rango probado: {_ew_range[0]} → {_ew_range[1]}")
-        if not _ew_res.get("ok"):
-            st.error(f"Error de /informes/empleados: {_ew_res.get('error') or 'sin detalle'}")
-        else:
-            _ew_df = pd.DataFrame(_ew_res.get("rows") or [])
-            if not _ew_df.empty:
-                st.dataframe(_ew_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇ Descargar Horas programadas semanales",
-                    data=_ew_df.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_horas_programadas_semana.csv",
-                    mime="text/csv",
-                    key="download_diag_emp_week",
-                )
-
-    if _emp_week_clicked:
-        st.stop()
-
-
-
-# ------------------------------------------------------------
-# DIAGNÓSTICO TEMPORAL — vacaciones aprobadas del periodo
-# ------------------------------------------------------------
-with st.expander("🧪 Paso 4.3 — Vacaciones aprobadas del periodo", expanded=False):
-    st.caption(
-        "Hace UNA sola petición a /api/exportacion/vacaciones (Estado=1). "
-        "No ejecuta la consulta normal de la app ni llama a /informes/*."
-    )
-    st.write("Para esta comprobación usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
-    _vac_clicked = st.button(
-        "Probar vacaciones aprobadas del periodo",
-        key="btn_diag_vacaciones_periodo",
-    )
-
-    if _vac_clicked:
-        if fecha_inicio > fecha_fin:
-            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
-        elif fecha_fin > hoy:
-            st.error("La fecha fin no puede ser mayor que hoy.")
-        else:
-            with st.spinner("Consultando /exportacion/vacaciones una sola vez…"):
-                _vac_res = api_exportacion_vacaciones_once_diag(
-                    fecha_inicio.strftime("%Y-%m-%d"),
-                    fecha_fin.strftime("%Y-%m-%d"),
-                )
-            st.session_state["vacaciones_diag_result"] = _vac_res
-            st.session_state["vacaciones_diag_range"] = (
-                fecha_inicio.strftime("%Y-%m-%d"),
-                fecha_fin.strftime("%Y-%m-%d"),
-            )
-
-    _vac_res = st.session_state.get("vacaciones_diag_result")
-    if isinstance(_vac_res, dict):
-        _vac_range = st.session_state.get("vacaciones_diag_range")
-        st.write(
-            f"**Resultado HTTP:** `{_vac_res.get('status')}` · "
-            f"**Duración:** `{_vac_res.get('elapsed_ms')} ms` · "
-            f"**Solicitudes recibidas:** `{len(_vac_res.get('rows') or [])}`"
-        )
-        if _vac_range:
-            st.caption(f"Rango probado: {_vac_range[0]} → {_vac_range[1]}")
-        if not _vac_res.get("ok"):
-            st.error(f"Error de /exportacion/vacaciones: {_vac_res.get('error') or 'sin detalle'}")
-        else:
-            _vac_df = pd.DataFrame(_vac_res.get("rows") or [])
-            if _vac_df.empty:
-                st.info("CRECE no ha devuelto vacaciones aprobadas que solapen con el rango.")
-            else:
-                st.dataframe(_vac_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇ Descargar vacaciones aprobadas",
-                    data=_vac_df.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_vacaciones_aprobadas.csv",
-                    mime="text/csv",
-                    key="download_diag_vacaciones_aprobadas",
-                )
-
-    if _vac_clicked:
-        st.stop()
 
 
 # --- Safe defaults to avoid NameError on first load / when no results ---
@@ -2908,7 +3113,6 @@ weeks_ui = []
 consultar = st.button("Consultar")
 
 if consultar:
-    _reset_informe_diag()
     if fecha_inicio > fecha_fin:
         st.error("❌ La fecha inicio no puede ser posterior a la fecha fin.")
         st.stop()
@@ -2976,14 +3180,23 @@ if consultar:
         base_emp["num_empleado"] = base_emp.get(
             "num_empleado", pd.Series("", index=base_emp.index)
         ).fillna("").astype(str).str.strip()
+        base_emp["empleado_id"] = base_emp.get(
+            "empleado_id", pd.Series("", index=base_emp.index)
+        ).apply(_canonical_crece_id)
 
         try:
-            horas_prog_map_query, bajas_min_map_query, contratado_map_query, informe_missing_days = build_informe_diario_maps_resilient(
-                d0, d1, base_emp
-            )
+            (
+                horas_prog_map_query,
+                bajas_min_map_query,
+                contratado_map_query,
+                turno_start_map_query,
+                informe_missing_days,
+                turnos_unknown_absences,
+            ) = build_turnos_daily_maps(d0, d1, base_emp)
         except Exception as _e:
             _safe_fail(_e)
-            horas_prog_map_query, bajas_min_map_query, contratado_map_query, informe_missing_days = {}, {}, {}, []
+            horas_prog_map_query, bajas_min_map_query, contratado_map_query = {}, {}, {}
+            turno_start_map_query, informe_missing_days, turnos_unknown_absences = {}, [], []
 
         nifs_all_query = [
             n for n in base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -2994,8 +3207,6 @@ if consultar:
         except Exception as _e:
             _safe_fail(_e)
             tc_map_query, tiempo_missing_days = {}, []
-
-        st.session_state["result_informe_diag"] = _snapshot_informe_diag()
 
         # --------- INCIDENCIAS ----------
         if df_fich.empty:
@@ -3097,11 +3308,6 @@ if consultar:
                 if exp_known and exp_min == 0 and worked:
                     return "Trabajado en día no laborable"
 
-                if int(r.get("dia", 0)) in [5, 6]:
-                    if worked:
-                        motivos.append("Trabajo en fin de semana")
-                    return "; ".join(motivos)
-
                 # Horas insuficientes solo con la jornada ya cerrada.
                 if completed_day and tc_known and exp_known and exp_min is not None and exp_min > 0 and worked_minutes < (exp_min - TOLERANCIA_MINUTOS):
                     motivos.append(f"Horas insuficientes (mín {segundos_a_hhmm(exp_min * 60)})")
@@ -3180,8 +3386,8 @@ if consultar:
                 ])
 
         # --------- BAJAS ----------
-        # Se reutiliza la MISMA lectura diaria de /informes/empleados utilizada
-        # para Horas programadas. No se vuelve a golpear el endpoint.
+        # Se reutiliza la misma lectura de /informes/turnos + ausencia usada
+        # para la jornada programada. No se hace una segunda llamada a informes.
         bajas_por_dia = {}
         if bajas_min_map_query:
             base_by_nif = (
@@ -3217,8 +3423,9 @@ if consultar:
         # --------- SIN FICHAJES ----------
         sin_por_dia = {}
 
-        # La elegibilidad es histórica por día: Días contratado en el periodo
-        # del propio /informes/empleados, no el estado "hoy" del maestro.
+        # La elegibilidad histórica por día procede de /informes/turnos:
+        # no-contrato excluye; una fila de cuadrante sin Horario ID sigue siendo
+        # un día contratado con 0 h programadas.
         base_emp_sin = base_emp.copy()
         empleados_nifs = [
             n for n in base_emp_sin["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -3277,9 +3484,9 @@ if consultar:
 
 
         # --------- EXCESO SEMANAL (MOI + ESTRUCTURA + MOD) ----------
-        # Fuente única:
+        # Fuentes:
         #   trabajado diario = tiempoContabilizado
-        #   esperado diario  = Horas programadas
+        #   esperado diario  = /informes/turnos + ausencia (validado contra HP semanal)
         # Balance diario cuantizado; balance semanal = suma de balances diarios.
         try:
             full_weeks = [
@@ -3296,7 +3503,7 @@ if consultar:
         if full_weeks:
             horas_prog_map = horas_prog_map_query
             tc_map = tc_map_query
-            mod_pre_shift_map = build_mod_pre_shift_work_map(df_fich, tipos_map)
+            mod_pre_shift_map = build_mod_pre_shift_work_map(df_fich, tipos_map, turno_start_map_query)
 
             base_exc = base_emp.copy()
             base_exc["Departamento_norm"] = (
@@ -3440,6 +3647,7 @@ if consultar:
     st.session_state["result_informe_missing_days"] = list(informe_missing_days or [])
     st.session_state["result_tiempo_missing_days"] = list(tiempo_missing_days or [])
     st.session_state["result_exceso_incomplete_count"] = int(exceso_incomplete_count or 0)
+    st.session_state["result_turnos_unknown_absences"] = list(turnos_unknown_absences or [])
 
     st.session_state["result_csv_incidencias"] = (
         _df_view(salida_incidencias).to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
@@ -3595,64 +3803,23 @@ def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> byte
 # Avisos no bloqueantes únicamente cuando CRECE no ha podido proporcionar datos.
 _missing_days_ui = list(st.session_state.get("result_informe_missing_days", []) or [])
 _missing_tc_days_ui = list(st.session_state.get("result_tiempo_missing_days", []) or [])
+_unknown_abs_ui = list(st.session_state.get("result_turnos_unknown_absences", []) or [])
 if _missing_days_ui:
     st.warning(
-        f"No se ha podido obtener el informe diario de empleados de CRECE para "
-        f"{len(_missing_days_ui)} fecha(s). La consulta continúa sin inventar Horas programadas; "
-        "esas fechas se omiten de las validaciones que dependen de ese dato."
+        "No se ha podido obtener /informes/turnos de CRECE para el rango consultado. "
+        "Las validaciones que dependen de la jornada programada se omiten sin inventar datos."
     )
 if _missing_tc_days_ui:
     st.warning(
         f"No se ha podido obtener tiempoContabilizado de CRECE para "
         f"{len(_missing_tc_days_ui)} fecha(s). Esas fechas no se interpretan como 00:00."
     )
-
-# Diagnóstico técnico temporal: solo aparece si falló /informes/empleados.
-# No contiene NIF, nombres, tokens, payloads ni respuestas desencriptadas.
-_diag_events_ui = list(st.session_state.get("result_informe_diag", []) or [])
-if _missing_days_ui and _diag_events_ui:
-    with st.expander("🔎 Diagnóstico técnico CRECE — informe de empleados", expanded=True):
-        _diag_df = pd.DataFrame(_diag_events_ui)
-        _http = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("http")].copy() if not _diag_df.empty else pd.DataFrame()
-        _parse = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("parse")].copy() if not _diag_df.empty else pd.DataFrame()
-        _day = _diag_df[_diag_df.get("kind", pd.Series(index=_diag_df.index, dtype=str)).eq("day")].copy() if not _diag_df.empty else pd.DataFrame()
-
-        st.caption("Solo metadatos técnicos; no se muestran datos personales ni payloads de CRECE.")
-        if not _http.empty and "status" in _http.columns:
-            _status_counts = (
-                _http.assign(status=_http["status"].fillna("sin_status").astype(str))
-                .groupby("status", dropna=False).size().reset_index(name="Intentos HTTP")
-                .sort_values("Intentos HTTP", ascending=False)
-            )
-            st.write("**Estados HTTP observados**")
-            st.dataframe(_status_counts, use_container_width=True, hide_index=True)
-        if not _parse.empty and "outcome" in _parse.columns:
-            _parse_counts = (
-                _parse.assign(outcome=_parse["outcome"].fillna("desconocido").astype(str))
-                .groupby("outcome", dropna=False).size().reset_index(name="Respuestas finales")
-                .sort_values("Respuestas finales", ascending=False)
-            )
-            st.write("**Resultado de descifrado/lectura**")
-            st.dataframe(_parse_counts, use_container_width=True, hide_index=True)
-        if not _day.empty and "outcome" in _day.columns:
-            _day_counts = (
-                _day.assign(outcome=_day["outcome"].fillna("desconocido").astype(str))
-                .groupby("outcome", dropna=False).size().reset_index(name="Fechas")
-                .sort_values("Fechas", ascending=False)
-            )
-            st.write("**Resultado por fecha**")
-            st.dataframe(_day_counts, use_container_width=True, hide_index=True)
-
-        _safe_cols = [c for c in ["kind", "label", "day", "attempt", "status", "elapsed_ms", "bytes", "retry_after", "content_type", "outcome", "rows", "error", "matched", "scope", "hp_entries", "contratado_entries"] if c in _diag_df.columns]
-        if _safe_cols:
-            _diag_export = _diag_df[_safe_cols].copy()
-            st.download_button(
-                "⬇ Descargar diagnóstico técnico",
-                data=_diag_export.to_csv(index=False).encode("utf-8"),
-                file_name="diagnostico_informes_crece.csv",
-                mime="text/csv",
-                key="download_diag_informes_crece",
-            )
+if _unknown_abs_ui:
+    st.warning(
+        "CRECE ha devuelto tipos de ausencia no reconocidos por la integración: "
+        + ", ".join(sorted(set(map(str, _unknown_abs_ui))))
+        + ". Esos días no se interpretan automáticamente como jornada 0."
+    )
 
 
 # Exceso solo se muestra cuando el rango contiene al menos una semana completa.
