@@ -1393,6 +1393,7 @@ _TURNOS_POS = {
     "horario_color": 7,
     "horario_duracion_computada": 8,
     "horario_texto": 9,
+    "ausencia": 10,
 }
 
 
@@ -1429,6 +1430,41 @@ def _turno_value(row, aliases, pos_key):
     return None
 
 
+def _diag_json(value) -> str:
+    """Representación compacta y estable para inspeccionar el nuevo campo ausencia."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return str(value)
+    return str(value).strip()
+
+
+def _absence_label(value) -> str:
+    """Extrae una etiqueta legible sin asumir todavía la estructura exacta de CRECE."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "tipo", "nombre", "descripcion", "descripción", "motivo",
+            "ausencia", "label", "texto", "name", "description"
+        ):
+            if key in value and value.get(key) not in (None, ""):
+                return _diag_json(value.get(key))
+        return _diag_json(value)
+    if isinstance(value, (list, tuple)):
+        labels = [_absence_label(v) for v in value]
+        labels = [x for x in labels if x]
+        return " | ".join(dict.fromkeys(labels)) if labels else _diag_json(value)
+    return str(value).strip()
+
+
 def _normalize_turno_row(row):
     if not isinstance(row, (dict, list, tuple)):
         return None
@@ -1455,6 +1491,11 @@ def _normalize_turno_row(row):
             "horario_duracion_computada",
         ),
         "Horario texto": _turno_value(row, ["Horario texto", "horario_texto"], "horario_texto"),
+        "Ausencia": _turno_value(
+            row,
+            ["ausencia", "Ausencia", "absence", "tipo_ausencia", "tipoAusencia"],
+            "ausencia",
+        ),
     }
 
 
@@ -1535,7 +1576,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
         detail = pd.DataFrame(columns=[
             "Turno ID", "Empleado ID", "Nº empleado", "Nombre y apellidos", "Fecha",
             "Horario ID", "Horario abreviatura", "Horario color",
-            "Horario duración computada", "Horario texto",
+            "Horario duración computada", "Horario texto", "Ausencia",
         ])
 
     detail["num_code"] = detail.get("Nº empleado", pd.Series(index=detail.index, dtype=object)).apply(_canonical_emp_code)
@@ -1546,6 +1587,13 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
     detail["Duración HH:MM"] = detail["Duración minutos"].apply(
         lambda x: segundos_a_hhmm(int(x) * 60) if pd.notna(x) else ""
     )
+    detail["Ausencia raw"] = detail.get(
+        "Ausencia", pd.Series(index=detail.index, dtype=object)
+    ).apply(_diag_json)
+    detail["Ausencia tipo"] = detail.get(
+        "Ausencia", pd.Series(index=detail.index, dtype=object)
+    ).apply(_absence_label)
+    detail["Tiene ausencia"] = detail["Ausencia raw"].astype(str).str.strip().ne("")
 
     scope = scope_emp_df.copy()
     if "num_empleado" not in scope.columns:
@@ -1581,6 +1629,8 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
                     "Jornada turnos minutos": ("Duración minutos num", "sum"),
                     "Horarios": ("Horario texto", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
                     "Abreviaturas": ("Horario abreviatura", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
+                    "Ausencias": ("Ausencia tipo", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
+                    "Ausencias raw": ("Ausencia raw", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
                 }
             )
         )
@@ -1615,6 +1665,8 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
                 "Estado turno": "CON TURNO" if hit is not None else "SIN FILA DE TURNO",
                 "Abreviaturas": str(hit.get("Abreviaturas") or "") if hit is not None else "",
                 "Horario texto": str(hit.get("Horarios") or "") if hit is not None else "",
+                "Ausencia": str(hit.get("Ausencias") or "") if hit is not None else "",
+                "Ausencia raw": str(hit.get("Ausencias raw") or "") if hit is not None else "",
             })
     matrix = pd.DataFrame(matrix_rows)
 
@@ -1627,6 +1679,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
                 **{
                     "Días con turno": ("Estado turno", lambda s: int((s == "CON TURNO").sum())),
                     "Días sin fila": ("Estado turno", lambda s: int((s == "SIN FILA DE TURNO").sum())),
+                    "Días con ausencia": ("Ausencia", lambda s: int(s.astype(str).str.strip().ne("").sum())),
                     "Total minutos": ("Jornada turnos minutos", "sum"),
                 }
             )
@@ -1638,6 +1691,7 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
         "Fecha", "Nº empleado", "Nombre y apellidos", "Nombre app", "Empresa", "Sede", "Departamento",
         "Turno ID", "Empleado ID", "Horario ID", "Horario abreviatura",
         "Horario duración computada", "Duración HH:MM", "Duración minutos", "Horario texto",
+        "Ausencia tipo", "Ausencia raw", "Tiene ausencia",
     ]
     detail_cols = [c for c in detail_cols if c in detail.columns]
     detail = detail[detail_cols].sort_values([c for c in ["Fecha", "Nombre app", "Nº empleado"] if c in detail.columns], kind="mergesort") if not detail.empty else detail
@@ -2580,6 +2634,9 @@ else:
 
 st.write("---")
 
+# Marcador temporal inequívoco para verificar que GitHub/Streamlit ha desplegado esta versión.
+st.caption("VERSIÓN DE PRUEBA ACTIVA: PASO 4.4 — /informes/turnos + campo ausencia")
+
 
 def _sig(fi: str, ff: str, empresas_sel: list, sedes_sel: list, empleados_sel_nifs: set[str] | None = None) -> str:
     empleados_sel_nifs = empleados_sel_nifs or set()
@@ -2628,13 +2685,13 @@ for k, v in [
 # ------------------------------------------------------------
 # DIAGNÓSTICO TEMPORAL /informes/turnos
 # ------------------------------------------------------------
-with st.expander("🧪 Diagnóstico temporal — /informes/turnos", expanded=False):
+with st.expander("🧪 Paso 4.4 — /informes/turnos + ausencia", expanded=False):
     st.caption(
         "Prueba aislada: hace UNA sola petición a /api/informes/turnos para el rango seleccionado. "
         "No ejecuta la consulta normal de Fichajes/Excesos."
     )
-    st.write("Para la primera prueba usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
-    _turnos_test_clicked = st.button("Probar /informes/turnos", key="btn_diag_turnos")
+    st.write("Prueba el nuevo campo **ausencia** añadido por CRECE usando **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
+    _turnos_test_clicked = st.button("Probar /informes/turnos + ausencia", key="btn_diag_turnos")
 
     if _turnos_test_clicked:
         if fecha_inicio > fecha_fin:
@@ -2684,13 +2741,22 @@ with st.expander("🧪 Diagnóstico temporal — /informes/turnos", expanded=Fal
             if isinstance(_td_summary, pd.DataFrame) and not _td_summary.empty:
                 st.write("**Resumen por empleado**")
                 st.dataframe(_td_summary, use_container_width=True, hide_index=True)
+            if isinstance(_td_detail, pd.DataFrame) and not _td_detail.empty and "Tiene ausencia" in _td_detail.columns:
+                _td_abs = _td_detail[_td_detail["Tiene ausencia"] == True].copy()
+                st.write(f"**Filas con ausencia informada por CRECE: {len(_td_abs)}**")
+                if not _td_abs.empty:
+                    _abs_cols = [c for c in [
+                        "Fecha", "Nº empleado", "Nombre app", "Empleado ID",
+                        "Horario abreviatura", "Duración HH:MM", "Ausencia tipo", "Ausencia raw"
+                    ] if c in _td_abs.columns]
+                    st.dataframe(_td_abs[_abs_cols], use_container_width=True, hide_index=True)
             if isinstance(_td_matrix, pd.DataFrame) and not _td_matrix.empty:
                 st.write("**Matriz empleado × día (incluye días sin fila de turno)**")
                 st.dataframe(_td_matrix, use_container_width=True, hide_index=True)
                 st.download_button(
                     "⬇ Descargar matriz turnos",
                     data=_td_matrix.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_turnos_matriz.csv",
+                    file_name="diagnostico_turnos_ausencias_matriz.csv",
                     mime="text/csv",
                     key="download_diag_turnos_matrix",
                 )
@@ -2700,7 +2766,7 @@ with st.expander("🧪 Diagnóstico temporal — /informes/turnos", expanded=Fal
                 st.download_button(
                     "⬇ Descargar detalle turnos",
                     data=_td_detail.to_csv(index=False).encode("utf-8"),
-                    file_name="diagnostico_turnos_detalle.csv",
+                    file_name="diagnostico_turnos_ausencias_detalle.csv",
                     mime="text/csv",
                     key="download_diag_turnos_detail",
                 )
