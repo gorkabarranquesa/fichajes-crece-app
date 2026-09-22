@@ -1977,6 +1977,102 @@ def api_informe_empleados_once_diag(fecha_desde: str, fecha_hasta: str):
         "rows": rows_out,
     }
 
+
+
+# ============================================================
+# DIAGNÓSTICO TEMPORAL — /api/exportacion/vacaciones
+# ============================================================
+
+def api_exportacion_vacaciones_once_diag(fecha_inicio: str, fecha_fin: str):
+    """Una única petición a /api/exportacion/vacaciones para validar ausencias.
+
+    Solicita únicamente vacaciones aprobadas (Estado=1) en el rango indicado.
+    No hace retries ni fallback para mantener la prueba aislada.
+    """
+    url = f"{API_URL_BASE}/exportacion/vacaciones"
+    body = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin, "Estado": 1}
+    t0 = time.monotonic()
+    try:
+        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "rows": [],
+        }
+
+    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
+    status = int(resp.status_code)
+    if status != 200:
+        msg = ""
+        try:
+            obj = resp.json()
+            if isinstance(obj, dict):
+                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
+            elif obj is not None:
+                msg = str(obj)[:300]
+        except Exception:
+            try:
+                msg = str(resp.text or "")[:300]
+            except Exception:
+                msg = ""
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": msg or f"HTTP {status}",
+            "rows": [],
+        }
+
+    parsed = _try_parse_encrypted_response(resp)
+    if parsed is None:
+        return {
+            "ok": False,
+            "status": status,
+            "elapsed_ms": elapsed_ms,
+            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
+            "rows": [],
+        }
+
+    raw_rows = _extract_generic_rows(parsed)
+    rows = []
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        usuario = raw.get("usuario") if isinstance(raw.get("usuario"), dict) else {}
+        num_emp = (
+            usuario.get("Num_empleado") or usuario.get("num_empleado") or
+            usuario.get("Número de empleado") or usuario.get("Nº empleado")
+        )
+        nombre_parts = [
+            usuario.get("Name") or usuario.get("name") or "",
+            usuario.get("Primer_apellido") or usuario.get("primer_apellido") or "",
+            usuario.get("Segundo_apellido") or usuario.get("segundo_apellido") or "",
+        ]
+        nombre = " ".join(str(x).strip() for x in nombre_parts if str(x or "").strip()).strip()
+        rows.append({
+            "Vacaciones ID": raw.get("ID", raw.get("id")),
+            "Empleado ID": raw.get("empleado_id", raw.get("Empleado ID")),
+            "Nº empleado": num_emp,
+            "Nombre": nombre,
+            "Fecha inicio": raw.get("fecha_inicio", raw.get("Fecha inicio")),
+            "Fecha fin": raw.get("fecha_fin", raw.get("Fecha fin")),
+            "Días laborables": raw.get("días_laborables", raw.get("dias_laborables", raw.get("Días laborables"))),
+            "Tipo": raw.get("tipo", raw.get("Tipo")),
+            "Estado": raw.get("estado", raw.get("Estado")),
+        })
+
+    return {
+        "ok": True,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "error": "",
+        "rows": rows,
+    }
+
+
 # ============================================================
 # DÍA (turno nocturno) + tiempos netos
 # ============================================================
@@ -2522,6 +2618,8 @@ for k, v in [
     ("turnos_diag_matrix", None),
     ("turnos_diag_summary", None),
     ("turnos_diag_range", None),
+    ("vacaciones_diag_result", None),
+    ("vacaciones_diag_range", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -2670,6 +2768,69 @@ with st.expander("🧪 Paso 4.2 — Horas programadas semanales", expanded=False
 
     if _emp_week_clicked:
         st.stop()
+
+
+
+# ------------------------------------------------------------
+# DIAGNÓSTICO TEMPORAL — vacaciones aprobadas del periodo
+# ------------------------------------------------------------
+with st.expander("🧪 Paso 4.3 — Vacaciones aprobadas del periodo", expanded=False):
+    st.caption(
+        "Hace UNA sola petición a /api/exportacion/vacaciones (Estado=1). "
+        "No ejecuta la consulta normal de la app ni llama a /informes/*."
+    )
+    st.write("Para esta comprobación usa **14/09/2026 → 18/09/2026**, todas las empresas/sedes y ningún empleado concreto.")
+    _vac_clicked = st.button(
+        "Probar vacaciones aprobadas del periodo",
+        key="btn_diag_vacaciones_periodo",
+    )
+
+    if _vac_clicked:
+        if fecha_inicio > fecha_fin:
+            st.error("La fecha inicio no puede ser posterior a la fecha fin.")
+        elif fecha_fin > hoy:
+            st.error("La fecha fin no puede ser mayor que hoy.")
+        else:
+            with st.spinner("Consultando /exportacion/vacaciones una sola vez…"):
+                _vac_res = api_exportacion_vacaciones_once_diag(
+                    fecha_inicio.strftime("%Y-%m-%d"),
+                    fecha_fin.strftime("%Y-%m-%d"),
+                )
+            st.session_state["vacaciones_diag_result"] = _vac_res
+            st.session_state["vacaciones_diag_range"] = (
+                fecha_inicio.strftime("%Y-%m-%d"),
+                fecha_fin.strftime("%Y-%m-%d"),
+            )
+
+    _vac_res = st.session_state.get("vacaciones_diag_result")
+    if isinstance(_vac_res, dict):
+        _vac_range = st.session_state.get("vacaciones_diag_range")
+        st.write(
+            f"**Resultado HTTP:** `{_vac_res.get('status')}` · "
+            f"**Duración:** `{_vac_res.get('elapsed_ms')} ms` · "
+            f"**Solicitudes recibidas:** `{len(_vac_res.get('rows') or [])}`"
+        )
+        if _vac_range:
+            st.caption(f"Rango probado: {_vac_range[0]} → {_vac_range[1]}")
+        if not _vac_res.get("ok"):
+            st.error(f"Error de /exportacion/vacaciones: {_vac_res.get('error') or 'sin detalle'}")
+        else:
+            _vac_df = pd.DataFrame(_vac_res.get("rows") or [])
+            if _vac_df.empty:
+                st.info("CRECE no ha devuelto vacaciones aprobadas que solapen con el rango.")
+            else:
+                st.dataframe(_vac_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇ Descargar vacaciones aprobadas",
+                    data=_vac_df.to_csv(index=False).encode("utf-8"),
+                    file_name="diagnostico_vacaciones_aprobadas.csv",
+                    mime="text/csv",
+                    key="download_diag_vacaciones_aprobadas",
+                )
+
+    if _vac_clicked:
+        st.stop()
+
 
 # --- Safe defaults to avoid NameError on first load / when no results ---
 salida_incidencias = pd.DataFrame()
