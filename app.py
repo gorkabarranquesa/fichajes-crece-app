@@ -1726,7 +1726,10 @@ def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date,
         ])
 
     detail["num_code"] = detail.get("Nº empleado", pd.Series(index=detail.index, dtype=object)).apply(_canonical_emp_code)
-    detail["Fecha"] = pd.to_datetime(detail.get("Fecha"), errors="coerce").dt.strftime("%Y-%m-%d")
+    # Misma regla de fecha que la lógica productiva: CRECE usa también DD/MM/YYYY.
+    detail["Fecha"] = detail.get("Fecha", pd.Series(index=detail.index, dtype=object)).apply(
+        lambda x: (_parse_date_any(x).strftime("%Y-%m-%d") if _parse_date_any(x) is not None else "")
+    )
     detail["Duración minutos"] = detail.get(
         "Horario duración computada", pd.Series(index=detail.index, dtype=object)
     ).apply(_duration_value_to_minutes)
@@ -2011,9 +2014,12 @@ def _cached_turnos_period_metrics(fecha_desde: str, fecha_hasta: str) -> dict:
     for row in list(result.get("rows") or []):
         emp_id = _canonical_crece_id(row.get("Empleado ID"))
         num_code = _canonical_emp_code(row.get("Nº empleado"))
+        # CRECE puede devolver Fecha como DD/MM/YYYY. No usar pd.to_datetime
+        # genérico aquí: en fechas ambiguas (p. ej. 08/09/2026) pandas puede
+        # interpretarlo como MM/DD/YYYY y cruzar meses.
         try:
-            day = pd.to_datetime(row.get("Fecha"), errors="coerce")
-            day_iso = day.strftime("%Y-%m-%d") if pd.notna(day) else ""
+            day = _parse_date_any(row.get("Fecha"))
+            day_iso = day.strftime("%Y-%m-%d") if day is not None else ""
         except Exception:
             day_iso = ""
         if not day_iso or not (emp_id or num_code):
