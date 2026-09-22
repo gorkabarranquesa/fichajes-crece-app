@@ -443,6 +443,18 @@ def build_mod_pre_shift_work_map(
         except Exception:
             continue
 
+        # En turnos nocturnos el mismo día civil puede contener dos trozos de
+        # trabajo distintos: la cola 00:00-06:00 del turno iniciado la noche
+        # anterior y, más tarde, la entrada del nuevo turno nocturno. La cola
+        # de madrugada NO es trabajo "antes del inicio" del nuevo turno y no
+        # debe restarse del balance. Usamos el mismo corte de las 06:00 que la
+        # aplicación ya emplea para asignar fichajes de turno nocturno.
+        day_start_dt = pd.Timestamp(day_s)
+        if int(shift_start_min) >= 18 * 60:
+            pre_window_start_dt = day_start_dt + pd.Timedelta(hours=6)
+        else:
+            pre_window_start_dt = day_start_dt
+
         pre_seconds = 0.0
         i = 0
         while i < len(sub) - 1:
@@ -458,9 +470,10 @@ def build_mod_pre_shift_work_map(
                         tipo_id = None
                     props = tipos_map.get(tipo_id, {}) if tipo_id is not None else {}
                     if int(props.get("descuenta_tiempo", 0) or 0) == 0:
+                        overlap_start = max(a_dt, pre_window_start_dt)
                         overlap_end = min(b_dt, shift_start_dt)
-                        if overlap_end > a_dt:
-                            pre_seconds += (overlap_end - a_dt).total_seconds()
+                        if overlap_end > overlap_start:
+                            pre_seconds += (overlap_end - overlap_start).total_seconds()
                 i += 2
             else:
                 i += 1
