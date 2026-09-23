@@ -1249,15 +1249,46 @@ def api_exportar_horarios() -> dict:
         for h in data_dec:
             if not isinstance(h, dict):
                 continue
-            hid = _canonical_crece_id(h.get("id"))
+
+            _ok_id, _hid_raw = _row_get_alias(h, ["id", "horario id", "horario_id"])
+            hid = _canonical_crece_id(_hid_raw if _ok_id else h.get("id"))
             if not hid:
                 continue
-            libre_raw = str(h.get("libre") or "").strip().lower()
+
+            _ok_ini, _ini_raw = _row_get_alias(
+                h, ["hora_inicio", "hora inicio", "inicio", "horaInicio"]
+            )
+            start_min = _clock_to_minutes(_ini_raw if _ok_ini else None)
+
+            # Algunas respuestas/versiones pueden no exponer hora_inicio con la
+            # etiqueta literal del manual. Como fallback, extraemos el primer
+            # HH:MM del horario_texto oficial de CRECE; nunca se inventa una
+            # hora de turno.
+            if start_min is None:
+                _ok_txt, _txt_raw = _row_get_alias(
+                    h, ["horario_texto", "horario texto", "texto", "descripcion", "descripción"]
+                )
+                if _ok_txt and _txt_raw not in (None, ""):
+                    txt = str(_txt_raw)
+                    for token in txt.replace("-", " ").replace("/", " ").replace(";", " ").split():
+                        cand = token.strip(" ,()[]{}")
+                        m = _clock_to_minutes(cand)
+                        if m is not None:
+                            start_min = m
+                            break
+
+            _ok_dur, _dur_raw = _row_get_alias(
+                h, ["duracion_computada", "duración computada", "duracion computada"]
+            )
+            _ok_libre, _libre_val = _row_get_alias(h, ["libre"])
+            _ok_abrev, _abrev_val = _row_get_alias(h, ["abreviatura"])
+
+            libre_raw = str(_libre_val if _ok_libre else "").strip().lower()
             out[hid] = {
-                "hora_inicio_min": _clock_to_minutes(h.get("hora_inicio")),
-                "duracion_min": _duration_value_to_minutes(h.get("duracion_computada")),
+                "hora_inicio_min": start_min,
+                "duracion_min": _duration_value_to_minutes(_dur_raw if _ok_dur else None),
                 "libre": libre_raw in {"1", "true", "t", "si", "sí", "yes"},
-                "abreviatura": str(h.get("abreviatura") or "").strip(),
+                "abreviatura": str(_abrev_val if _ok_abrev else "").strip(),
             }
         return out
     except Exception as exc:
@@ -3376,6 +3407,16 @@ if consultar:
         except Exception as _e:
             _safe_fail(_e)
             midnight_transfers = {}
+
+        # Cada continuidad nocturna detectada contiene dos marcajes técnicos de
+        # corte de día (salida ~23:59 + entrada ~00:00). Para RRHH forman parte
+        # de un único turno y no deben contar como dos fichajes adicionales ni
+        # disparar validaciones horarias de turno diurno.
+        midnight_bridge_counts = {}
+        for (_nif_b, _from_day_b, _to_day_b), _mins_b in (midnight_transfers or {}).items():
+            _bk = (str(_nif_b or "").upper().strip(), str(_to_day_b or ""))
+            midnight_bridge_counts[_bk] = int(midnight_bridge_counts.get(_bk, 0)) + 1
+
         tc_balance_map_query = apply_midnight_tc_transfers(tc_map_query, midnight_transfers)
 
         # Los dos días de contexto son internos y nunca deben generar avisos UI.
@@ -3397,6 +3438,23 @@ if consultar:
                 .agg(Numero=("Numero", "max"))
                 .rename(columns={"fecha_dia": "Fecha", "Numero": "Numero de fichajes"})
             )
+
+            # En un turno cruzado por medianoche CRECE introduce el par técnico
+            # 23:59/00:00. El número mostrado/validado debe ser el número lógico
+            # de fichajes del turno, no esos dos marcajes de frontera.
+            def _logical_fichajes_count(r):
+                try:
+                    raw = int(r.get("Numero de fichajes", 0) or 0)
+                except Exception:
+                    raw = 0
+                key = (
+                    str(r.get("nif") or "").upper().strip(),
+                    str(r.get("Fecha") or ""),
+                )
+                bridges = int((midnight_bridge_counts or {}).get(key, 0) or 0)
+                return max(0, raw - 2 * bridges)
+
+            conteo["Numero de fichajes"] = conteo.apply(_logical_fichajes_count, axis=1)
 
             neto = calcular_tiempos_neto(df_fich, tipos_map)
             resumen = conteo.merge(neto, on=["nif", "Fecha"], how="left")
@@ -3499,13 +3557,21 @@ if consultar:
                     night_by_schedule = shift_start_for_day is not None and int(shift_start_for_day) >= 18 * 60
                 except Exception:
                     night_by_schedule = False
-                night_split_pattern = bool(
-                    depto_norm == "MOD"
-                    and str(r.get("Primera entrada") or "") == "00:00"
+                bridge_night_pattern = bool(
+                    (nif_str, day_str) in (midnight_bridge_counts or {})
+                )
+                # Compatibilidad defensiva con datos que todavía llegasen sin
+                # normalizar: el patrón 00:00..23:59 + 4 marcas también indica
+                # un turno nocturno partido por CRECE.
+                visible_night_pattern = bool(
+                    str(r.get("Primera entrada") or "") == "00:00"
                     and str(r.get("Última salida") or "") == "23:59"
                     and int(r.get("Numero de fichajes", 0) or 0) >= 4
                 )
-                is_night_mod = bool(depto_norm == "MOD" and (night_by_schedule or night_split_pattern))
+                is_night_mod = bool(
+                    depto_norm == "MOD"
+                    and (night_by_schedule or bridge_night_pattern or visible_night_pattern)
+                )
 
                 # Cantidad de fichajes determinada por la jornada programada real.
                 min_f = required_min_fichajes(
