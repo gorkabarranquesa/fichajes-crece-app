@@ -431,11 +431,33 @@ def build_mod_pre_shift_work_map(
         entradas = sub[sub["direccion"] == "entrada"]
         if entradas.empty:
             continue
+
+        # CRECE puede partir un turno nocturno en el cambio de día y devolver
+        # dentro del mismo día civil una cola 00:00-06:xx del turno anterior y
+        # un nuevo tramo nocturno 21/22:xx-23:59. Ese patrón NO puede tratarse
+        # como trabajo previo a un turno de mañana: provocaría descuentos de
+        # ~6 h/día y déficits semanales artificiales.
+        entrada_dts = pd.to_datetime(entradas["fecha_dt"], errors="coerce").dropna()
+        split_night_group = bool(
+            (not entrada_dts.empty)
+            and any(int(ts.hour) < 6 for ts in entrada_dts)
+            and any(int(ts.hour) >= 18 for ts in entrada_dts)
+        )
+
         first_ts = pd.to_datetime(entradas.iloc[0]["fecha_dt"], errors="coerce")
         if pd.isna(first_ts):
             continue
         shift_start_map = shift_start_map or {}
         shift_start_min = shift_start_map.get((nif_s, day_s))
+
+        # Si Turnos/Horarios no nos ha dado un inicio nocturno fiable pero los
+        # marcajes muestran inequívocamente el corte de medianoche, no se
+        # descuenta ningún supuesto "pre-turno". Es preferible conservar el TC
+        # oficial a restar la cola del turno anterior. Cuando CRECE sí aporta
+        # el inicio nocturno (>=18:00), se aplica la regla MOD normalmente.
+        if split_night_group and (shift_start_min is None or int(shift_start_min) < 18 * 60):
+            continue
+
         if shift_start_min is None:
             shift_start_min = 6 * 60 if int(first_ts.hour) < 12 else 14 * 60
         try:
@@ -3070,7 +3092,7 @@ else:
 st.write("---")
 
 
-APP_STATE_VERSION = "turnos-ausencias-2026-09-22-v1"
+APP_STATE_VERSION = "turnos-ausencias-date-nightfix-2026-09-22-v2"
 if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
     for _state_key in [
         "last_sig", "result_incidencias", "result_bajas", "result_sin_fichajes",
@@ -3333,6 +3355,23 @@ if consultar:
 
                 depto_norm = str(r.get("Departamento") or "").upper().strip()
 
+                # CRECE divide los turnos nocturnos en el cambio de día. En el
+                # resumen diario esto puede verse como 00:00 ... 23:59 y 4
+                # fichajes (dos pares), aun siendo un único turno real. No debe
+                # generar por ello "entrada temprana" ni "fichajes excesivos".
+                shift_start_for_day = (turno_start_map_query or {}).get(exp_key)
+                try:
+                    night_by_schedule = shift_start_for_day is not None and int(shift_start_for_day) >= 18 * 60
+                except Exception:
+                    night_by_schedule = False
+                night_split_pattern = bool(
+                    depto_norm == "MOD"
+                    and str(r.get("Primera entrada") or "") == "00:00"
+                    and str(r.get("Última salida") or "") == "23:59"
+                    and int(r.get("Numero de fichajes", 0) or 0) >= 4
+                )
+                is_night_mod = bool(depto_norm == "MOD" and (night_by_schedule or night_split_pattern))
+
                 # Cantidad de fichajes determinada por la jornada programada real.
                 min_f = required_min_fichajes(
                     depto_norm, r.get("Nombre"), (exp_min if exp_known else None)
@@ -3357,22 +3396,23 @@ if consultar:
                             max_ok_i = int(max_ok)
                             if hours_ok and num_fich > max_ok_i:
                                 motivos.append(f"Fichajes excesivos (máx {max_ok_i})")
-                        elif hours_ok and num_fich > min_f_i:
+                        elif hours_ok and num_fich > min_f_i and not is_night_mod:
                             motivos.append(f"Fichajes excesivos (mín {min_f_i})")
                     except Exception:
                         pass
 
-                motivos += validar_horario(
-                    r.get("Departamento"),
-                    r.get("Nombre"),
-                    int(r.get("dia", 0)),
-                    r.get("Primera entrada", ""),
-                    r.get("Última salida", ""),
-                    expected_minutes=(exp_min if exp_known else None),
-                    sede=r.get("Sede", ""),
-                    empresa=r.get("Empresa", ""),
-                    completed_day=completed_day,
-                )
+                if not is_night_mod:
+                    motivos += validar_horario(
+                        r.get("Departamento"),
+                        r.get("Nombre"),
+                        int(r.get("dia", 0)),
+                        r.get("Primera entrada", ""),
+                        r.get("Última salida", ""),
+                        expected_minutes=(exp_min if exp_known else None),
+                        sede=r.get("Sede", ""),
+                        empresa=r.get("Empresa", ""),
+                        completed_day=completed_day,
+                    )
                 return "; ".join(motivos)
 
             resumen["Incidencia"] = resumen.apply(build_incidencia, axis=1)
