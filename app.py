@@ -517,9 +517,10 @@ def build_mod_pre_shift_work_map(
 ) -> dict:
     """Devuelve {(NIF, fecha): minutos_trabajados antes del inicio real del turno MOD}.
 
-    Prioriza la hora de inicio del horario asignado en CRECE. Si no está disponible,
-    conserva como fallback la lógica histórica 06:00/14:00 según la primera entrada.
-    Solo descuenta trabajo REAL contenido en pares entrada->salida.
+    Prioriza la hora de inicio del horario asignado en CRECE. Para MOD, la regla
+    operativa confirmada es 06:00/14:00/22:00; si CRECE no expone el inicio, se
+    usa ese patrón como fallback. Solo descuenta trabajo REAL contenido en pares
+    entrada->salida.
     """
     if df_fich is None or df_fich.empty:
         return {}
@@ -558,16 +559,26 @@ def build_mod_pre_shift_work_map(
         shift_start_map = shift_start_map or {}
         shift_start_min = shift_start_map.get((nif_s, day_s))
 
-        # Si Turnos/Horarios no nos ha dado un inicio nocturno fiable pero los
-        # marcajes muestran inequívocamente el corte de medianoche, no se
-        # descuenta ningún supuesto "pre-turno". Es preferible conservar el TC
-        # oficial a restar la cola del turno anterior. Cuando CRECE sí aporta
-        # el inicio nocturno (>=18:00), se aplica la regla MOD normalmente.
-        if split_night_group and (shift_start_min is None or int(shift_start_min) < 18 * 60):
-            continue
+        # Regla RRHH confirmada para MOD: los tres turnos estándar son
+        # 06:00-14:00, 14:00-22:00 y 22:00-06:00. La hora de entrada puede
+        # adelantarse (p. ej. 21:30 para el turno de noche), pero ese tiempo
+        # anterior al inicio oficial NO suma al balance de exceso.
+        #
+        # Si los marcajes muestran inequívocamente un turno partido por
+        # medianoche, ese turno es el de noche y su inicio oficial es 22:00.
+        # Esto evita depender de que /exportacion/horarios exponga bien la
+        # hora de inicio para poder descontar, por ejemplo, 21:30-22:00.
+        if split_night_group:
+            shift_start_min = 22 * 60
 
         if shift_start_min is None:
-            shift_start_min = 6 * 60 if int(first_ts.hour) < 12 else 14 * 60
+            first_clock_min = int(first_ts.hour) * 60 + int(first_ts.minute)
+            if first_clock_min >= 18 * 60:
+                shift_start_min = 22 * 60
+            elif first_clock_min >= 12 * 60:
+                shift_start_min = 14 * 60
+            else:
+                shift_start_min = 6 * 60
         try:
             shift_start_dt = pd.Timestamp(day_s) + pd.Timedelta(minutes=int(shift_start_min))
         except Exception:
