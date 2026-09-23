@@ -113,30 +113,6 @@ INFORME_MIN_INTERVAL_SECONDS = 61.0
 _INFORME_GATE_LOCK = threading.Lock()
 _INFORME_LAST_FINISH_MONO = 0.0
 
-# Diagnóstico técnico temporal de /informes/empleados. Solo guarda metadatos
-# no sensibles: fecha/rango, modo, intento, estado HTTP, tiempos, bytes y etapa.
-_INFORME_DIAG_LOCK = threading.Lock()
-_INFORME_DIAG_EVENTS: list[dict] = []
-
-def _diag_informe_event(**event) -> None:
-    clean = {}
-    for k, v in event.items():
-        if v is None:
-            clean[k] = None
-        elif isinstance(v, (int, float, bool)):
-            clean[k] = v
-        else:
-            clean[k] = str(v)[:160]
-    with _INFORME_DIAG_LOCK:
-        _INFORME_DIAG_EVENTS.append(clean)
-
-def _reset_informe_diag() -> None:
-    with _INFORME_DIAG_LOCK:
-        _INFORME_DIAG_EVENTS.clear()
-
-def _snapshot_informe_diag() -> list[dict]:
-    with _INFORME_DIAG_LOCK:
-        return [dict(x) for x in _INFORME_DIAG_EVENTS]
 
 _SESSION_LOCAL = threading.local()
 
@@ -184,7 +160,8 @@ def _retry_after_seconds(resp: requests.Response) -> float | None:
         return None
 
 
-def safe_request(method: str, url: str, *, data=None, params=None, json_body=None, timeout=HTTP_TIMEOUT, trace_label: str | None = None):
+def safe_request(method: str, url: str, *, data=None, timeout=HTTP_TIMEOUT):
+    """Petición HTTP con TLS verificado, timeout y retry/backoff conservador."""
     method = (method or "").upper().strip()
     if method not in {"GET", "POST"}:
         return None
@@ -192,25 +169,13 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
     last_exc = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            _t0 = time.monotonic()
             resp = _get_http_session().request(
                 method,
                 url,
                 data=data,
-                params=params,
-                json=json_body,
                 timeout=timeout,
                 verify=True,
             )
-            _elapsed_ms = int(round((time.monotonic() - _t0) * 1000.0))
-            if trace_label:
-                _diag_informe_event(
-                    kind="http", label=trace_label, attempt=attempt + 1,
-                    status=int(resp.status_code), elapsed_ms=_elapsed_ms,
-                    bytes=len(resp.content or b""),
-                    retry_after=_retry_after_seconds(resp),
-                    content_type=(resp.headers.get("Content-Type") or "").split(";")[0],
-                )
 
             if resp.status_code in RETRY_STATUS:
                 if attempt < MAX_RETRIES:
@@ -225,13 +190,8 @@ def safe_request(method: str, url: str, *, data=None, params=None, json_body=Non
 
             return resp
 
-        except requests.RequestException as e:
-            last_exc = e
-            if trace_label:
-                _diag_informe_event(
-                    kind="transport_error", label=trace_label, attempt=attempt + 1,
-                    error=type(e).__name__,
-                )
+        except requests.RequestException as exc:
+            last_exc = exc
             if attempt < MAX_RETRIES:
                 wait = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
                 wait += random.uniform(0, 0.20)
@@ -252,7 +212,7 @@ def _text(value) -> str:
     """Convierte valores API/DataFrame a texto de forma segura.
 
     Evita que None/NaN rompan comparaciones y, sobre todo, centraliza la
-    normalización usada por los mapas de Horas programadas/Bajas.
+    normalización usada por los mapas de jornada programada y bajas.
     """
     if value is None:
         return ""
@@ -379,8 +339,6 @@ def quantize_daily_balance_30(diff_mins: int, tol: int = 5) -> int:
     if d > 0:
         return floor_to_30(d) if d >= 30 else 0
     return -ceil_to_30(abs(d))
-
-
 
 
 def effective_worked_minutes_for_mod(mins_tc: int, pre_shift_work_minutes: int = 0) -> int:
@@ -699,8 +657,6 @@ def decrypt_crece_payload(payload_b64: str, app_key_b64: str) -> str:
         return decrypted.decode("utf-8")
     except Exception as exc:
         raise ValueError("No se pueden desencriptar los datos CRECE") from exc
-
-
 
 
 def _try_parse_encrypted_response(resp: requests.Response):
@@ -1028,7 +984,7 @@ def validar_horario(
             except Exception:
                 exp_m = None
 
-            # La jornada reducida/completa la determina CRECE mediante Horas programadas.
+            # La jornada reducida/completa la determina la jornada diaria obtenida de CRECE.
             salida_min = None
             if exp_m is not None and exp_m > 0:
                 salida_min = (13 * 60 + 30) if exp_m <= (6 * 60 + 35) else (16 * 60 + 30)
@@ -1145,8 +1101,8 @@ def api_exportar_empleados_completos() -> pd.DataFrame:
         empresa_id = e.get("empresa") or e.get("empresa_id") or e.get("cod_empresa") or e.get("company_id")
         sede_id = e.get("sede") or e.get("sede_id") or e.get("centro") or e.get("centro_id")
 
-        # Fuente de enlace con /informes/empleados: Nº empleado <-> num_empleado.
-        # No se utiliza el ID interno de CRECE como sustituto.
+        # Se conserva num_empleado como identificador auxiliar/fallback. Para
+        # /informes/turnos el enlace principal usa el ID interno de empleado CRECE.
         num_empleado = (
             e.get("num_empleado")
             or e.get("Num_empleado")
@@ -1423,8 +1379,6 @@ def _parse_tiempo_trabajado_payload(parsed) -> tuple[pd.DataFrame, bool]:
     return df, bool(recognized)
 
 
-
-
 def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> tuple[pd.DataFrame, bool]:
     """Consulta tiempo trabajado y distingue respuesta válida de fallo de API."""
     url = f"{API_URL_BASE}/exportacion/tiempo-trabajado"
@@ -1453,9 +1407,6 @@ def api_exportar_tiempo_trabajado(desde: str, hasta: str, nifs=None) -> tuple[pd
     except Exception as e:
         _safe_fail(e)
         return empty, False
-
-
-
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1530,8 +1481,6 @@ def _cached_tiempo_contabilizado_map(
     return {"values": out, "failed_days": sorted(failed_days)}
 
 
-
-
 def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> tuple[dict, list[str]]:
     """Devuelve TC diario y fechas cuyo endpoint no pudo leerse.
 
@@ -1556,94 +1505,8 @@ def build_tiempo_contabilizado_map(d0: date, d1: date, nifs: list[str]) -> tuple
     return out, failed_days
 
 
-
-
-def api_informe_empleados(fecha_desde: str, fecha_hasta: str):
-    """Consulta robusta y SERIAL de /api/informes/empleados.
-
-    Versión instrumentada: registra únicamente metadatos técnicos no sensibles
-    para distinguir HTTP/rate-limit/timeout de errores de descifrado o parsing.
-    """
-    global _INFORME_LAST_FINISH_MONO
-
-    url = f"{API_URL_BASE}/informes/empleados"
-    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-
-    def _parse_valid(resp, mode: str):
-        if resp is None:
-            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="no_response")
-            return None
-        status = getattr(resp, "status_code", None)
-        try:
-            resp.raise_for_status()
-        except Exception:
-            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="http_error", status=status)
-            return None
-        parsed = _try_parse_encrypted_response(resp)
-        if parsed is None:
-            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="decrypt_or_json_failed", status=status)
-            return None
-        rows = _extract_rows_from_informe(parsed)
-        if not rows:
-            _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="no_rows", status=status)
-            return None
-        _diag_informe_event(kind="parse", label=f"{fecha_desde}..{fecha_hasta}:{mode}", outcome="ok", status=status, rows=len(rows))
-        return parsed
-
-    with _INFORME_GATE_LOCK:
-        elapsed = time.monotonic() - float(_INFORME_LAST_FINISH_MONO or 0.0)
-        if elapsed < INFORME_MIN_INTERVAL_SECONDS:
-            time.sleep(INFORME_MIN_INTERVAL_SECONDS - elapsed)
-
-        try:
-            label_form = f"{fecha_desde}..{fecha_hasta}:form"
-            resp = safe_request("POST", url, data=body, timeout=(5, 75), trace_label=label_form)
-            parsed = _parse_valid(resp, "form")
-            if parsed is not None:
-                return parsed
-
-            status = getattr(resp, "status_code", None) if resp is not None else None
-            if status in {400, 415, 422}:
-                label_json = f"{fecha_desde}..{fecha_hasta}:json"
-                resp_json = safe_request("POST", url, json_body=body, timeout=(5, 75), trace_label=label_json)
-                parsed_json = _parse_valid(resp_json, "json")
-                if parsed_json is not None:
-                    return parsed_json
-
-            return None
-        except Exception as e:
-            _diag_informe_event(kind="api_exception", label=f"{fecha_desde}..{fecha_hasta}", error=type(e).__name__)
-            _safe_fail(e)
-            return None
-        finally:
-            _INFORME_LAST_FINISH_MONO = time.monotonic()
-
-
-
-# ============================================================
-# HELPERS BAJAS (ROBUSTO)
-# ============================================================
-
-def _to_float_any(x) -> float:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return 0.0
-    try:
-        if isinstance(x, str):
-            s = x.strip().replace(",", ".")
-            return float(s) if s else 0.0
-        return float(x)
-    except Exception:
-        return 0.0
-
-
 def _field_key_norm(value) -> str:
-    """Normaliza nombres de campos del informe CRECE.
-
-    El API de informes documenta etiquetas legibles (p. ej. "Nº empleado",
-    "Horas programadas"), mientras que algunas instalaciones/versiones pueden
-    devolver snake_case/camelCase. Esta normalización permite soportar ambos
-    formatos sin depender de una etiqueta exacta.
-    """
+    """Normaliza nombres de campos CRECE y tolera etiquetas/snake_case/camelCase."""
     s = unicodedata.normalize("NFKD", str(value or ""))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower().replace("º", "o").replace("°", "o")
@@ -1662,7 +1525,7 @@ def _row_get_alias(row: dict, aliases: list[str]):
 
 
 # ============================================================
-# DIAGNÓSTICO TEMPORAL — /api/informes/turnos
+# INFORME DE TURNOS / AUSENCIAS
 # ============================================================
 
 _TURNOS_POS = {
@@ -1713,8 +1576,8 @@ def _turno_value(row, aliases, pos_key):
     return None
 
 
-def _diag_json(value) -> str:
-    """Representación compacta y estable para inspeccionar el nuevo campo ausencia."""
+def _compact_json_value(value) -> str:
+    """Representación compacta y estable de valores estructurados de ausencia."""
     if value is None:
         return ""
     if isinstance(value, float) and pd.isna(value):
@@ -1739,12 +1602,12 @@ def _absence_label(value) -> str:
             "ausencia", "label", "texto", "name", "description"
         ):
             if key in value and value.get(key) not in (None, ""):
-                return _diag_json(value.get(key))
-        return _diag_json(value)
+                return _compact_json_value(value.get(key))
+        return _compact_json_value(value)
     if isinstance(value, (list, tuple)):
         labels = [_absence_label(v) for v in value]
         labels = [x for x in labels if x]
-        return " | ".join(dict.fromkeys(labels)) if labels else _diag_json(value)
+        return " | ".join(dict.fromkeys(labels)) if labels else _compact_json_value(value)
     return str(value).strip()
 
 
@@ -1887,140 +1750,6 @@ def api_informe_turnos(fecha_desde: str, fecha_hasta: str):
             _INFORME_LAST_FINISH_MONO = time.monotonic()
 
 
-def _build_turnos_diagnostic(result: dict, fecha_desde: date, fecha_hasta: date, scope_emp_df: pd.DataFrame):
-    """Genera detalle, matriz empleado/día y resumen del informe de turnos."""
-    rows = list((result or {}).get("rows", []) or [])
-    detail = pd.DataFrame(rows)
-    if detail.empty:
-        detail = pd.DataFrame(columns=[
-            "Turno ID", "Empleado ID", "Nº empleado", "Nombre y apellidos", "Fecha",
-            "Horario ID", "Horario abreviatura", "Horario color",
-            "Horario duración computada", "Horario texto", "Ausencia",
-        ])
-
-    detail["num_code"] = detail.get("Nº empleado", pd.Series(index=detail.index, dtype=object)).apply(_canonical_emp_code)
-    # Misma regla de fecha que la lógica productiva: CRECE usa también DD/MM/YYYY.
-    detail["Fecha"] = detail.get("Fecha", pd.Series(index=detail.index, dtype=object)).apply(
-        lambda x: (_parse_date_any(x).strftime("%Y-%m-%d") if _parse_date_any(x) is not None else "")
-    )
-    detail["Duración minutos"] = detail.get(
-        "Horario duración computada", pd.Series(index=detail.index, dtype=object)
-    ).apply(_duration_value_to_minutes)
-    detail["Duración HH:MM"] = detail["Duración minutos"].apply(
-        lambda x: segundos_a_hhmm(int(x) * 60) if pd.notna(x) else ""
-    )
-    detail["Ausencia raw"] = detail.get(
-        "Ausencia", pd.Series(index=detail.index, dtype=object)
-    ).apply(_diag_json)
-    detail["Ausencia tipo"] = detail.get(
-        "Ausencia", pd.Series(index=detail.index, dtype=object)
-    ).apply(_absence_label)
-    detail["Tiene ausencia"] = detail["Ausencia raw"].astype(str).str.strip().ne("")
-
-    scope = scope_emp_df.copy()
-    if "num_empleado" not in scope.columns:
-        scope["num_empleado"] = ""
-    scope["num_code"] = scope["num_empleado"].apply(_canonical_emp_code)
-    scope = scope[scope["num_code"].astype(str).str.strip().ne("")].copy()
-    scope_codes = set(scope["num_code"].tolist())
-    if scope_codes:
-        detail = detail[detail["num_code"].isin(scope_codes)].copy()
-
-    name_map = dict(zip(scope["num_code"], scope.get("nombre_completo", pd.Series("", index=scope.index)).fillna("")))
-    empresa_map = dict(zip(scope["num_code"], scope.get("Empresa", pd.Series("", index=scope.index)).fillna("")))
-    sede_map_local = dict(zip(scope["num_code"], scope.get("Sede", pd.Series("", index=scope.index)).fillna("")))
-    dept_map = dict(zip(scope["num_code"], scope.get("departamento_nombre", pd.Series("", index=scope.index)).fillna("")))
-
-    if not detail.empty:
-        detail["Nombre app"] = detail["num_code"].map(name_map).fillna("")
-        detail["Empresa"] = detail["num_code"].map(empresa_map).fillna("")
-        detail["Sede"] = detail["num_code"].map(sede_map_local).fillna("")
-        detail["Departamento"] = detail["num_code"].map(dept_map).fillna("")
-
-    # Agregación por empleado/día de todas las filas de turno encontradas.
-    if detail.empty:
-        daily_found = pd.DataFrame(columns=["num_code", "Fecha", "Nº turnos", "Jornada turnos minutos", "Horarios"])
-    else:
-        tmp = detail.copy()
-        tmp["Duración minutos num"] = pd.to_numeric(tmp["Duración minutos"], errors="coerce").fillna(0).astype(int)
-        daily_found = (
-            tmp.groupby(["num_code", "Fecha"], as_index=False)
-            .agg(
-                **{
-                    "Nº turnos": ("Turno ID", "size"),
-                    "Jornada turnos minutos": ("Duración minutos num", "sum"),
-                    "Horarios": ("Horario texto", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
-                    "Abreviaturas": ("Horario abreviatura", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
-                    "Ausencias": ("Ausencia tipo", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
-                    "Ausencias raw": ("Ausencia raw", lambda s: " | ".join(dict.fromkeys(str(x) for x in s if str(x).strip()))),
-                }
-            )
-        )
-
-    days = []
-    cur = fecha_desde
-    while cur <= fecha_hasta:
-        days.append(cur.strftime("%Y-%m-%d"))
-        cur += timedelta(days=1)
-
-    matrix_rows = []
-    found_lookup = {
-        (str(r["num_code"]), str(r["Fecha"])): r
-        for _, r in daily_found.iterrows()
-    }
-    for _, emp in scope.sort_values(["nombre_completo"], kind="mergesort").iterrows():
-        code = str(emp.get("num_code") or "")
-        for day in days:
-            hit = found_lookup.get((code, day))
-            mins = int(hit.get("Jornada turnos minutos", 0)) if hit is not None else 0
-            n_turnos = int(hit.get("Nº turnos", 0)) if hit is not None else 0
-            matrix_rows.append({
-                "Fecha": day,
-                "Nº empleado": str(emp.get("num_empleado") or ""),
-                "Nombre": str(emp.get("nombre_completo") or ""),
-                "Empresa": str(emp.get("Empresa") or ""),
-                "Sede": str(emp.get("Sede") or ""),
-                "Departamento": str(emp.get("departamento_nombre") or ""),
-                "Nº turnos": n_turnos,
-                "Jornada turnos": segundos_a_hhmm(int(mins) * 60),
-                "Jornada turnos minutos": mins,
-                "Estado turno": "CON TURNO" if hit is not None else "SIN FILA DE TURNO",
-                "Abreviaturas": str(hit.get("Abreviaturas") or "") if hit is not None else "",
-                "Horario texto": str(hit.get("Horarios") or "") if hit is not None else "",
-                "Ausencia": str(hit.get("Ausencias") or "") if hit is not None else "",
-                "Ausencia raw": str(hit.get("Ausencias raw") or "") if hit is not None else "",
-            })
-    matrix = pd.DataFrame(matrix_rows)
-
-    if matrix.empty:
-        summary = pd.DataFrame(columns=["Nº empleado", "Nombre", "Días con turno", "Días sin fila", "Total turnos"])
-    else:
-        summary = (
-            matrix.groupby(["Nº empleado", "Nombre"], as_index=False)
-            .agg(
-                **{
-                    "Días con turno": ("Estado turno", lambda s: int((s == "CON TURNO").sum())),
-                    "Días sin fila": ("Estado turno", lambda s: int((s == "SIN FILA DE TURNO").sum())),
-                    "Días con ausencia": ("Ausencia", lambda s: int(s.astype(str).str.strip().ne("").sum())),
-                    "Total minutos": ("Jornada turnos minutos", "sum"),
-                }
-            )
-        )
-        summary["Total turnos"] = summary["Total minutos"].apply(lambda x: segundos_a_hhmm(int(x) * 60))
-        summary = summary.drop(columns=["Total minutos"])
-
-    detail_cols = [
-        "Fecha", "Nº empleado", "Nombre y apellidos", "Nombre app", "Empresa", "Sede", "Departamento",
-        "Turno ID", "Empleado ID", "Horario ID", "Horario abreviatura",
-        "Horario duración computada", "Duración HH:MM", "Duración minutos", "Horario texto",
-        "Ausencia tipo", "Ausencia raw", "Tiene ausencia",
-    ]
-    detail_cols = [c for c in detail_cols if c in detail.columns]
-    detail = detail[detail_cols].sort_values([c for c in ["Fecha", "Nombre app", "Nº empleado"] if c in detail.columns], kind="mergesort") if not detail.empty else detail
-
-    return detail.reset_index(drop=True), matrix.reset_index(drop=True), summary.reset_index(drop=True)
-
-
 def _canonical_emp_code(value) -> str:
     """Código de empleado estable.
 
@@ -2039,20 +1768,6 @@ def _canonical_emp_code(value) -> str:
     except Exception:
         pass
     return s.upper()
-
-
-
-def _get_employee_number_from_row(row: dict) -> str:
-    found, value = _row_get_alias(
-        row,
-        [
-            "Nº empleado", "N° empleado", "N. empleado", "N empleado",
-            "Numero empleado", "Número empleado", "num_empleado", "numEmpleado",
-            "employee_number", "employeeNumber",
-        ],
-    )
-    return _canonical_emp_code(value) if found else ""
-
 
 
 def _duration_value_to_minutes(value):
@@ -2285,7 +2000,6 @@ def _cached_turnos_period_metrics(fecha_desde: str, fecha_hasta: str) -> dict:
     return {
         "records": records,
         "unknown_absences": sorted(unknown_absences),
-        "rows_received": len(result.get("rows") or []),
     }
 
 
@@ -2378,353 +2092,6 @@ def build_turnos_daily_maps(
     return hp_out, baja_out, contratado_out, shift_start_out, [], unknown_absences
 
 
-
-def _report_hours_to_minutes(value):
-    """Convierte campos de informe expresados en horas a minutos.
-
-    En /informes/empleados los campos se llaman explícitamente "Horas ...".
-    Los valores numéricos se interpretan siempre como horas decimales, también
-    cuando un periodo agregado supera 24 horas.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        if ":" in raw:
-            parts = raw.split(":")
-            try:
-                if len(parts) == 2:
-                    h, m = int(parts[0]), int(parts[1])
-                    return max(0, h * 60 + m)
-                if len(parts) == 3:
-                    h, m = int(parts[0]), int(parts[1])
-                    sec = float(parts[2].replace(",", "."))
-                    return max(0, int(round(h * 60 + m + sec / 60.0)))
-            except Exception:
-                return None
-        raw = raw.replace(",", ".")
-        try:
-            num = float(raw)
-        except Exception:
-            return None
-    else:
-        try:
-            num = float(value)
-        except Exception:
-            return None
-
-    if pd.isna(num) or num < 0:
-        return None
-    return int(round(num * 60.0))
-
-
-_INFORME_EMP_IDX_NUM = 0
-_INFORME_EMP_IDX_DIAS_CONTRATADO = 14
-_INFORME_EMP_IDX_HORAS_PROGRAMADAS = 25
-_INFORME_EMP_IDX_HORAS_BAJA = 33
-
-
-
-def _normalize_informe_employee_row(item):
-    if isinstance(item, dict):
-        return item
-    if isinstance(item, (list, tuple)):
-        row = {}
-        if len(item) > _INFORME_EMP_IDX_NUM:
-            row["Nº empleado"] = item[_INFORME_EMP_IDX_NUM]
-        if len(item) > _INFORME_EMP_IDX_DIAS_CONTRATADO:
-            row["Días contratado en el periodo"] = item[_INFORME_EMP_IDX_DIAS_CONTRATADO]
-        if len(item) > _INFORME_EMP_IDX_HORAS_PROGRAMADAS:
-            row["Horas programadas"] = item[_INFORME_EMP_IDX_HORAS_PROGRAMADAS]
-        if len(item) > _INFORME_EMP_IDX_HORAS_BAJA:
-            row["Horas de baja laboral (laborables, no naturales)"] = item[_INFORME_EMP_IDX_HORAS_BAJA]
-        return row if row else None
-    return None
-
-
-
-def _extract_rows_from_informe(rep):
-    if rep is None:
-        return []
-
-    raw_rows = None
-    if isinstance(rep, list):
-        raw_rows = rep
-    elif isinstance(rep, dict):
-        for k in ["data", "empleados", "results", "resultado", "items"]:
-            v = rep.get(k)
-            if isinstance(v, list):
-                raw_rows = v
-                break
-
-        if raw_rows is None:
-            if _get_employee_number_from_row(rep):
-                raw_rows = [rep]
-            else:
-                vals = list(rep.values())
-                if vals and all(isinstance(v, (dict, list, tuple)) for v in vals):
-                    raw_rows = vals
-
-    if not isinstance(raw_rows, list):
-        return []
-
-    out = []
-    for item in raw_rows:
-        row = _normalize_informe_employee_row(item)
-        if isinstance(row, dict):
-            out.append(row)
-    return out
-
-
-def _get_horas_baja_from_row(row: dict) -> float:
-    if not isinstance(row, dict):
-        return 0.0
-
-    aliases = [
-        "Horas de baja laboral (laborables, no naturales)",
-        "horas_baja", "horasBaja", "horas_de_baja", "horas_baja_total",
-        "total_horas_baja", "horas_baja_dia", "horas_baja_diarias",
-        "horas_baja_hoy", "horas_baja_parte",
-    ]
-    found, value = _row_get_alias(row, aliases)
-    if found:
-        return _to_float_any(value)
-
-    for k in ["baja", "bajas", "ausencia", "ausencias", "incidencia", "incidencias"]:
-        v = row.get(k)
-        if isinstance(v, dict):
-            found, value = _row_get_alias(v, aliases + ["horas"])
-            if found:
-                return _to_float_any(value)
-        elif isinstance(v, list):
-            best = 0.0
-            for it in v:
-                if isinstance(it, dict):
-                    h = _get_horas_baja_from_row(it)
-                    if h > best:
-                        best = h
-            if best > 0:
-                return best
-
-    return 0.0
-
-
-
-def _get_dias_contratado_from_row(row: dict):
-    """Devuelve (campo_encontrado, días_contratado) del informe CRECE."""
-    if not isinstance(row, dict):
-        return False, None
-    found, value = _row_get_alias(
-        row,
-        [
-            "Días contratado en el periodo", "Dias contratado en el periodo",
-            "dias_contratado_periodo", "diasContratadoPeriodo",
-            "dias_contratado", "diasContratado",
-        ],
-    )
-    if not found or value is None or isinstance(value, bool):
-        return False, None
-    try:
-        num = float(str(value).strip().replace(",", "."))
-        if pd.isna(num) or num < 0:
-            return False, None
-        return True, num
-    except Exception:
-        return False, None
-
-
-def _pick_key(df: pd.DataFrame, names: list[str]):
-    for n in names:
-        if n in df.columns:
-            return n
-    wanted = {_field_key_norm(n) for n in names}
-    for col in df.columns:
-        if _field_key_norm(col) in wanted:
-            return col
-    return None
-
-
-
-# ============================================================
-# DIAGNÓSTICO TEMPORAL — comparación semanal /informes/empleados
-# ============================================================
-
-def api_informe_empleados_once_diag(fecha_desde: str, fecha_hasta: str):
-    """Una sola petición a /api/informes/empleados, sin retries ni fallback.
-
-    Se usa únicamente para comparar el total semanal de Horas programadas
-    con el detalle diario ya descargado de /informes/turnos. No ejecuta la
-    consulta normal de la aplicación ni hace llamadas adicionales.
-    """
-    url = f"{API_URL_BASE}/informes/empleados"
-    body = {"fecha_desde": fecha_desde, "fecha_hasta": fecha_hasta}
-    t0 = time.monotonic()
-    try:
-        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
-            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-            "rows": [],
-        }
-
-    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
-    status = int(resp.status_code)
-    if status != 200:
-        msg = ""
-        try:
-            obj = resp.json()
-            if isinstance(obj, dict):
-                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
-            elif obj is not None:
-                msg = str(obj)[:300]
-        except Exception:
-            try:
-                msg = str(resp.text or "")[:300]
-            except Exception:
-                msg = ""
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": msg or f"HTTP {status}",
-            "rows": [],
-        }
-
-    parsed = _try_parse_encrypted_response(resp)
-    if parsed is None:
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
-            "rows": [],
-        }
-
-    raw_rows = _extract_rows_from_informe(parsed)
-    rows_out = []
-    for idx, row in enumerate(raw_rows):
-        code = _get_employee_number_from_row(row)
-        found_hp, hp_mins = _get_horas_programadas_minutes_from_row(row)
-        found_days, dias_contratado = _get_dias_contratado_from_row(row)
-        baja_h = _get_horas_baja_from_row(row)
-        rows_out.append({
-            "Fila informe": idx + 1,
-            "Nº empleado": code,
-            "Horas programadas": (segundos_a_hhmm(int(hp_mins) * 60) if found_hp and hp_mins is not None else ""),
-            "Horas programadas minutos": (int(hp_mins) if found_hp and hp_mins is not None else None),
-            "Días contratado en el periodo": (float(dias_contratado) if found_days and dias_contratado is not None else None),
-            "Horas baja": float(baja_h or 0.0),
-        })
-
-    return {
-        "ok": True,
-        "status": status,
-        "elapsed_ms": elapsed_ms,
-        "error": "",
-        "rows": rows_out,
-    }
-
-
-
-# ============================================================
-# DIAGNÓSTICO TEMPORAL — /api/exportacion/vacaciones
-# ============================================================
-
-def api_exportacion_vacaciones_once_diag(fecha_inicio: str, fecha_fin: str):
-    """Una única petición a /api/exportacion/vacaciones para validar ausencias.
-
-    Solicita únicamente vacaciones aprobadas (Estado=1) en el rango indicado.
-    No hace retries ni fallback para mantener la prueba aislada.
-    """
-    url = f"{API_URL_BASE}/exportacion/vacaciones"
-    body = {"fecha_inicio": fecha_inicio, "fecha_fin": fecha_fin, "Estado": 1}
-    t0 = time.monotonic()
-    try:
-        resp = _get_http_session().post(url, data=body, timeout=(5, 90), verify=True)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "elapsed_ms": int(round((time.monotonic() - t0) * 1000)),
-            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-            "rows": [],
-        }
-
-    elapsed_ms = int(round((time.monotonic() - t0) * 1000))
-    status = int(resp.status_code)
-    if status != 200:
-        msg = ""
-        try:
-            obj = resp.json()
-            if isinstance(obj, dict):
-                msg = str(obj.get("message") or obj.get("error") or obj.get("errors") or "")[:300]
-            elif obj is not None:
-                msg = str(obj)[:300]
-        except Exception:
-            try:
-                msg = str(resp.text or "")[:300]
-            except Exception:
-                msg = ""
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": msg or f"HTTP {status}",
-            "rows": [],
-        }
-
-    parsed = _try_parse_encrypted_response(resp)
-    if parsed is None:
-        return {
-            "ok": False,
-            "status": status,
-            "elapsed_ms": elapsed_ms,
-            "error": "HTTP 200 pero no se pudo descifrar/interpretar la respuesta.",
-            "rows": [],
-        }
-
-    raw_rows = _extract_generic_rows(parsed)
-    rows = []
-    for raw in raw_rows:
-        if not isinstance(raw, dict):
-            continue
-        usuario = raw.get("usuario") if isinstance(raw.get("usuario"), dict) else {}
-        num_emp = (
-            usuario.get("Num_empleado") or usuario.get("num_empleado") or
-            usuario.get("Número de empleado") or usuario.get("Nº empleado")
-        )
-        nombre_parts = [
-            usuario.get("Name") or usuario.get("name") or "",
-            usuario.get("Primer_apellido") or usuario.get("primer_apellido") or "",
-            usuario.get("Segundo_apellido") or usuario.get("segundo_apellido") or "",
-        ]
-        nombre = " ".join(str(x).strip() for x in nombre_parts if str(x or "").strip()).strip()
-        rows.append({
-            "Vacaciones ID": raw.get("ID", raw.get("id")),
-            "Empleado ID": raw.get("empleado_id", raw.get("Empleado ID")),
-            "Nº empleado": num_emp,
-            "Nombre": nombre,
-            "Fecha inicio": raw.get("fecha_inicio", raw.get("Fecha inicio")),
-            "Fecha fin": raw.get("fecha_fin", raw.get("Fecha fin")),
-            "Días laborables": raw.get("días_laborables", raw.get("dias_laborables", raw.get("Días laborables"))),
-            "Tipo": raw.get("tipo", raw.get("Tipo")),
-            "Estado": raw.get("estado", raw.get("Estado")),
-        })
-
-    return {
-        "ok": True,
-        "status": status,
-        "elapsed_ms": elapsed_ms,
-        "error": "",
-        "rows": rows,
-    }
-
-
 # ============================================================
 # DÍA (turno nocturno) + tiempos netos
 # ============================================================
@@ -2807,272 +2174,6 @@ def _parse_date_any(x):
         return dt.date()
     except Exception:
         return None
-
-
-
-
-def _normalize_emp_code(x: str, pad: int = 10) -> str:
-    s = str(x or '').strip()
-    if not s:
-        return ''
-    if s.isdigit():
-        return s.zfill(pad)
-    return s
-
-
-def _get_horas_programadas_minutes_from_row(row: dict):
-    """Devuelve (campo_encontrado, minutos_programados).
-
-    Según el manual del informe de empleados, el campo se denomina
-    "Horas programadas". También se admiten variantes históricas.
-    Es importante distinguir un 0 real (día no laborable) de un campo ausente.
-    """
-    if not isinstance(row, dict):
-        return False, None
-
-    aliases = [
-        "Horas programadas",
-        "horas_programadas", "horasProgramadas",
-        "horas_programadas_dia", "horasProgramadasDia",
-        "horas_programadas_hoy", "horasProgramadasHoy",
-    ]
-    found, value = _row_get_alias(row, aliases)
-    if found:
-        mins = _report_hours_to_minutes(value)
-        return (mins is not None), mins
-
-    for nested_key in ["contrato", "jornada", "horario", "turno"]:
-        nested = row.get(nested_key)
-        if isinstance(nested, dict):
-            found, value = _row_get_alias(nested, aliases)
-            if found:
-                mins = _report_hours_to_minutes(value)
-                return (mins is not None), mins
-
-    return False, None
-
-
-
-
-def _metrics_from_informe_payload(rep) -> dict:
-    """Extrae HP, bajas y contratación por Nº empleado pseudonimizado."""
-    hp_by_emp: dict[str, int] = {}
-    baja_by_emp: dict[str, int] = {}
-    contratado_by_emp: dict[str, int] = {}
-
-    for row in _extract_rows_from_informe(rep):
-        code = _get_employee_number_from_row(row)
-        if not code:
-            continue
-        he = _hash_emp_code(code)
-        if not he:
-            continue
-
-        found_hp, hp_mins = _get_horas_programadas_minutes_from_row(row)
-        if found_hp and hp_mins is not None:
-            hp_by_emp[he] = max(0, int(hp_mins))
-
-        baja_h = _get_horas_baja_from_row(row)
-        if baja_h > 0:
-            baja_by_emp[he] = max(0, int(round(float(baja_h) * 60.0)))
-
-        found_days, dias_contratado = _get_dias_contratado_from_row(row)
-        if found_days and dias_contratado is not None:
-            contratado_by_emp[he] = 1 if float(dias_contratado) > 0 else 0
-
-    return {"hp": hp_by_emp, "baja": baja_by_emp, "contratado": contratado_by_emp}
-
-
-
-@st.cache_data(show_spinner=False, ttl=900)
-def _cached_informe_period_metrics(fecha_desde: str, fecha_hasta: str) -> dict:
-    """Métricas de /informes/empleados para el periodo solicitado.
-
-    Se cachean solo hashes de Nº empleado y métricas numéricas; nunca el payload
-    completo ni PII. Para dimensión diaria se invoca con fecha_desde=fecha_hasta.
-    """
-    rep = api_informe_empleados(fecha_desde, fecha_hasta)
-    if rep is None:
-        raise RuntimeError(
-            f"Informe de empleados no disponible para {fecha_desde}..{fecha_hasta}"
-        )
-    rows = _extract_rows_from_informe(rep)
-    if not rows:
-        raise RuntimeError(
-            f"Informe de empleados vacío/no interpretable para {fecha_desde}..{fecha_hasta}"
-        )
-    return _metrics_from_informe_payload(rep)
-
-
-
-def _chunk_date_ranges(d0: date, d1: date, chunk_days: int = 31):
-    """Divide un rango en bloques pequeños para evitar informes acumulados enormes."""
-    cur = d0
-    while cur <= d1:
-        end = min(d1, cur + timedelta(days=max(1, int(chunk_days)) - 1))
-        yield cur, end
-        cur = end + timedelta(days=1)
-
-
-
-def build_informe_diario_maps_resilient(
-    d0: date,
-    d1: date,
-    base_emp: pd.DataFrame,
-) -> tuple[dict, dict, dict, list[str]]:
-    """Obtiene el informe CRECE de cada día SIN concurrencia.
-
-    No reconstruye jornadas por diferencias entre informes agregados. Cada
-    fecha usa /informes/empleados con fecha_desde=fecha_hasta=D y enlaza
-    exclusivamente Nº empleado con num_empleado. Los éxitos quedan cacheados
-    por fecha; los fallos se reintentan secuencialmente con enfriamiento.
-    """
-    if base_emp is None or base_emp.empty or d0 > d1:
-        return {}, {}, {}, []
-
-    be = base_emp.copy()
-    be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
-    if "num_empleado" not in be.columns:
-        be["num_empleado"] = ""
-    be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
-
-    emp_hash_to_nif: dict[str, str] = {}
-    for _, row in be.iterrows():
-        code = _text(row.get("num_empleado_code"))
-        nif = _text(row.get("nif")).upper()
-        if code and nif:
-            emp_hash_to_nif[_hash_emp_code(code)] = nif
-
-    all_days = [d.strftime("%Y-%m-%d") for d in _iter_days(d0, d1)]
-    if not emp_hash_to_nif:
-        return {}, {}, {}, all_days
-
-    metrics_by_day: dict[str, dict] = {}
-    failed_days: set[str] = set()
-
-    # No ThreadPoolExecutor aquí. En la prueba real, las ráfagas concurrentes
-    # dejaron casi todo el rango sin informe. Una única petición en vuelo es
-    # deliberada: primero exactitud; la caché evita repetir días ya obtenidos.
-    for day in all_days:
-        metrics = None
-        for attempt in range(3):
-            if attempt:
-                time.sleep(1.25 * attempt)
-            try:
-                metrics = _cached_informe_period_metrics(day, day)
-                if metrics:
-                    break
-            except Exception as exc:
-                _safe_fail(exc)
-                metrics = None
-
-        if metrics:
-            metrics_by_day[day] = metrics
-        else:
-            failed_days.add(day)
-
-    hp_out: dict[tuple[str, str], int] = {}
-    baja_out: dict[tuple[str, str], int] = {}
-    contratado_out: dict[tuple[str, str], bool] = {}
-    unavailable_days: set[str] = set(failed_days)
-
-    for day in all_days:
-        metrics = metrics_by_day.get(day)
-        if metrics is None:
-            _diag_informe_event(kind="day", day=day, outcome="no_metrics")
-            unavailable_days.add(day)
-            continue
-
-        hp_sec = (metrics.get("hp", {}) or {})
-        baja_sec = (metrics.get("baja", {}) or {})
-        contratado_sec = (metrics.get("contratado", {}) or {})
-
-        # Un HTTP 200 no basta: al menos una persona del alcance debe enlazar
-        # por Nº empleado/num_empleado con métricas del informe.
-        matched = sum(
-            1 for he in emp_hash_to_nif
-            if he in hp_sec or he in baja_sec or he in contratado_sec
-        )
-        if matched == 0:
-            _diag_informe_event(
-                kind="day", day=day, outcome="no_employee_match",
-                scope=len(emp_hash_to_nif), hp_entries=len(hp_sec),
-                baja_entries=len(baja_sec), contratado_entries=len(contratado_sec),
-            )
-            unavailable_days.add(day)
-            continue
-
-        _diag_informe_event(
-            kind="day", day=day, outcome="ok", matched=matched,
-            scope=len(emp_hash_to_nif), hp_entries=len(hp_sec),
-            baja_entries=len(baja_sec), contratado_entries=len(contratado_sec),
-        )
-
-        for he, nif in emp_hash_to_nif.items():
-            if he in hp_sec:
-                try:
-                    hp_out[(nif, day)] = max(0, int(hp_sec[he]))
-                except Exception:
-                    pass
-
-            if he in baja_sec:
-                try:
-                    mins_baja = max(0, int(baja_sec[he]))
-                    if mins_baja > 0:
-                        baja_out[(nif, day)] = mins_baja
-                except Exception:
-                    pass
-
-            if he in contratado_sec:
-                try:
-                    contratado_out[(nif, day)] = bool(int(contratado_sec[he]))
-                except Exception:
-                    pass
-
-    return hp_out, baja_out, contratado_out, sorted(unavailable_days)
-
-
-
-def build_weekly_official_hp_map(
-    full_weeks: list,
-    base_emp: pd.DataFrame,
-) -> dict:
-    """Horas programadas OFICIALES por empleado/semana desde /informes/empleados.
-
-    Clave: (NIF, week_start_iso, week_end_iso) -> minutos.
-    Una semana de vacaciones/cierre con HP=0 queda explícitamente a cero.
-    """
-    if not full_weeks or base_emp is None or base_emp.empty:
-        return {}
-
-    be = base_emp.copy()
-    be["nif"] = be["nif"].fillna("").astype(str).str.upper().str.strip()
-    if "num_empleado" not in be.columns:
-        be["num_empleado"] = ""
-    be["num_empleado_code"] = be["num_empleado"].apply(_canonical_emp_code)
-
-    hash_to_nif = {}
-    for _, row in be.iterrows():
-        code = _text(row.get("num_empleado_code"))
-        nif = _text(row.get("nif")).upper()
-        if code and nif:
-            hash_to_nif[_hash_emp_code(code)] = nif
-
-    out = {}
-    for wk_start, wk_end, _mode in full_weeks:
-        a = wk_start.strftime("%Y-%m-%d")
-        b = wk_end.strftime("%Y-%m-%d")
-        try:
-            metrics = _cached_informe_period_metrics(a, b)
-        except Exception as exc:
-            _safe_fail(exc)
-            continue
-        for he, mins in ((metrics or {}).get("hp", {}) or {}).items():
-            nif = hash_to_nif.get(he)
-            if nif:
-                out[(nif, a, b)] = max(0, int(mins))
-    return out
-
 
 
 def empleado_activo_o_contrato(df_emp: pd.DataFrame) -> pd.Series:
@@ -3243,14 +2344,13 @@ else:
 st.write("---")
 
 
-APP_STATE_VERSION = "turnos-ausencias-date-nightfix-2026-09-22-v2"
+APP_STATE_VERSION = "turnos-ausencias-final-2026-09-23-v1"
 if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
     for _state_key in [
         "last_sig", "result_incidencias", "result_bajas", "result_sin_fichajes",
-        "result_excesos_semana", "result_csv_incidencias", "result_csv_bajas",
-        "result_csv_sin", "result_csv_excesos", "scope_fi", "scope_ff",
+        "result_excesos_semana", "scope_fi", "scope_ff",
         "scope_empresas_norm", "scope_sedes_norm", "scope_empleados_nif",
-        "scope_used_employee_filter", "result_informe_missing_days",
+        "scope_used_employee_filter", "result_turnos_missing_days",
         "result_tiempo_missing_days", "result_exceso_incomplete_count",
         "result_turnos_unknown_absences",
     ]:
@@ -3276,17 +2376,13 @@ for k, v in [
     ("result_bajas", {}),
     ("result_sin_fichajes", {}),
     ("result_excesos_semana", {}),
-    ("result_csv_incidencias", b""),
-    ("result_csv_bajas", b""),
-    ("result_csv_sin", b""),
-    ("result_csv_excesos", b""),
     ("scope_fi", ""),
     ("scope_ff", ""),
     ("scope_empresas_norm", set()),
     ("scope_sedes_norm", set()),
     ("scope_empleados_nif", set()),
     ("scope_used_employee_filter", False),
-    ("result_informe_missing_days", []),
+    ("result_turnos_missing_days", []),
     ("result_tiempo_missing_days", []),
     ("result_exceso_incomplete_count", 0),
     ("result_turnos_unknown_absences", []),
@@ -3392,13 +2488,13 @@ if consultar:
                 bajas_min_map_query,
                 contratado_map_query,
                 turno_start_map_query,
-                informe_missing_days,
+                turnos_missing_days,
                 turnos_unknown_absences,
             ) = build_turnos_daily_maps(d0_context, d1_context, base_emp)
         except Exception as _e:
             _safe_fail(_e)
             horas_prog_map_query, bajas_min_map_query, contratado_map_query = {}, {}, {}
-            turno_start_map_query, informe_missing_days, turnos_unknown_absences = {}, [], []
+            turno_start_map_query, turnos_missing_days, turnos_unknown_absences = {}, [], []
 
         nifs_all_query = [
             n for n in base_emp["nif"].dropna().astype(str).str.upper().str.strip().unique().tolist()
@@ -3433,7 +2529,7 @@ if consultar:
 
         # Los dos días de contexto son internos y nunca deben generar avisos UI.
         tiempo_missing_days = [d for d in (tiempo_missing_days or []) if fi <= str(d) <= ff]
-        informe_missing_days = [d for d in (informe_missing_days or []) if fi <= str(d) <= ff]
+        turnos_missing_days = [d for d in (turnos_missing_days or []) if fi <= str(d) <= ff]
 
         # --------- INCIDENCIAS ----------
         if df_fich.empty:
@@ -3669,6 +2765,10 @@ if consultar:
             )
             rows_by_day: dict[str, list[dict]] = {}
             for (nif_b, day_b), baja_mins in bajas_min_map_query.items():
+                # Los días de contexto (D-1 / D+1) solo sirven para cerrar turnos
+                # nocturnos y nunca deben aparecer en la pestaña/CSV de Bajas.
+                if not (fi <= str(day_b) <= ff):
+                    continue
                 if int(baja_mins or 0) <= 0 or nif_b not in base_by_nif.index:
                     continue
                 emp = base_by_nif.loc[nif_b]
@@ -3769,7 +2869,6 @@ if consultar:
             full_weeks = []
 
         excesos_por_semana = {}
-        csv_excesos = b""
         exceso_incomplete_count = 0
 
         if full_weeks:
@@ -3786,8 +2885,6 @@ if consultar:
             base_exc = base_exc[
                 base_exc["Departamento_norm"].isin(["MOI", "ESTRUCTURA", "MOD"])
             ].copy()
-
-            all_rows = []
 
             for wk_start, wk_end_incl, mode in full_weeks:
                 if mode == "LD":
@@ -3873,10 +2970,6 @@ if consultar:
                             "nif": nif,
                         }
                         rows.append(row)
-                        all_rows.append({
-                            "Semana": label,
-                            **{k: v for k, v in row.items() if k != "nif"},
-                        })
 
                 if rows:
                     dfw = (
@@ -3895,16 +2988,6 @@ if consultar:
 
                 excesos_por_semana[label] = dfw
 
-            if all_rows:
-                df_all = (
-                    pd.DataFrame(all_rows)
-                    .sort_values(
-                        ["Semana", "Empresa", "Sede", "Departamento", "Nombre"],
-                        kind="mergesort",
-                    )
-                    .reset_index(drop=True)
-                )
-                csv_excesos = df_all.to_csv(index=False).encode("utf-8")
 
 if consultar:
     # --------- Guardar en estado + CSVs ----------
@@ -3926,28 +3009,11 @@ if consultar:
     st.session_state["result_bajas"] = bajas_por_dia
     st.session_state["result_sin_fichajes"] = sin_por_dia
     st.session_state["result_excesos_semana"] = excesos_por_semana
-    st.session_state["result_informe_missing_days"] = list(informe_missing_days or [])
+    st.session_state["result_turnos_missing_days"] = list(turnos_missing_days or [])
     st.session_state["result_tiempo_missing_days"] = list(tiempo_missing_days or [])
     st.session_state["result_exceso_incomplete_count"] = int(exceso_incomplete_count or 0)
     st.session_state["result_turnos_unknown_absences"] = list(turnos_unknown_absences or [])
 
-    st.session_state["result_csv_incidencias"] = (
-        _df_view(salida_incidencias).to_csv(index=False).encode("utf-8") if not salida_incidencias.empty else b""
-    )
-
-    if bajas_por_dia:
-        df_all_bajas = pd.concat(list(bajas_por_dia.values()), ignore_index=True)
-        st.session_state["result_csv_bajas"] = _df_view(df_all_bajas).to_csv(index=False).encode("utf-8")
-    else:
-        st.session_state["result_csv_bajas"] = b""
-
-    if sin_por_dia:
-        df_all_sin = pd.concat(list(sin_por_dia.values()), ignore_index=True)
-        st.session_state["result_csv_sin"] = _df_view(df_all_sin).to_csv(index=False).encode("utf-8")
-    else:
-        st.session_state["result_csv_sin"] = b""
-
-    st.session_state["result_csv_excesos"] = csv_excesos
 
 
 # ------------------------------------------------------------
@@ -3958,15 +3024,10 @@ ff_sig = fecha_fin.strftime("%Y-%m-%d")
 current_sig = _sig(fi_sig, ff_sig, sel_empresas, sel_sedes, sel_empleados_nifs)
 
 last_sig = st.session_state.get("last_sig", "")
-results_match = (last_sig == current_sig)
 if not last_sig:
     # En el arranque (sin haber pulsado Consultar) NO mostramos nada más que los filtros.
     # Importante: sin mensajes ni pestañas.
     st.stop()
-elif not results_match:
-    pass
-
-
 try:
     weeks_ui = list_full_workweeks_in_range(fecha_inicio, fecha_fin)
 except Exception:
@@ -4083,7 +3144,7 @@ def _csv_from_result_dict(result_dict: dict, *, week_mode: bool = False) -> byte
 
 
 # Avisos no bloqueantes únicamente cuando CRECE no ha podido proporcionar datos.
-_missing_days_ui = list(st.session_state.get("result_informe_missing_days", []) or [])
+_missing_days_ui = list(st.session_state.get("result_turnos_missing_days", []) or [])
 _missing_tc_days_ui = list(st.session_state.get("result_tiempo_missing_days", []) or [])
 _unknown_abs_ui = list(st.session_state.get("result_turnos_unknown_absences", []) or [])
 if _missing_days_ui:
@@ -4105,7 +3166,6 @@ if _unknown_abs_ui:
 
 
 # Exceso solo se muestra cuando el rango contiene al menos una semana completa.
-range_days = (fecha_fin - fecha_inicio).days + 1 if fecha_fin >= fecha_inicio else 0
 tab_labels = ["📌 Fichajes", "🏥 Bajas", "⛔ Sin fichajes"]
 show_exceso_tab = bool(weeks_ui)
 if show_exceso_tab:
@@ -4154,7 +3214,7 @@ if "tab_bajas" in tab_map:
             if _missing_days_ui:
                 st.warning(
                     "No se puede confirmar que no haya bajas en todo el rango porque faltan "
-                    "datos del informe de empleados para algunas fechas."
+                    "datos de /informes/turnos de CRECE para algunas fechas."
                 )
             else:
                 st.info("No hay empleados de baja en el rango seleccionado.")
@@ -4176,7 +3236,7 @@ if "tab_sin" in tab_map:
             if _missing_days_ui or _missing_tc_days_ui:
                 st.warning(
                     "No se puede confirmar que no haya empleados sin fichajes en todo el rango "
-                    "porque faltan Horas programadas o tiempoContabilizado para algunas fechas."
+                    "porque faltan jornada programada de /informes/turnos o tiempoContabilizado para algunas fechas."
                 )
             else:
                 st.info("No hay empleados sin fichajes (activos/contrato) en el rango seleccionado.")
@@ -4212,7 +3272,7 @@ if "tab_exc" in tab_map:
                 st.warning(
                     "No se puede confirmar que no haya excesos de jornada: "
                     "faltan datos diarios suficientes para validar algunas semanas/empleados "
-                    "contra Horas programadas y tiempoContabilizado oficiales de CRECE."
+                    "contra la jornada de /informes/turnos y tiempoContabilizado oficiales de CRECE."
                 )
             else:
                 st.info("No hay excesos de jornada en el rango seleccionado.")
