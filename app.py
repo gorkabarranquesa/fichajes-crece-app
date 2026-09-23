@@ -402,6 +402,114 @@ def effective_worked_minutes_for_mod(mins_tc: int, pre_shift_work_minutes: int =
     return max(0, total - pre)
 
 
+
+def normalize_midnight_continuations(df_fich: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Agrupa continuaciones reales de turno partidas por CRECE a las 00:00.
+
+    CRECE puede materializar un turno que cruza medianoche como::
+
+        ... entrada -> salida 23:59   /   entrada 00:00 -> salida 06:xx ...
+
+    El segundo par sigue perteneciendo al turno iniciado el día anterior. Esta
+    función reasigna *solo* ese par inequívoco al día de inicio y devuelve un
+    mapa de minutos de trabajo que deben trasladarse, únicamente para el
+    cálculo por turno, desde el día civil siguiente al anterior.
+
+    No se inventa tiempo: el traslado se basa exclusivamente en intervalos de
+    fichajes reales. ``tiempoContabilizado`` bruto se conserva intacto para la
+    columna semanal; el mapa de traslado se utiliza después solo para alinear
+    el balance diario con el turno.
+    """
+    if df_fich is None or df_fich.empty:
+        return (df_fich.copy() if isinstance(df_fich, pd.DataFrame) else pd.DataFrame()), {}
+
+    required = {"nif", "fecha_dt", "direccion", "fecha_dia"}
+    if not required.issubset(set(df_fich.columns)):
+        return df_fich.copy(), {}
+
+    out = df_fich.copy()
+    out["nif"] = out["nif"].fillna("").astype(str).str.upper().str.strip()
+    out["fecha_dt"] = pd.to_datetime(out["fecha_dt"], errors="coerce")
+    transfers: dict[tuple[str, str, str], int] = {}
+
+    for nif, sub in out.dropna(subset=["fecha_dt"]).groupby("nif", sort=False):
+        if not nif:
+            continue
+        sub = sub.sort_values("fecha_dt", kind="mergesort")
+        idxs = list(sub.index)
+        # Buscamos la secuencia salida 23:5x -> entrada 00:0x -> salida matinal.
+        for j in range(len(idxs) - 2):
+            ia, ib, ic = idxs[j], idxs[j + 1], idxs[j + 2]
+            a, b, c = out.loc[ia], out.loc[ib], out.loc[ic]
+            if str(a.get("direccion") or "").lower().strip() != "salida":
+                continue
+            if str(b.get("direccion") or "").lower().strip() != "entrada":
+                continue
+            if str(c.get("direccion") or "").lower().strip() != "salida":
+                continue
+
+            a_dt = pd.to_datetime(a.get("fecha_dt"), errors="coerce")
+            b_dt = pd.to_datetime(b.get("fecha_dt"), errors="coerce")
+            c_dt = pd.to_datetime(c.get("fecha_dt"), errors="coerce")
+            if pd.isna(a_dt) or pd.isna(b_dt) or pd.isna(c_dt):
+                continue
+
+            if b_dt.date() != c_dt.date() or b_dt.date() != (a_dt.date() + timedelta(days=1)):
+                continue
+
+            a_min = int(a_dt.hour) * 60 + int(a_dt.minute)
+            b_min = int(b_dt.hour) * 60 + int(b_dt.minute)
+            c_min = int(c_dt.hour) * 60 + int(c_dt.minute)
+
+            # La firma 23:55+ / 00:05- evita reclasificar fichajes nocturnos
+            # normales que no sean un corte artificial de medianoche.
+            if a_min < 23 * 60 + 55 or b_min > 5:
+                continue
+            # Una continuación de turno industrial debe terminar en la mañana.
+            # Permitimos hasta mediodía para no perder horas extra del mismo turno.
+            if c_min > 12 * 60 or c_dt <= b_dt:
+                continue
+            if (b_dt - a_dt).total_seconds() > 10 * 60:
+                continue
+
+            prev_day = a_dt.date().strftime("%Y-%m-%d")
+            civil_day = b_dt.date().strftime("%Y-%m-%d")
+            out.at[ib, "fecha_dia"] = prev_day
+            out.at[ic, "fecha_dia"] = prev_day
+
+            worked_mins = max(0, int(round((c_dt - b_dt).total_seconds() / 60.0)))
+            if worked_mins > 0:
+                k = (str(nif).upper().strip(), civil_day, prev_day)
+                transfers[k] = int(transfers.get(k, 0)) + worked_mins
+
+    return out, transfers
+
+
+def apply_midnight_tc_transfers(tc_map: dict, transfers: dict) -> dict:
+    """Alinea TC para balances por turno sin modificar el TC bruto original.
+
+    Cada traslado mueve como máximo los minutos de trabajo REAL detectados y
+    nunca crea minutos nuevos. Solo se aplica si CRECE devolvió TC para ambos
+    días implicados, de modo que dato ausente nunca se convierte en cero.
+    """
+    adjusted = dict(tc_map or {})
+    for (nif, from_day, to_day), requested in (transfers or {}).items():
+        src = (str(nif).upper().strip(), str(from_day))
+        dst = (str(nif).upper().strip(), str(to_day))
+        if src not in adjusted or dst not in adjusted:
+            continue
+        try:
+            available = max(0, int(adjusted[src]))
+            amount = min(available, max(0, int(requested)))
+        except Exception:
+            continue
+        if amount <= 0:
+            continue
+        adjusted[src] = available - amount
+        adjusted[dst] = max(0, int(adjusted[dst])) + amount
+    return adjusted
+
+
 def build_mod_pre_shift_work_map(
     df_fich: pd.DataFrame,
     tipos_map: dict,
@@ -3166,6 +3274,14 @@ if consultar:
 
     fi = fecha_inicio.strftime("%Y-%m-%d")
     ff = fecha_fin.strftime("%Y-%m-%d")
+    # Contexto de un día a cada lado para poder unir de forma exacta los
+    # turnos que cruzan medianoche, incluso si el rango visible empieza o
+    # termina en mitad de un turno nocturno. Los resultados UI se filtran
+    # después estrictamente al rango solicitado.
+    d0_ctx = fecha_inicio - timedelta(days=1)
+    d1_ctx = fecha_fin + timedelta(days=1)
+    fi_ctx = d0_ctx.strftime("%Y-%m-%d")
+    ff_ctx = d1_ctx.strftime("%Y-%m-%d")
     signature = _sig(fi, ff, sel_empresas, sel_sedes, sel_empleados_nifs)
 
     with st.spinner("Procesando…"):
@@ -3174,7 +3290,7 @@ if consultar:
         # --------- FICHAJES ----------
         fichajes_rows = []
         with ThreadPoolExecutor(max_workers=_max_workers_emps(len(empleados_filtrados))) as exe:
-            futures = {exe.submit(api_exportar_fichajes, r["nif"], fi, ff): r for _, r in empleados_filtrados.iterrows()}
+            futures = {exe.submit(api_exportar_fichajes, r["nif"], fi_ctx, ff_ctx): r for _, r in empleados_filtrados.iterrows()}
             for fut in as_completed(futures):
                 emp = futures[fut]
                 try:
@@ -3215,6 +3331,8 @@ if consultar:
         # Se consultan una sola vez por rango y se reutilizan en todas las pestañas.
         d0 = datetime.strptime(fi, "%Y-%m-%d").date()
         d1 = datetime.strptime(ff, "%Y-%m-%d").date()
+        d0_context = d0 - timedelta(days=1)
+        d1_context = d1 + timedelta(days=1)
 
         base_emp = empleados_filtrados.copy()
         base_emp["nif"] = base_emp["nif"].fillna("").astype(str).str.upper().str.strip()
@@ -3233,7 +3351,7 @@ if consultar:
                 turno_start_map_query,
                 informe_missing_days,
                 turnos_unknown_absences,
-            ) = build_turnos_daily_maps(d0, d1, base_emp)
+            ) = build_turnos_daily_maps(d0_context, d1_context, base_emp)
         except Exception as _e:
             _safe_fail(_e)
             horas_prog_map_query, bajas_min_map_query, contratado_map_query = {}, {}, {}
@@ -3244,10 +3362,25 @@ if consultar:
             if n
         ]
         try:
-            tc_map_query, tiempo_missing_days = build_tiempo_contabilizado_map(d0, d1, nifs_all_query)
+            tc_map_query, tiempo_missing_days = build_tiempo_contabilizado_map(d0_context, d1_context, nifs_all_query)
         except Exception as _e:
             _safe_fail(_e)
             tc_map_query, tiempo_missing_days = {}, []
+
+        # Alineación de continuaciones 23:59 -> 00:00 con el día real de
+        # inicio del turno. El TC bruto se conserva aparte para la columna
+        # semanal; ``tc_balance_map_query`` solo se usa en validaciones y
+        # balances por turno.
+        try:
+            df_fich, midnight_transfers = normalize_midnight_continuations(df_fich)
+        except Exception as _e:
+            _safe_fail(_e)
+            midnight_transfers = {}
+        tc_balance_map_query = apply_midnight_tc_transfers(tc_map_query, midnight_transfers)
+
+        # Los dos días de contexto son internos y nunca deben generar avisos UI.
+        tiempo_missing_days = [d for d in (tiempo_missing_days or []) if fi <= str(d) <= ff]
+        informe_missing_days = [d for d in (informe_missing_days or []) if fi <= str(d) <= ff]
 
         # --------- INCIDENCIAS ----------
         if df_fich.empty:
@@ -3277,7 +3410,7 @@ if consultar:
             resumen["Última salida"] = resumen["ultima_salida_dt"].apply(ts_to_hhmm)
 
             horas_prog_map_incid = horas_prog_map_query
-            tc_map_incid = tc_map_query
+            tc_map_incid = tc_balance_map_query
 
             if tc_map_incid:
                 tc = pd.DataFrame(
@@ -3308,6 +3441,8 @@ if consultar:
                 axis=1,
             )
 
+            # Oculta los días de contexto usados solo para cerrar turnos nocturnos.
+            resumen = resumen[(resumen["Fecha"].astype(str) >= fi) & (resumen["Fecha"].astype(str) <= ff)].copy()
             resumen["dia"] = pd.to_datetime(resumen["Fecha"]).dt.weekday
 
             def _max_ok(r):
@@ -3517,14 +3652,14 @@ if consultar:
 
                 if key not in horas_prog_map_query:
                     continue
-                tc_known = key in tc_map_query
+                tc_known = key in tc_balance_map_query
                 if is_sin_fichajes_candidate(
                     contratado=(contratado_map_query.get(key) is True),
                     horas_programadas=horas_prog_map_query[key],
                     tiene_fichajes=(nif in present_set),
                     esta_baja=(nif in on_sick_leave),
                     tc_known=tc_known,
-                    tiempo_contabilizado=(tc_map_query.get(key) if tc_known else None),
+                    tiempo_contabilizado=(tc_balance_map_query.get(key) if tc_known else None),
                 ):
                     missing.append(nif)
 
@@ -3561,7 +3696,8 @@ if consultar:
 
         if full_weeks:
             horas_prog_map = horas_prog_map_query
-            tc_map = tc_map_query
+            tc_map = tc_map_query  # bruto: fuente de la columna Trabajado semanal
+            tc_balance_map = tc_balance_map_query  # alineado por turno: solo balance diario
             mod_pre_shift_map = build_mod_pre_shift_work_map(df_fich, tipos_map, turno_start_map_query)
 
             base_exc = base_emp.copy()
@@ -3624,10 +3760,13 @@ if consultar:
                             # Columna visual: siempre TC bruto.
                             trabajado_sem_min += mins_tc
 
-                            mins_balance = mins_tc
+                            # Para MOD el balance se alinea al turno real cuando CRECE
+                            # ha partido una continuación nocturna a las 00:00. La
+                            # columna semanal sigue usando ``mins_tc`` bruto.
+                            mins_balance = int(tc_balance_map.get(key, mins_tc)) if depto.upper().strip() == "MOD" else mins_tc
                             if depto.upper().strip() == "MOD" and exp_day > 0:
                                 pre_shift = int(mod_pre_shift_map.get(key, 0) or 0)
-                                mins_balance = effective_worked_minutes_for_mod(mins_tc, pre_shift)
+                                mins_balance = effective_worked_minutes_for_mod(mins_balance, pre_shift)
 
                             diff_day = int(mins_balance) - exp_day
                             exceso_sem_min += quantize_daily_balance_30(
