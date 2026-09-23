@@ -387,9 +387,10 @@ def effective_worked_minutes_for_mod(mins_tc: int, pre_shift_work_minutes: int =
     """Tiempo válido para el balance MOD.
 
     La columna visual conserva todo ``tiempoContabilizado``. Para el balance de
-    un día laborable MOD se descuenta únicamente el trabajo REAL que los
-    intervalos entrada/salida sitúan antes del inicio del turno (06:00 mañana o
-    14:00 tarde). Nunca se descuenta un hueco sin fichajes.
+    un día MOD se descuenta únicamente el trabajo REAL que los intervalos
+    entrada/salida sitúan antes del inicio oficial del turno (06:00 mañana,
+    14:00 tarde o 22:00 noche), también si ese día figura L/libre. Nunca se
+    descuenta un hueco sin fichajes.
     """
     try:
         total = max(0, int(mins_tc))
@@ -3841,7 +3842,13 @@ if consultar:
                             # ha partido una continuación nocturna a las 00:00. La
                             # columna semanal sigue usando ``mins_tc`` bruto.
                             mins_balance = int(tc_balance_map.get(key, mins_tc)) if depto.upper().strip() == "MOD" else mins_tc
-                            if depto.upper().strip() == "MOD" and exp_day > 0:
+                            if depto.upper().strip() == "MOD":
+                                # Regla RRHH MOD: el tiempo realmente trabajado antes del
+                                # inicio oficial del turno (06:00 / 14:00 / 22:00) no suma
+                                # al balance de exceso, incluso cuando CRECE tenga ese día
+                                # como L/libre (HP=0). Ej.: 21:30-22:00 no es exceso de un
+                                # turno nocturno extraordinario; la columna Trabajado semanal
+                                # sigue mostrando el tiempoContabilizado bruto completo.
                                 pre_shift = int(mod_pre_shift_map.get(key, 0) or 0)
                                 mins_balance = effective_worked_minutes_for_mod(mins_balance, pre_shift)
 
